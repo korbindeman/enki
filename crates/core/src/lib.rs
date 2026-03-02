@@ -1,3 +1,4 @@
+pub mod agent_runtime;
 pub mod dag;
 pub mod db;
 pub mod scheduler;

@@ -12,3 +12,5 @@ tracing = { workspace = true }
 toml = "0.8"
 chrono = { workspace = true }
 ulid = { workspace = true }
+which = "7"
+dirs = "6"
