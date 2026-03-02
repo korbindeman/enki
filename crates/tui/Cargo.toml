@@ -1,0 +1,19 @@
+[package]
+name = "enki-tui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+crossterm = "0.29"
+
+[features]
+default = ["markdown"]
+markdown = ["dep:termimad"]
+
+[dependencies.termimad]
+version = "0.30"
+optional = true
+
+[dev-dependencies]
+tokio = { workspace = true }
+anyhow = "1"
