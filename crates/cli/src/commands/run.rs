@@ -6,7 +6,7 @@ use enki_core::worktree::WorktreeManager;
 
 use super::open_db;
 
-pub async fn run(task_id: &str, agent_cmd: &str, agent_args: &str) -> anyhow::Result<()> {
+pub async fn run(task_id: &str, agent_cmd: &str, agent_args: &str, keep: bool) -> anyhow::Result<()> {
     let db = open_db()?;
     let task_id = Id(task_id.to_string());
 
@@ -32,8 +32,22 @@ pub async fn run(task_id: &str, agent_cmd: &str, agent_args: &str) -> anyhow::Re
     std::fs::create_dir_all(&worktree_dir)?;
 
     let wt_mgr = WorktreeManager::new(&bare_path)?;
+
+    // Warn if source repo has uncommitted work (workers won't see it).
+    if let Ok(status) = wt_mgr.check_source_status() {
+        if !status.is_clean() {
+            eprintln!("warning: source repo has uncommitted work — workers won't see these changes");
+            eprintln!("  {}", status.summary());
+        }
+    }
+
+    // Sync bare repo before branching so the worker starts from current code.
+    if let Err(e) = wt_mgr.sync() {
+        eprintln!("warning: bare repo sync failed: {e}");
+    }
+
     println!("creating worktree on branch '{}'...", branch);
-    let worktree_path = wt_mgr.create(&branch, "main", &worktree_dir)?;
+    let worktree_path = wt_mgr.create(&branch, "origin/main", &worktree_dir)?;
     println!("worktree: {}", worktree_path.display());
 
     // Update task status
@@ -67,16 +81,24 @@ pub async fn run(task_id: &str, agent_cmd: &str, agent_args: &str) -> anyhow::Re
             println!("\nagent finished ({})", stop_reason);
             db.update_task_status(&task_id, TaskStatus::Done)?;
             println!("task marked as done.");
+
+            if keep {
+                println!("worktree kept at: {}", worktree_path.display());
+            } else {
+                print!("cleaning up worktree... ");
+                match wt_mgr.remove(&worktree_path, false) {
+                    Ok(()) => println!("done."),
+                    Err(e) => println!("failed: {e}\nworktree left at: {}", worktree_path.display()),
+                }
+            }
         }
         Err(e) => {
             eprintln!("\nagent error: {e}");
             db.update_task_status(&task_id, TaskStatus::Failed)?;
             println!("task marked as failed.");
+            println!("worktree left at: {} (inspect and clean up manually)", worktree_path.display());
         }
     }
-
-    // Optionally clean up worktree (leave it for now so user can inspect)
-    println!("worktree left at: {}", worktree_path.display());
 
     Ok(())
 }
@@ -89,7 +111,7 @@ async fn run_acp_session(
 ) -> anyhow::Result<String> {
     let mgr = AgentManager::new();
 
-    mgr.on_update(|update| match update {
+    mgr.on_update(|_session_id, update| match update {
         SessionUpdate::Text(text) => {
             print!("{}", text);
         }

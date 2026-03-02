@@ -1,9 +1,11 @@
+mod exec;
 mod init;
 mod project;
 mod run;
 mod status;
 mod task;
 
+pub use exec::{exec, ExecCmd};
 pub use init::init;
 pub use project::{project, ProjectCmd};
 pub use run::run;
@@ -20,7 +22,7 @@ fn workspace_dir() -> PathBuf {
 }
 
 /// Default database path.
-fn db_path() -> PathBuf {
+pub fn db_path() -> PathBuf {
     workspace_dir().join("db.sqlite")
 }
 
@@ -29,7 +31,7 @@ fn dirs() -> PathBuf {
 }
 
 /// Open the workspace database, or error if not initialized.
-fn open_db() -> anyhow::Result<Db> {
+pub fn open_db() -> anyhow::Result<Db> {
     let path = db_path();
     if !path.exists() {
         anyhow::bail!(

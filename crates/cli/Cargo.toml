@@ -10,10 +10,15 @@ path = "src/main.rs"
 [dependencies]
 enki-core = { path = "../core" }
 enki-acp = { path = "../acp" }
+enki-tui = { path = "../tui" }
 anyhow = "1"
+serde_json = { workspace = true }
 chrono = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 home = "0.5"
+ignore = "0.4"
+nucleo-matcher = "0.3"
 tokio = { workspace = true }
 tracing = { workspace = true }
+tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
