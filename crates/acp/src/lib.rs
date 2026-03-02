@@ -22,7 +22,8 @@ pub enum AcpError {
 pub type Result<T> = std::result::Result<T, AcpError>;
 
 /// Callback for streaming session updates from the agent.
-pub type UpdateCallback = Box<dyn Fn(SessionUpdate) + 'static>;
+/// First argument is the session ID that produced the update.
+pub type UpdateCallback = Box<dyn Fn(&str, SessionUpdate) + 'static>;
 
 /// Simplified session update for the orchestrator.
 #[derive(Debug, Clone)]
@@ -52,6 +53,7 @@ struct SessionEntry {
 ///
 /// All methods must be called from within a `tokio::task::LocalSet` because
 /// ACP futures are `!Send`.
+#[derive(Clone)]
 pub struct AgentManager {
     sessions: Rc<RefCell<HashMap<String, SessionEntry>>>,
     update_callback: Rc<RefCell<Option<UpdateCallback>>>,
@@ -69,7 +71,8 @@ impl AgentManager {
     }
 
     /// Set a callback to receive session updates from all agents.
-    pub fn on_update(&self, callback: impl Fn(SessionUpdate) + 'static) {
+    /// The callback receives `(session_id, update)`.
+    pub fn on_update(&self, callback: impl Fn(&str, SessionUpdate) + 'static) {
         *self.update_callback.borrow_mut() = Some(Box::new(callback));
     }
 
@@ -84,6 +87,7 @@ impl AgentManager {
         agent_args: &[&str],
         cwd: PathBuf,
     ) -> Result<String> {
+        tracing::debug!(cmd = agent_cmd, args = ?agent_args, cwd = %cwd.display(), "spawning agent process");
         // Spawn agent subprocess
         let mut child = Command::new(agent_cmd)
             .args(agent_args)
@@ -100,6 +104,8 @@ impl AgentManager {
         let client = EnkiClient {
             update_callback: self.update_callback.clone(),
             auto_approve: self.auto_approve_permissions,
+            terminals: Rc::new(RefCell::new(HashMap::new())),
+            next_terminal_id: Rc::new(std::cell::Cell::new(1)),
         };
 
         let (conn, handle_io) = acp::ClientSideConnection::new(client, stdin, stdout, |fut| {
@@ -155,6 +161,7 @@ impl AgentManager {
     /// Send a prompt to an existing session and wait for completion.
     /// Returns the stop reason as a string.
     pub async fn prompt(&self, session_id: &str, text: &str) -> Result<String> {
+        tracing::debug!(session_id, chars = text.len(), "sending prompt to agent");
         let conn = {
             let sessions = self.sessions.borrow();
             let entry = sessions
@@ -198,6 +205,7 @@ impl AgentManager {
 
     /// Kill a session and its agent process.
     pub fn kill_session(&self, session_id: &str) {
+        tracing::debug!(session_id, "killing ACP session");
         self.sessions.borrow_mut().remove(session_id);
         // Dropping SessionEntry drops the child_ref, which kills the process via kill_on_drop
     }
@@ -208,10 +216,26 @@ impl AgentManager {
     }
 }
 
+/// State for a spawned terminal process.
+/// Starts with a running child, transitions to completed with output.
+enum TerminalState {
+    Running {
+        child: tokio::process::Child,
+        output_limit: usize,
+    },
+    Done {
+        output: String,
+        truncated: bool,
+        exit_status: acp::TerminalExitStatus,
+    },
+}
+
 /// ACP Client implementation for Enki orchestrator.
 struct EnkiClient {
     update_callback: Rc<RefCell<Option<UpdateCallback>>>,
     auto_approve: bool,
+    terminals: Rc<RefCell<HashMap<String, TerminalState>>>,
+    next_terminal_id: Rc<std::cell::Cell<u64>>,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -264,26 +288,28 @@ impl acp::Client for EnkiClient {
             return Ok(());
         };
 
+        let session_id = args.session_id.to_string();
+
         match args.update {
             acp::SessionUpdate::AgentMessageChunk(chunk) => {
                 if let acp::ContentBlock::Text(text) = chunk.content {
-                    callback(SessionUpdate::Text(text.text));
+                    callback(&session_id, SessionUpdate::Text(text.text));
                 }
             }
             acp::SessionUpdate::ToolCall(tc) => {
-                callback(SessionUpdate::ToolCallStarted {
+                callback(&session_id, SessionUpdate::ToolCallStarted {
                     id: tc.tool_call_id.to_string(),
                     title: tc.title.clone(),
                 });
             }
             acp::SessionUpdate::ToolCallUpdate(tcu) => {
-                callback(SessionUpdate::ToolCallDone {
+                callback(&session_id, SessionUpdate::ToolCallDone {
                     id: tcu.tool_call_id.to_string(),
                 });
             }
             acp::SessionUpdate::Plan(plan) => {
                 if let Ok(value) = serde_json::to_value(&plan) {
-                    callback(SessionUpdate::Plan(value));
+                    callback(&session_id, SessionUpdate::Plan(value));
                 }
             }
             _ => {}
@@ -314,8 +340,252 @@ impl acp::Client for EnkiClient {
 
     async fn create_terminal(
         &self,
-        _args: acp::CreateTerminalRequest,
+        args: acp::CreateTerminalRequest,
     ) -> acp::Result<acp::CreateTerminalResponse> {
-        Err(acp::Error::method_not_found())
+        let mut cmd = tokio::process::Command::new(&args.command);
+        cmd.args(&args.args);
+
+        if let Some(cwd) = &args.cwd {
+            cmd.current_dir(cwd);
+        }
+
+        for env_var in &args.env {
+            cmd.env(&env_var.name, &env_var.value);
+        }
+
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        cmd.stdin(std::process::Stdio::null());
+
+        let child = cmd.spawn().map_err(|e| {
+            acp::Error::into_internal_error(std::io::Error::new(std::io::ErrorKind::Other, format!("failed to spawn terminal: {e}")))
+        })?;
+
+        let id_num = self.next_terminal_id.get();
+        self.next_terminal_id.set(id_num + 1);
+        let terminal_id = format!("term-{id_num}");
+
+        let output_limit = args.output_byte_limit.unwrap_or(100_000) as usize;
+
+        self.terminals.borrow_mut().insert(
+            terminal_id.clone(),
+            TerminalState::Running {
+                child,
+                output_limit,
+            },
+        );
+
+        Ok(acp::CreateTerminalResponse::new(acp::TerminalId::from(
+            terminal_id,
+        )))
+    }
+
+    async fn terminal_output(
+        &self,
+        args: acp::TerminalOutputRequest,
+    ) -> acp::Result<acp::TerminalOutputResponse> {
+        let tid = args.terminal_id.to_string();
+        self.finish_if_exited(&tid).await;
+
+        let terminals = self.terminals.borrow();
+        let state = terminals
+            .get(&tid)
+            .ok_or_else(|| acp::Error::into_internal_error(std::io::Error::new(std::io::ErrorKind::NotFound, "terminal not found")))?;
+
+        match state {
+            TerminalState::Running { .. } => {
+                Ok(acp::TerminalOutputResponse::new(String::new(), false))
+            }
+            TerminalState::Done { output, truncated, exit_status, .. } => {
+                let mut resp = acp::TerminalOutputResponse::new(output.clone(), *truncated);
+                resp.exit_status = Some(exit_status.clone());
+                Ok(resp)
+            }
+        }
+    }
+
+    async fn wait_for_terminal_exit(
+        &self,
+        args: acp::WaitForTerminalExitRequest,
+    ) -> acp::Result<acp::WaitForTerminalExitResponse> {
+        let tid = args.terminal_id.to_string();
+
+        // Take the child out so we can await without holding the borrow
+        let mut child_and_limit = None;
+        {
+            let mut terminals = self.terminals.borrow_mut();
+            let state = terminals
+                .get_mut(&tid)
+                .ok_or_else(|| acp::Error::into_internal_error(std::io::Error::new(std::io::ErrorKind::NotFound, "terminal not found")))?;
+
+            match state {
+                TerminalState::Done { exit_status, .. } => {
+                    return Ok(acp::WaitForTerminalExitResponse::new(exit_status.clone()));
+                }
+                TerminalState::Running { .. } => {
+                    // Take ownership of the child to await it
+                    let taken = std::mem::replace(
+                        state,
+                        // Temporary placeholder — will be replaced below
+                        TerminalState::Done {
+                            output: String::new(),
+                            truncated: false,
+                            exit_status: acp::TerminalExitStatus::new(),
+                        },
+                    );
+                    if let TerminalState::Running { child, output_limit } = taken {
+                        child_and_limit = Some((child, output_limit));
+                    }
+                }
+            }
+        }
+
+        // Now await outside the borrow
+        let (child, output_limit) = child_and_limit.unwrap();
+        let result = child.wait_with_output().await;
+
+        let (output, truncated, exit_status) = match result {
+            Ok(output) => {
+                let mut combined = String::from_utf8_lossy(&output.stdout).to_string();
+                combined.push_str(&String::from_utf8_lossy(&output.stderr));
+
+                let truncated = combined.len() > output_limit;
+                if truncated {
+                    let start = combined.len() - output_limit;
+                    let start = combined.ceil_char_boundary(start);
+                    combined = combined[start..].to_string();
+                }
+
+                let exit_status = acp::TerminalExitStatus::new()
+                    .exit_code(output.status.code().map(|c| c as u32));
+                (combined, truncated, exit_status)
+            }
+            Err(e) => {
+                let exit_status = acp::TerminalExitStatus::new()
+                    .signal(format!("io_error: {e}"));
+                (String::new(), false, exit_status)
+            }
+        };
+
+        // Store the result
+        self.terminals.borrow_mut().insert(
+            tid,
+            TerminalState::Done {
+                output,
+                truncated,
+                exit_status: exit_status.clone(),
+            },
+        );
+
+        Ok(acp::WaitForTerminalExitResponse::new(exit_status))
+    }
+
+    async fn kill_terminal_command(
+        &self,
+        args: acp::KillTerminalCommandRequest,
+    ) -> acp::Result<acp::KillTerminalCommandResponse> {
+        let tid = args.terminal_id.to_string();
+        let mut terminals = self.terminals.borrow_mut();
+        let state = terminals
+            .get_mut(&tid)
+            .ok_or_else(|| acp::Error::into_internal_error(std::io::Error::new(std::io::ErrorKind::NotFound, "terminal not found")))?;
+
+        if let TerminalState::Running { child, .. } = state {
+            let _ = child.kill().await;
+        }
+
+        Ok(acp::KillTerminalCommandResponse::default())
+    }
+
+    async fn release_terminal(
+        &self,
+        args: acp::ReleaseTerminalRequest,
+    ) -> acp::Result<acp::ReleaseTerminalResponse> {
+        let tid = args.terminal_id.to_string();
+        let entry = self.terminals.borrow_mut().remove(&tid);
+
+        // If still running, the child is dropped which kills it (kill_on_drop isn't set
+        // on these, but dropping the pipes will cause the process to get SIGPIPE).
+        drop(entry);
+
+        Ok(acp::ReleaseTerminalResponse::default())
+    }
+}
+
+impl EnkiClient {
+    /// If the terminal's child has exited, transition to Done state.
+    async fn finish_if_exited(&self, terminal_id: &str) {
+        // Check if already done or if process exited
+        let mut should_wait = false;
+        {
+            let terminals = self.terminals.borrow();
+            if let Some(TerminalState::Running { .. }) = terminals.get(terminal_id) {
+                should_wait = true;
+            }
+        }
+
+        if !should_wait {
+            return;
+        }
+
+        // Try non-blocking check
+        let exited = {
+            let mut terminals = self.terminals.borrow_mut();
+            if let Some(TerminalState::Running { child, .. }) = terminals.get_mut(terminal_id) {
+                matches!(child.try_wait(), Ok(Some(_)))
+            } else {
+                false
+            }
+        };
+
+        if exited {
+            // Take child out and wait for output
+            let child_and_limit = {
+                let mut terminals = self.terminals.borrow_mut();
+                let state = terminals.get_mut(terminal_id).unwrap();
+                let taken = std::mem::replace(
+                    state,
+                    TerminalState::Done {
+                        output: String::new(),
+                        truncated: false,
+                        exit_status: acp::TerminalExitStatus::new(),
+                    },
+                );
+                if let TerminalState::Running { child, output_limit } = taken {
+                    Some((child, output_limit))
+                } else {
+                    None
+                }
+            };
+
+            if let Some((child, output_limit)) = child_and_limit {
+                let result = child.wait_with_output().await;
+                let (output, truncated, exit_status) = match result {
+                    Ok(output) => {
+                        let mut combined = String::from_utf8_lossy(&output.stdout).to_string();
+                        combined.push_str(&String::from_utf8_lossy(&output.stderr));
+                        let truncated = combined.len() > output_limit;
+                        if truncated {
+                            let start = combined.len() - output_limit;
+                            let start = combined.ceil_char_boundary(start);
+                            combined = combined[start..].to_string();
+                        }
+                        let exit_status = acp::TerminalExitStatus::new()
+                            .exit_code(output.status.code().map(|c| c as u32));
+                        (combined, truncated, exit_status)
+                    }
+                    Err(e) => {
+                        let exit_status = acp::TerminalExitStatus::new()
+                            .signal(format!("io_error: {e}"));
+                        (String::new(), false, exit_status)
+                    }
+                };
+
+                self.terminals.borrow_mut().insert(
+                    terminal_id.to_string(),
+                    TerminalState::Done { output, truncated, exit_status },
+                );
+            }
+        }
     }
 }
