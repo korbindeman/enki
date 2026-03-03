@@ -5,25 +5,19 @@ use clap::Parser;
 
 #[derive(Parser)]
 #[command(name = "enki", about = "Multi-agent orchestrator for ACP coding agents")]
-enum Cli {
-    /// Launch the interactive TUI (default when no subcommand given).
-    Tui,
-    /// Initialize the enki workspace database.
+struct Cli {
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+}
+
+#[derive(clap::Subcommand)]
+enum Cmd {
+    /// Initialize enki in the current project.
     Init,
-    /// Manage projects.
-    Project {
-        #[command(subcommand)]
-        cmd: commands::ProjectCmd,
-    },
     /// Manage tasks.
     Task {
         #[command(subcommand)]
         cmd: commands::TaskCmd,
-    },
-    /// Run a workflow template, creating tasks and wiring dependencies.
-    Exec {
-        #[command(subcommand)]
-        cmd: commands::ExecCmd,
     },
     /// Run a single task via an ACP agent.
     Run {
@@ -41,19 +35,23 @@ enum Cli {
     },
     /// Show workspace status.
     Status,
-}
-
-impl Default for Cli {
-    fn default() -> Self {
-        Cli::Tui
-    }
+    /// Diagnose project health (bare repo, worktrees, agent, logs).
+    Doctor,
+    /// Stop all running workers immediately.
+    Stop,
+    /// Run as an MCP stdio server (used by ACP agents, not for direct use).
+    Mcp {
+        /// Agent role: planner, merger, or worker. Controls which tools are exposed.
+        #[arg(long, default_value = "planner")]
+        role: String,
+    },
 }
 
 #[tokio::main]
 async fn main() {
-    let cli = Cli::try_parse().unwrap_or_default();
+    let cli = Cli::parse();
 
-    let is_tui = matches!(cli, Cli::Tui);
+    let is_tui = cli.cmd.is_none();
     // Keep the guard alive for the entire process — dropping it flushes
     // and closes the background writer thread.
     let _log_guard = init_logging(is_tui);
@@ -67,30 +65,38 @@ async fn main() {
             std::path::PathBuf::from("enki")
         });
 
-    let result = match cli {
-        Cli::Tui => {
-            let db_path = commands::db_path();
-            let db_path_str = db_path.to_str().unwrap().to_string();
-            let db = match commands::open_db() {
-                Ok(db) => db,
+    let result = match cli.cmd {
+        None => {
+            // Bare `enki` launches the TUI. Auto-initialize if needed.
+            if let Err(e) = commands::init().await {
+                eprintln!("error: failed to initialize project: {e}");
+                std::process::exit(1);
+            }
+
+            match commands::db_path().and_then(|p| {
+                let db_path_str = p.to_str().unwrap().to_string();
+                let db = commands::open_db()?;
+                Ok((db, db_path_str))
+            }) {
+                Ok((db, db_path_str)) => tui::run(db, db_path_str, enki_bin).await,
                 Err(e) => {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }
-            };
-            tui::run(db, db_path_str, enki_bin).await
+            }
         }
-        Cli::Init => commands::init().await,
-        Cli::Project { cmd } => commands::project(cmd).await,
-        Cli::Task { cmd } => commands::task(cmd).await,
-        Cli::Exec { cmd } => commands::exec(cmd).await,
-        Cli::Run {
+        Some(Cmd::Init) => commands::init().await,
+        Some(Cmd::Task { cmd }) => commands::task(cmd).await,
+        Some(Cmd::Run {
             task_id,
             agent,
             agent_args,
             keep,
-        } => commands::run(&task_id, &agent, &agent_args, keep, enki_bin).await,
-        Cli::Status => commands::status().await,
+        }) => commands::run(&task_id, &agent, &agent_args, keep, enki_bin).await,
+        Some(Cmd::Status) => commands::status().await,
+        Some(Cmd::Doctor) => commands::doctor().await,
+        Some(Cmd::Stop) => commands::stop().await,
+        Some(Cmd::Mcp { role }) => commands::mcp::run(&role),
     };
 
     if let Err(e) = result {
@@ -108,10 +114,7 @@ async fn main() {
 /// Non-TUI mode: logs to stderr as before. Returns None.
 fn init_logging(is_tui: bool) -> Option<tracing_appender::non_blocking::WorkerGuard> {
     if is_tui {
-        let log_dir = home::home_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(".enki")
-            .join("logs");
+        let log_dir = commands::global_dir().join("logs");
         std::fs::create_dir_all(&log_dir).ok();
 
         let file_appender = tracing_appender::rolling::never(&log_dir, "enki.log");

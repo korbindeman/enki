@@ -14,6 +14,8 @@ pub enum InputAction {
     ConfirmExit,
     /// Input content or cursor changed — caller should redraw.
     Changed,
+    /// User pressed Escape (input cleared) — caller should interrupt any active operation.
+    Interrupt,
 }
 
 /// Autocomplete state.
@@ -257,7 +259,7 @@ impl InputLine {
             KeyCode::Esc => {
                 self.text.clear();
                 self.cursor = 0;
-                InputAction::Changed
+                InputAction::Interrupt
             }
             _ => InputAction::None,
         }

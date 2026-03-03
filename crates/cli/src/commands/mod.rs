@@ -1,41 +1,73 @@
-mod exec;
+mod doctor;
 mod init;
-mod project;
+pub mod mcp;
 mod run;
 mod status;
+mod stop;
 mod task;
 
-pub use exec::{exec, ExecCmd};
+pub use doctor::doctor;
 pub use init::init;
-pub use project::{project, ProjectCmd};
 pub use run::run;
 pub use status::status;
+pub use stop::stop;
 pub use task::{task, TaskCmd};
 
 use std::path::PathBuf;
 
 use enki_core::db::Db;
 
-/// Default workspace directory.
-fn workspace_dir() -> PathBuf {
-    dirs().join(".enki")
+/// Find the `.enki/` directory by checking `ENKI_DIR` env var first,
+/// then looking in the current directory.
+pub fn enki_dir() -> anyhow::Result<PathBuf> {
+    if let Ok(dir) = std::env::var("ENKI_DIR") {
+        let p = PathBuf::from(dir);
+        if p.join("db.sqlite").exists() {
+            return Ok(p);
+        }
+        anyhow::bail!("ENKI_DIR={} does not contain db.sqlite", p.display());
+    }
+
+    let candidate = std::env::current_dir()?.join(".enki");
+    if candidate.join("db.sqlite").exists() {
+        return Ok(candidate);
+    }
+    anyhow::bail!("not an enki project (no .enki/ found in current directory). Run `enki init` first.");
 }
 
-/// Default database path.
-pub fn db_path() -> PathBuf {
-    workspace_dir().join("db.sqlite")
+/// Path to the project's SQLite database.
+pub fn db_path() -> anyhow::Result<PathBuf> {
+    Ok(enki_dir()?.join("db.sqlite"))
 }
 
-fn dirs() -> PathBuf {
-    home::home_dir().unwrap_or_else(|| PathBuf::from("."))
+/// Path to the bare git clone.
+pub fn bare_path() -> anyhow::Result<PathBuf> {
+    Ok(enki_dir()?.join("bare.git"))
 }
 
-/// Open the workspace database, or error if not initialized.
+/// Base directory for task worktrees.
+pub fn worktree_base() -> anyhow::Result<PathBuf> {
+    Ok(enki_dir()?.join("worktrees"))
+}
+
+/// Project root (parent of `.enki/`).
+pub fn project_root() -> anyhow::Result<PathBuf> {
+    Ok(enki_dir()?.parent().unwrap().to_path_buf())
+}
+
+/// Global enki directory for logs and shared caches.
+pub fn global_dir() -> PathBuf {
+    home::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".enki")
+}
+
+/// Open the project database, or error if not initialized.
 pub fn open_db() -> anyhow::Result<Db> {
-    let path = db_path();
+    let path = db_path()?;
     if !path.exists() {
         anyhow::bail!(
-            "workspace not initialized. Run `enki init` first."
+            "not an enki project (no .enki/ found). Run `enki init` first."
         );
     }
     Ok(Db::open(path.to_str().unwrap())?)

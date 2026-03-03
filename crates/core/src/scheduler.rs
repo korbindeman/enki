@@ -48,25 +48,20 @@ pub enum SchedulerAction {
         tier: Tier,
         execution_id: Id,
         step_id: String,
+        /// Outputs from completed upstream steps: (step_title, output_text).
+        upstream_outputs: Vec<(String, String)>,
     },
-    /// A task completed — update downstream.
-    TaskCompleted {
+    /// A task was blocked because a dependency failed.
+    TaskBlocked {
         task_id: Id,
         execution_id: Id,
         step_id: String,
-    },
-    /// A task failed.
-    TaskFailed {
-        task_id: Id,
-        execution_id: Id,
-        step_id: String,
-        reason: String,
     },
     /// An execution is fully complete (all nodes done).
     ExecutionComplete {
         execution_id: Id,
     },
-    /// An execution has failures.
+    /// An execution has failures and nothing left to run.
     ExecutionFailed {
         execution_id: Id,
     },
@@ -90,6 +85,13 @@ struct ExecutionState {
     step_tasks: HashMap<String, Id>,
     /// Maps step_id -> agent session_id for running steps.
     step_sessions: HashMap<String, String>,
+    /// Captured outputs from completed steps, keyed by step_id.
+    step_outputs: HashMap<String, String>,
+    /// Step IDs that have already been reported as blocked via TaskBlocked actions.
+    /// Prevents emitting duplicate TaskBlocked actions across ticks.
+    reported_blocked: std::collections::HashSet<String>,
+    /// When true, `tick()` skips this execution entirely.
+    paused: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -141,6 +143,11 @@ impl Scheduler {
         }
     }
 
+    /// Check whether an execution is already tracked by this scheduler.
+    pub fn has_execution(&self, execution_id: &str) -> bool {
+        self.executions.contains_key(execution_id)
+    }
+
     /// Register a new execution with its DAG.
     /// `step_tasks` maps step IDs to their corresponding task IDs in the DB.
     pub fn add_execution(
@@ -158,6 +165,50 @@ impl Scheduler {
                 dag,
                 step_tasks,
                 step_sessions: HashMap::new(),
+                step_outputs: HashMap::new(),
+                reported_blocked: std::collections::HashSet::new(),
+                paused: false,
+            },
+        );
+    }
+
+    /// Rebuild an execution from DB state (crash recovery).
+    /// `step_statuses` maps step_id -> NodeStatus derived from task statuses in the DB.
+    /// `step_outputs` maps step_id -> captured output for completed steps.
+    pub fn rebuild_execution(
+        &mut self,
+        execution_id: Id,
+        project_id: Id,
+        mut dag: Dag,
+        step_tasks: HashMap<String, Id>,
+        step_statuses: HashMap<String, NodeStatus>,
+        step_outputs: HashMap<String, String>,
+    ) {
+        // Apply DB-derived statuses to the DAG nodes.
+        // Tasks that were Running when we crashed get reset to Ready.
+        for (step_id, status) in &step_statuses {
+            let effective = if *status == NodeStatus::Running {
+                NodeStatus::Ready
+            } else {
+                *status
+            };
+            dag.set_status(step_id, effective);
+        }
+
+        // Re-evaluate: promote Pending nodes whose deps are all Done.
+        dag.reevaluate();
+
+        self.executions.insert(
+            execution_id.0.clone(),
+            ExecutionState {
+                execution_id,
+                project_id,
+                dag,
+                step_tasks,
+                step_sessions: HashMap::new(),
+                step_outputs,
+                reported_blocked: std::collections::HashSet::new(),
+                paused: false,
             },
         );
     }
@@ -171,6 +222,30 @@ impl Scheduler {
         for key in exec_keys {
             let exec = self.executions.get_mut(&key).unwrap();
 
+            // Skip paused executions entirely.
+            if exec.paused {
+                continue;
+            }
+
+            // Emit TaskBlocked for newly blocked nodes
+            let blocked: Vec<String> = exec
+                .dag
+                .blocked_nodes()
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            for step_id in blocked {
+                if exec.reported_blocked.insert(step_id.clone()) {
+                    if let Some(task_id) = exec.step_tasks.get(&step_id) {
+                        actions.push(SchedulerAction::TaskBlocked {
+                            task_id: task_id.clone(),
+                            execution_id: exec.execution_id.clone(),
+                            step_id,
+                        });
+                    }
+                }
+            }
+
             // Check for ready nodes we can assign
             let ready: Vec<String> = exec
                 .dag
@@ -180,14 +255,23 @@ impl Scheduler {
                 .collect();
 
             for step_id in ready {
-                // Extract node data before mutating the DAG
-                let (title, description, tier) = {
+                let (title, description, tier, upstream_outputs) = {
                     let node = exec.dag.get(&step_id).unwrap();
-                    (
-                        node.title.clone(),
-                        node.description.clone(),
-                        node.tier.unwrap_or(Tier::Standard),
-                    )
+                    let tier = node.tier.unwrap_or(Tier::Standard);
+
+                    // Collect outputs from all completed upstream deps
+                    let upstream: Vec<(String, String)> = node
+                        .deps
+                        .iter()
+                        .filter_map(|&dep_idx| {
+                            let dep = &exec.dag.nodes()[dep_idx];
+                            exec.step_outputs
+                                .get(&dep.id)
+                                .map(|out| (dep.title.clone(), out.clone()))
+                        })
+                        .collect();
+
+                    (node.title.clone(), node.description.clone(), tier, upstream)
                 };
 
                 if !self.running.can_run(tier, &self.limits) {
@@ -197,9 +281,11 @@ impl Scheduler {
                 exec.dag.mark_running(&step_id);
                 self.running.increment(tier);
 
-                let task_id = exec.step_tasks.get(&step_id).cloned().unwrap_or_else(|| {
-                    Id::new("task")
-                });
+                let task_id = exec
+                    .step_tasks
+                    .get(&step_id)
+                    .cloned()
+                    .unwrap_or_else(|| Id::new("task"));
 
                 actions.push(SchedulerAction::SpawnWorker {
                     task_id,
@@ -209,6 +295,7 @@ impl Scheduler {
                     tier,
                     execution_id: exec.execution_id.clone(),
                     step_id: step_id.clone(),
+                    upstream_outputs,
                 });
             }
 
@@ -218,7 +305,6 @@ impl Scheduler {
                     execution_id: exec.execution_id.clone(),
                 });
             } else if exec.dag.has_failures() {
-                // Check if there's nothing left to run (all remaining are blocked by failures)
                 let has_running = exec
                     .dag
                     .nodes()
@@ -247,8 +333,13 @@ impl Scheduler {
         actions
     }
 
-    /// Notify the scheduler that a step has completed.
-    pub fn step_completed(&mut self, execution_id: &str, step_id: &str) {
+    /// Notify the scheduler that a step has completed, with optional captured output.
+    pub fn step_completed(
+        &mut self,
+        execution_id: &str,
+        step_id: &str,
+        output: Option<String>,
+    ) {
         if let Some(exec) = self.executions.get_mut(execution_id) {
             let tier = exec
                 .dag
@@ -257,6 +348,9 @@ impl Scheduler {
                 .unwrap_or(Tier::Standard);
             exec.dag.mark_done(step_id);
             exec.step_sessions.remove(step_id);
+            if let Some(out) = output {
+                exec.step_outputs.insert(step_id.to_string(), out);
+            }
             self.running.decrement(tier);
         }
     }
@@ -282,7 +376,19 @@ impl Scheduler {
         }
     }
 
-    /// Get current worker counts.
+    /// Look up which execution and step a task belongs to.
+    pub fn find_task(&self, task_id: &Id) -> Option<(&str, &str)> {
+        for exec in self.executions.values() {
+            for (step_id, tid) in &exec.step_tasks {
+                if tid.0 == task_id.0 {
+                    return Some((&exec.execution_id.0, step_id));
+                }
+            }
+        }
+        None
+    }
+
+    /// Get current worker counts: (total, heavy, standard, light).
     pub fn worker_counts(&self) -> (usize, usize, usize, usize) {
         (
             self.running.total(),
@@ -292,9 +398,133 @@ impl Scheduler {
         )
     }
 
+    /// Abort all active executions immediately.
+    /// Returns a list of (execution_id, step_id, task_id) for every running step
+    /// so the caller can kill sessions and update the DB.
+    pub fn abort_all(&mut self) -> Vec<(String, String, Id)> {
+        let mut aborted = Vec::new();
+        for exec in self.executions.values() {
+            for node in exec.dag.nodes() {
+                if node.status == NodeStatus::Running {
+                    if let Some(task_id) = exec.step_tasks.get(&node.id) {
+                        aborted.push((
+                            exec.execution_id.0.clone(),
+                            node.id.clone(),
+                            task_id.clone(),
+                        ));
+                    }
+                }
+            }
+        }
+        self.executions.clear();
+        self.running = TierCounts::default();
+        aborted
+    }
+
+    /// Get all (execution_id, step_id, task_id) triples where the step is still Running.
+    pub fn running_steps(&self) -> Vec<(String, String, Id)> {
+        let mut result = Vec::new();
+        for exec in self.executions.values() {
+            for node in exec.dag.nodes() {
+                if node.status == NodeStatus::Running {
+                    if let Some(task_id) = exec.step_tasks.get(&node.id) {
+                        result.push((
+                            exec.execution_id.0.clone(),
+                            node.id.clone(),
+                            task_id.clone(),
+                        ));
+                    }
+                }
+            }
+        }
+        result
+    }
+
     /// Get all active execution IDs.
     pub fn active_executions(&self) -> Vec<&str> {
         self.executions.keys().map(|s| s.as_str()).collect()
+    }
+
+    /// Pause an entire execution. `tick()` will skip it.
+    pub fn pause_execution(&mut self, execution_id: &str) -> bool {
+        if let Some(exec) = self.executions.get_mut(execution_id) {
+            exec.paused = true;
+            return true;
+        }
+        false
+    }
+
+    /// Resume a paused execution. Next `tick()` will process it.
+    pub fn resume_execution(&mut self, execution_id: &str) -> bool {
+        if let Some(exec) = self.executions.get_mut(execution_id) {
+            exec.paused = false;
+            return true;
+        }
+        false
+    }
+
+    /// Cancel an entire execution. Returns `(task_id, session_id)` pairs
+    /// for running steps that need to be killed.
+    pub fn cancel_execution(&mut self, execution_id: &str) -> Vec<(Id, String)> {
+        let mut to_kill = Vec::new();
+        if let Some(exec) = self.executions.remove(execution_id) {
+            for node in exec.dag.nodes() {
+                if node.status == NodeStatus::Running {
+                    if let Some(task_id) = exec.step_tasks.get(&node.id) {
+                        if let Some(session_id) = exec.step_sessions.get(&node.id) {
+                            to_kill.push((task_id.clone(), session_id.clone()));
+                        }
+                    }
+                }
+            }
+            // Decrement running counts for killed workers.
+            for node in exec.dag.nodes() {
+                if node.status == NodeStatus::Running {
+                    let tier = node.tier.unwrap_or(Tier::Standard);
+                    self.running.decrement(tier);
+                }
+            }
+        }
+        to_kill
+    }
+
+    /// Pause a single node within an execution.
+    /// Returns `Some(session_id)` if the node was Running (caller must kill it).
+    pub fn pause_node(&mut self, execution_id: &str, step_id: &str) -> Option<String> {
+        let exec = self.executions.get_mut(execution_id)?;
+        let was_running = exec.dag.pause_node(step_id)?;
+        if was_running {
+            let tier = exec.dag.get(step_id).map(|n| n.tier.unwrap_or(Tier::Standard)).unwrap_or(Tier::Standard);
+            self.running.decrement(tier);
+            return exec.step_sessions.remove(step_id);
+        }
+        None
+    }
+
+    /// Resume a paused node within an execution.
+    pub fn resume_node(&mut self, execution_id: &str, step_id: &str) -> bool {
+        if let Some(exec) = self.executions.get_mut(execution_id) {
+            return exec.dag.resume_node(step_id);
+        }
+        false
+    }
+
+    /// Cancel a single node within an execution.
+    /// Returns `Some(session_id)` if the node was Running (caller must kill it).
+    pub fn cancel_node(&mut self, execution_id: &str, step_id: &str) -> Option<String> {
+        let exec = self.executions.get_mut(execution_id)?;
+        let was_running = exec.dag.cancel_node(step_id)?;
+        if was_running {
+            let tier = exec.dag.get(step_id).map(|n| n.tier.unwrap_or(Tier::Standard)).unwrap_or(Tier::Standard);
+            self.running.decrement(tier);
+            return exec.step_sessions.remove(step_id);
+        }
+        None
+    }
+
+    /// Check if an execution is paused.
+    pub fn is_execution_paused(&self, execution_id: &str) -> bool {
+        self.executions.get(execution_id).map_or(false, |e| e.paused)
     }
 }
 
@@ -302,59 +532,20 @@ impl Scheduler {
 mod tests {
     use super::*;
     use crate::dag::Dag;
-    use crate::template::Template;
     use std::collections::HashMap as StdMap;
 
-    const SHINY: &str = r#"
-name = "shiny"
-description = "Design before code"
-
-[vars.feature]
-description = "Feature"
-required = true
-
-[[steps]]
-id = "design"
-title = "Design"
-description = "Design {{feature}}"
-tier = "heavy"
-
-[[steps]]
-id = "implement"
-title = "Implement"
-description = "Implement {{feature}}"
-needs = ["design"]
-tier = "standard"
-
-[[steps]]
-id = "test"
-title = "Test"
-description = "Test {{feature}}"
-needs = ["design"]
-tier = "light"
-
-[[steps]]
-id = "review"
-title = "Review"
-description = "Review {{feature}}"
-needs = ["implement", "test"]
-tier = "standard"
-
-[[steps]]
-id = "merge"
-title = "Merge"
-description = "Merge {{feature}}"
-needs = ["review"]
-tier = "light"
-"#;
+    fn make_dag() -> Dag {
+        Dag::from_steps(&[
+            ("design".into(), "Design".into(), "Design auth".into(), Some(Tier::Heavy), vec![]),
+            ("implement".into(), "Implement".into(), "Implement auth".into(), Some(Tier::Standard), vec!["design".into()]),
+            ("test".into(), "Test".into(), "Test auth".into(), Some(Tier::Light), vec!["design".into()]),
+            ("review".into(), "Review".into(), "Review auth".into(), Some(Tier::Standard), vec!["implement".into(), "test".into()]),
+            ("merge".into(), "Merge".into(), "Merge auth".into(), Some(Tier::Light), vec!["review".into()]),
+        ])
+    }
 
     fn make_scheduler_and_dag() -> (Scheduler, Id, StdMap<String, Id>) {
-        let template = Template::from_toml(SHINY).unwrap();
-        let mut vars = StdMap::new();
-        vars.insert("feature".into(), "auth".into());
-        let rendered = template.render(&vars).unwrap();
-        let dag = Dag::from_template(&rendered);
-
+        let dag = make_dag();
         let exec_id = Id::new("exec");
         let project_id = Id::new("proj");
 
@@ -376,9 +567,15 @@ tier = "light"
 
         assert_eq!(actions.len(), 1);
         match &actions[0] {
-            SchedulerAction::SpawnWorker { title, tier, .. } => {
+            SchedulerAction::SpawnWorker {
+                title,
+                tier,
+                upstream_outputs,
+                ..
+            } => {
                 assert_eq!(title, "Design");
                 assert_eq!(*tier, Tier::Heavy);
+                assert!(upstream_outputs.is_empty());
             }
             other => panic!("expected SpawnWorker, got {other:?}"),
         }
@@ -389,25 +586,53 @@ tier = "light"
         let (mut scheduler, exec_id, _) = make_scheduler_and_dag();
         scheduler.tick(); // spawns design
 
-        scheduler.step_completed(&exec_id.0, "design");
+        scheduler.step_completed(&exec_id.0, "design", Some("design output".into()));
         let actions = scheduler.tick();
 
-        // implement (standard) and test (light) should both spawn
         let spawn_actions: Vec<_> = actions
             .iter()
             .filter(|a| matches!(a, SchedulerAction::SpawnWorker { .. }))
             .collect();
         assert_eq!(spawn_actions.len(), 2);
 
-        let titles: Vec<&str> = spawn_actions
+        // Both should have upstream output from design
+        for action in &spawn_actions {
+            if let SchedulerAction::SpawnWorker {
+                upstream_outputs, ..
+            } = action
+            {
+                assert_eq!(upstream_outputs.len(), 1);
+                assert_eq!(upstream_outputs[0].0, "Design");
+                assert_eq!(upstream_outputs[0].1, "design output");
+            }
+        }
+    }
+
+    #[test]
+    fn upstream_outputs_accumulate() {
+        let (mut scheduler, exec_id, _) = make_scheduler_and_dag();
+        scheduler.tick();
+        scheduler.step_completed(&exec_id.0, "design", Some("design output".into()));
+        scheduler.tick();
+        scheduler.step_completed(&exec_id.0, "implement", Some("impl output".into()));
+        scheduler.step_completed(&exec_id.0, "test", Some("test output".into()));
+
+        let actions = scheduler.tick();
+        let review_action = actions
             .iter()
-            .map(|a| match a {
-                SchedulerAction::SpawnWorker { title, .. } => title.as_str(),
-                _ => unreachable!(),
-            })
-            .collect();
-        assert!(titles.contains(&"Implement"));
-        assert!(titles.contains(&"Test"));
+            .find(|a| matches!(a, SchedulerAction::SpawnWorker { title, .. } if title == "Review"))
+            .unwrap();
+
+        if let SchedulerAction::SpawnWorker {
+            upstream_outputs, ..
+        } = review_action
+        {
+            // review depends on implement and test
+            assert_eq!(upstream_outputs.len(), 2);
+            let titles: Vec<&str> = upstream_outputs.iter().map(|(t, _)| t.as_str()).collect();
+            assert!(titles.contains(&"Implement"));
+            assert!(titles.contains(&"Test"));
+        }
     }
 
     #[test]
@@ -418,32 +643,40 @@ tier = "light"
         let actions = scheduler.tick();
         assert_eq!(actions.len(), 1);
 
-        scheduler.step_completed(&exec_id.0, "design");
+        scheduler.step_completed(&exec_id.0, "design", None);
 
         // Tick 2: implement + test in parallel
         let actions = scheduler.tick();
         assert_eq!(actions.len(), 2);
 
-        scheduler.step_completed(&exec_id.0, "implement");
-        scheduler.step_completed(&exec_id.0, "test");
+        scheduler.step_completed(&exec_id.0, "implement", None);
+        scheduler.step_completed(&exec_id.0, "test", None);
 
         // Tick 3: review
         let actions = scheduler.tick();
         assert_eq!(actions.len(), 1);
-        assert!(matches!(&actions[0], SchedulerAction::SpawnWorker { title, .. } if title == "Review"));
+        assert!(matches!(
+            &actions[0],
+            SchedulerAction::SpawnWorker { title, .. } if title == "Review"
+        ));
 
-        scheduler.step_completed(&exec_id.0, "review");
+        scheduler.step_completed(&exec_id.0, "review", None);
 
         // Tick 4: merge
         let actions = scheduler.tick();
         assert_eq!(actions.len(), 1);
-        assert!(matches!(&actions[0], SchedulerAction::SpawnWorker { title, .. } if title == "Merge"));
+        assert!(matches!(
+            &actions[0],
+            SchedulerAction::SpawnWorker { title, .. } if title == "Merge"
+        ));
 
-        scheduler.step_completed(&exec_id.0, "merge");
+        scheduler.step_completed(&exec_id.0, "merge", None);
 
         // Tick 5: execution complete
         let actions = scheduler.tick();
-        assert!(actions.iter().any(|a| matches!(a, SchedulerAction::ExecutionComplete { .. })));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, SchedulerAction::ExecutionComplete { .. })));
     }
 
     #[test]
@@ -455,26 +688,12 @@ tier = "light"
             max_light: 5,
         };
 
-        // Two executions both needing standard-tier work
-        let template = Template::from_toml(
-            r#"
-name = "simple"
-description = "one step"
-
-[[steps]]
-id = "work"
-title = "Work"
-description = "do work"
-tier = "standard"
-"#,
-        )
-        .unwrap();
-
         let mut scheduler = Scheduler::new(limits);
 
-        // Add two executions
         for _ in 0..2 {
-            let dag = Dag::from_template(&template);
+            let dag = Dag::from_steps(&[
+                ("work".into(), "Work".into(), "do work".into(), Some(Tier::Standard), vec![]),
+            ]);
             let exec_id = Id::new("exec");
             let mut step_tasks = StdMap::new();
             step_tasks.insert("work".into(), Id::new("task"));
@@ -482,7 +701,6 @@ tier = "standard"
         }
 
         let actions = scheduler.tick();
-        // Only 1 should spawn (max_standard = 1)
         let spawns: Vec<_> = actions
             .iter()
             .filter(|a| matches!(a, SchedulerAction::SpawnWorker { .. }))
@@ -491,22 +709,31 @@ tier = "standard"
     }
 
     #[test]
-    fn failure_propagation() {
-        let (mut scheduler, exec_id, _) = make_scheduler_and_dag();
+    fn failure_propagation_with_blocked_actions() {
+        let (mut scheduler, exec_id, _step_tasks) = make_scheduler_and_dag();
         scheduler.tick(); // design
 
         scheduler.step_failed(&exec_id.0, "design");
         let actions = scheduler.tick();
 
-        // No new spawns (implement and test depend on design)
+        // No new spawns
         let spawns: Vec<_> = actions
             .iter()
             .filter(|a| matches!(a, SchedulerAction::SpawnWorker { .. }))
             .collect();
         assert!(spawns.is_empty());
 
+        // Should have TaskBlocked for all downstream nodes
+        let blocked: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, SchedulerAction::TaskBlocked { .. }))
+            .collect();
+        assert_eq!(blocked.len(), 4); // implement, test, review, merge
+
         // Execution should be marked failed
-        assert!(actions.iter().any(|a| matches!(a, SchedulerAction::ExecutionFailed { .. })));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, SchedulerAction::ExecutionFailed { .. })));
     }
 
     #[test]
@@ -518,10 +745,181 @@ tier = "standard"
         scheduler.tick(); // design (heavy)
         assert_eq!(scheduler.worker_counts(), (1, 1, 0, 0));
 
-        scheduler.step_completed(&exec_id.0, "design");
+        scheduler.step_completed(&exec_id.0, "design", None);
         assert_eq!(scheduler.worker_counts(), (0, 0, 0, 0));
 
         scheduler.tick(); // implement (standard) + test (light)
         assert_eq!(scheduler.worker_counts(), (2, 0, 1, 1));
+    }
+
+    #[test]
+    fn find_task_lookup() {
+        let (scheduler, exec_id, step_tasks) = make_scheduler_and_dag();
+        let design_task_id = step_tasks.get("design").unwrap();
+
+        let result = scheduler.find_task(design_task_id);
+        assert!(result.is_some());
+        let (found_exec, found_step) = result.unwrap();
+        assert_eq!(found_exec, exec_id.0);
+        assert_eq!(found_step, "design");
+    }
+
+    #[test]
+    fn abort_all_clears_everything() {
+        let (mut scheduler, exec_id, _step_tasks) = make_scheduler_and_dag();
+        scheduler.tick(); // design spawned (running)
+
+        scheduler.step_completed(&exec_id.0, "design", None);
+        scheduler.tick(); // implement + test spawned (running)
+
+        assert_eq!(scheduler.worker_counts().0, 2);
+        assert_eq!(scheduler.active_executions().len(), 1);
+
+        let aborted = scheduler.abort_all();
+        assert_eq!(aborted.len(), 2); // implement and test were running
+
+        // Scheduler is fully reset
+        assert_eq!(scheduler.worker_counts(), (0, 0, 0, 0));
+        assert!(scheduler.active_executions().is_empty());
+
+        // A tick produces no actions
+        assert!(scheduler.tick().is_empty());
+    }
+
+    #[test]
+    fn crash_recovery_rebuild() {
+        let dag = make_dag();
+        let exec_id = Id::new("exec");
+        let project_id = Id::new("proj");
+
+        let step_tasks: StdMap<String, Id> = ["design", "implement", "test", "review", "merge"]
+            .iter()
+            .map(|s| (s.to_string(), Id::new("task")))
+            .collect();
+
+        // Simulate crash mid-execution: design Done, implement was Running (reset to Ready)
+        let mut step_statuses = StdMap::new();
+        step_statuses.insert("design".into(), NodeStatus::Done);
+        step_statuses.insert("implement".into(), NodeStatus::Running); // will be reset to Ready
+        step_statuses.insert("test".into(), NodeStatus::Pending);
+        step_statuses.insert("review".into(), NodeStatus::Pending);
+        step_statuses.insert("merge".into(), NodeStatus::Pending);
+
+        let mut step_outputs = StdMap::new();
+        step_outputs.insert("design".into(), "design output".into());
+
+        let mut scheduler = Scheduler::new(Limits::default());
+        scheduler.rebuild_execution(
+            exec_id.clone(),
+            project_id,
+            dag,
+            step_tasks,
+            step_statuses,
+            step_outputs,
+        );
+
+        let actions = scheduler.tick();
+
+        let mut spawns: Vec<&str> = actions
+            .iter()
+            .filter_map(|a| match a {
+                SchedulerAction::SpawnWorker { title, .. } => Some(title.as_str()),
+                _ => None,
+            })
+            .collect();
+        spawns.sort();
+
+        // implement was Running → reset to Ready
+        // test was Pending but design is Done → reevaluate promotes to Ready
+        // Both should spawn
+        assert_eq!(spawns, vec!["Implement", "Test"]);
+
+        // implement should have upstream output from design
+        let impl_action = actions.iter().find(|a| matches!(a, SchedulerAction::SpawnWorker { title, .. } if title == "Implement")).unwrap();
+        if let SchedulerAction::SpawnWorker { upstream_outputs, .. } = impl_action {
+            assert_eq!(upstream_outputs.len(), 1);
+            assert_eq!(upstream_outputs[0].1, "design output");
+        }
+    }
+
+    #[test]
+    fn pause_execution_skips_tick() {
+        let (mut scheduler, exec_id, _) = make_scheduler_and_dag();
+        scheduler.tick(); // spawns design
+
+        scheduler.step_completed(&exec_id.0, "design", None);
+        scheduler.pause_execution(&exec_id.0);
+
+        // Tick while paused — should produce no actions.
+        let actions = scheduler.tick();
+        assert!(actions.is_empty());
+        assert!(scheduler.is_execution_paused(&exec_id.0));
+
+        // Resume and tick — should spawn implement + test.
+        scheduler.resume_execution(&exec_id.0);
+        let actions = scheduler.tick();
+        let spawns: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, SchedulerAction::SpawnWorker { .. }))
+            .collect();
+        assert_eq!(spawns.len(), 2);
+    }
+
+    #[test]
+    fn cancel_execution_returns_running_sessions() {
+        let (mut scheduler, exec_id, _) = make_scheduler_and_dag();
+        scheduler.tick(); // spawns design
+        scheduler.set_step_session(&exec_id.0, "design", "sess-1".into());
+
+        let to_kill = scheduler.cancel_execution(&exec_id.0);
+        assert_eq!(to_kill.len(), 1);
+        assert_eq!(to_kill[0].1, "sess-1");
+
+        // Execution is removed.
+        assert!(scheduler.active_executions().is_empty());
+        assert_eq!(scheduler.worker_counts().0, 0);
+    }
+
+    #[test]
+    fn pause_resume_node() {
+        let (mut scheduler, exec_id, _) = make_scheduler_and_dag();
+        scheduler.tick(); // spawns design
+
+        scheduler.step_completed(&exec_id.0, "design", None);
+        scheduler.tick(); // spawns implement + test
+
+        // Pause implement (Running → Paused, returns session if registered)
+        scheduler.set_step_session(&exec_id.0, "implement", "sess-impl".into());
+        let session = scheduler.pause_node(&exec_id.0, "implement");
+        assert_eq!(session, Some("sess-impl".into()));
+
+        // Worker count decremented.
+        let (_total, _, standard, _) = scheduler.worker_counts();
+        assert_eq!(standard, 0);
+
+        // Resume implement.
+        assert!(scheduler.resume_node(&exec_id.0, "implement"));
+    }
+
+    #[test]
+    fn cancel_node_cascades() {
+        let (mut scheduler, exec_id, _) = make_scheduler_and_dag();
+        scheduler.tick(); // spawns design
+
+        scheduler.step_completed(&exec_id.0, "design", None);
+        scheduler.tick(); // spawns implement + test
+
+        scheduler.set_step_session(&exec_id.0, "implement", "sess-impl".into());
+        let session = scheduler.cancel_node(&exec_id.0, "implement");
+        assert_eq!(session, Some("sess-impl".into()));
+
+        // tick — test is still running, review/merge are cancelled by DAG cascade
+        let actions = scheduler.tick();
+        // No new spawns since review's deps aren't all done (implement cancelled, not done).
+        let spawns: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, SchedulerAction::SpawnWorker { .. }))
+            .collect();
+        assert!(spawns.is_empty());
     }
 }

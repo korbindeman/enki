@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use crate::template::Template;
 use crate::types::Tier;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10,6 +9,9 @@ pub enum NodeStatus {
     Running,
     Done,
     Failed,
+    Blocked,
+    Paused,
+    Cancelled,
 }
 
 #[derive(Debug, Clone)]
@@ -33,33 +35,50 @@ pub struct Dag {
 }
 
 impl Dag {
-    /// Build a DAG from a rendered template.
-    /// The template must already be validated (no cycles, no unknown deps).
-    pub fn from_template(template: &Template) -> Self {
-        let mut nodes = Vec::with_capacity(template.steps.len());
+    /// Build a single-node DAG for a standalone task.
+    pub fn single(step_id: &str, title: &str, description: &str, tier: Option<Tier>) -> Self {
+        let mut index = HashMap::new();
+        index.insert(step_id.to_string(), 0);
+        Dag {
+            nodes: vec![Node {
+                id: step_id.to_string(),
+                title: title.to_string(),
+                description: description.to_string(),
+                tier,
+                status: NodeStatus::Ready,
+                deps: Vec::new(),
+                dependents: Vec::new(),
+            }],
+            index,
+        }
+    }
+
+    /// Build a DAG from raw step data (e.g. reconstructed from the DB).
+    /// Each tuple is (step_id, title, description, tier, dep_step_ids).
+    pub fn from_steps(steps: &[(String, String, String, Option<Tier>, Vec<String>)]) -> Self {
+        let mut nodes = Vec::with_capacity(steps.len());
         let mut index = HashMap::new();
 
-        // Create nodes
-        for (i, step) in template.steps.iter().enumerate() {
-            index.insert(step.id.clone(), i);
+        for (i, (step_id, title, description, tier, _)) in steps.iter().enumerate() {
+            index.insert(step_id.clone(), i);
             nodes.push(Node {
-                id: step.id.clone(),
-                title: step.title.clone(),
-                description: step.description.clone(),
-                tier: step.tier,
+                id: step_id.clone(),
+                title: title.clone(),
+                description: description.clone(),
+                tier: *tier,
                 status: NodeStatus::Pending,
                 deps: Vec::new(),
                 dependents: Vec::new(),
             });
         }
 
-        // Wire up edges
-        for step in &template.steps {
-            let node_idx = index[&step.id];
-            for dep_id in &step.needs {
-                let dep_idx = index[dep_id];
-                nodes[node_idx].deps.push(dep_idx);
-                nodes[dep_idx].dependents.push(node_idx);
+        for (step_id, _, _, _, dep_ids) in steps {
+            let node_idx = index[step_id];
+            for dep_id in dep_ids {
+                if let Some(&dep_idx) = index.get(dep_id) {
+                    nodes[node_idx].deps.push(dep_idx);
+                    nodes[dep_idx].dependents.push(node_idx);
+                }
             }
         }
 
@@ -110,20 +129,125 @@ impl Dag {
         false
     }
 
-    /// Mark a node as failed.
+    /// Mark a node as failed and cascade Blocked to all transitive dependents.
     pub fn mark_failed(&mut self, id: &str) -> bool {
         if let Some(&idx) = self.index.get(id) {
             if self.nodes[idx].status == NodeStatus::Running {
                 self.nodes[idx].status = NodeStatus::Failed;
+                self.cascade_blocked(idx);
                 return true;
             }
         }
         false
     }
 
-    /// Is every node done?
+    /// Node IDs that are blocked (dependency failed).
+    pub fn blocked_nodes(&self) -> Vec<&str> {
+        self.nodes
+            .iter()
+            .filter(|n| n.status == NodeStatus::Blocked)
+            .map(|n| n.id.as_str())
+            .collect()
+    }
+
+    /// Pause a node. Ready/Pending → Paused. Returns true if the node was
+    /// Running (caller must kill the worker). Returns false if the node
+    /// can't be paused (Done/Failed/Cancelled).
+    pub fn pause_node(&mut self, id: &str) -> Option<bool> {
+        let &idx = self.index.get(id)?;
+        match self.nodes[idx].status {
+            NodeStatus::Ready | NodeStatus::Pending => {
+                self.nodes[idx].status = NodeStatus::Paused;
+                Some(false)
+            }
+            NodeStatus::Running => {
+                self.nodes[idx].status = NodeStatus::Paused;
+                Some(true) // caller must kill the worker
+            }
+            _ => None, // can't pause Done/Failed/Blocked/Cancelled/already Paused
+        }
+    }
+
+    /// Resume a paused node. Re-evaluates deps first: if all deps are done,
+    /// the node goes to Ready; otherwise back to Pending.
+    pub fn resume_node(&mut self, id: &str) -> bool {
+        let Some(&idx) = self.index.get(id) else {
+            return false;
+        };
+        if self.nodes[idx].status != NodeStatus::Paused {
+            return false;
+        }
+        let all_deps_done = self.nodes[idx]
+            .deps
+            .iter()
+            .all(|&dep_idx| self.nodes[dep_idx].status == NodeStatus::Done);
+        self.nodes[idx].status = if all_deps_done {
+            NodeStatus::Ready
+        } else {
+            NodeStatus::Pending
+        };
+        true
+    }
+
+    /// Cancel a node and cascade Cancelled to all transitive dependents
+    /// that are Pending/Ready/Blocked/Paused. Returns true if the node
+    /// was Running (caller must kill the worker).
+    pub fn cancel_node(&mut self, id: &str) -> Option<bool> {
+        let &idx = self.index.get(id)?;
+        match self.nodes[idx].status {
+            NodeStatus::Done | NodeStatus::Cancelled => None,
+            NodeStatus::Running => {
+                self.nodes[idx].status = NodeStatus::Cancelled;
+                self.cascade_cancelled(idx);
+                Some(true) // caller must kill the worker
+            }
+            _ => {
+                self.nodes[idx].status = NodeStatus::Cancelled;
+                self.cascade_cancelled(idx);
+                Some(false)
+            }
+        }
+    }
+
+    /// Set a node's status directly (used for crash recovery).
+    pub fn set_status(&mut self, id: &str, status: NodeStatus) -> bool {
+        if let Some(&idx) = self.index.get(id) {
+            self.nodes[idx].status = status;
+            return true;
+        }
+        false
+    }
+
+    /// Propagate Blocked status to all transitive dependents of a failed node.
+    fn cascade_blocked(&mut self, failed_idx: usize) {
+        let mut stack = self.nodes[failed_idx].dependents.clone();
+        while let Some(idx) = stack.pop() {
+            if matches!(self.nodes[idx].status, NodeStatus::Pending | NodeStatus::Ready) {
+                self.nodes[idx].status = NodeStatus::Blocked;
+                stack.extend(self.nodes[idx].dependents.iter().copied());
+            }
+        }
+    }
+
+    /// Propagate Cancelled to transitive dependents that haven't completed.
+    fn cascade_cancelled(&mut self, cancelled_idx: usize) {
+        let mut stack = self.nodes[cancelled_idx].dependents.clone();
+        while let Some(idx) = stack.pop() {
+            if matches!(
+                self.nodes[idx].status,
+                NodeStatus::Pending | NodeStatus::Ready | NodeStatus::Blocked | NodeStatus::Paused
+            ) {
+                self.nodes[idx].status = NodeStatus::Cancelled;
+                stack.extend(self.nodes[idx].dependents.iter().copied());
+            }
+        }
+    }
+
+    /// Is every node in a terminal state (Done or Cancelled)?
     pub fn is_complete(&self) -> bool {
-        self.nodes.iter().all(|n| n.status == NodeStatus::Done)
+        self.nodes
+            .iter()
+            .all(|n| matches!(n.status, NodeStatus::Done | NodeStatus::Cancelled))
     }
 
     /// Is any node failed?
@@ -131,7 +255,13 @@ impl Dag {
         self.nodes.iter().any(|n| n.status == NodeStatus::Failed)
     }
 
+    /// Public re-evaluation (used after crash recovery to promote pending nodes).
+    pub fn reevaluate(&mut self) {
+        self.evaluate_ready();
+    }
+
     /// Re-evaluate pending nodes to see if they're now ready.
+    /// Skips Paused and Cancelled nodes.
     fn evaluate_ready(&mut self) {
         for i in 0..self.nodes.len() {
             if self.nodes[i].status != NodeStatus::Pending {
@@ -151,59 +281,21 @@ impl Dag {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::template::Template;
-    use std::collections::HashMap;
 
-    const SHINY: &str = r#"
-name = "shiny"
-description = "Design before code, review before ship"
-
-[vars.feature]
-description = "Feature to implement"
-required = true
-
-[[steps]]
-id = "design"
-title = "Design"
-description = "Think about architecture for {{feature}}"
-
-[[steps]]
-id = "implement"
-title = "Implement"
-description = "Implement {{feature}} based on the design"
-needs = ["design"]
-
-[[steps]]
-id = "test"
-title = "Test"
-description = "Write tests for {{feature}}"
-needs = ["design"]
-
-[[steps]]
-id = "review"
-title = "Review"
-description = "Review implementation and tests for {{feature}}"
-needs = ["implement", "test"]
-
-[[steps]]
-id = "merge"
-title = "Merge"
-description = "Merge {{feature}} to main"
-needs = ["review"]
-"#;
-
+    /// Build the "shiny" diamond DAG: design → {implement, test} → review → merge
     fn make_dag() -> Dag {
-        let template = Template::from_toml(SHINY).unwrap();
-        let mut vars = HashMap::new();
-        vars.insert("feature".into(), "auth".into());
-        let rendered = template.render(&vars).unwrap();
-        Dag::from_template(&rendered)
+        Dag::from_steps(&[
+            ("design".into(), "Design".into(), "Think about architecture for auth".into(), Some(Tier::Heavy), vec![]),
+            ("implement".into(), "Implement".into(), "Implement auth based on the design".into(), Some(Tier::Standard), vec!["design".into()]),
+            ("test".into(), "Test".into(), "Write tests for auth".into(), Some(Tier::Light), vec!["design".into()]),
+            ("review".into(), "Review".into(), "Review implementation and tests for auth".into(), Some(Tier::Standard), vec!["implement".into(), "test".into()]),
+            ("merge".into(), "Merge".into(), "Merge auth to main".into(), Some(Tier::Light), vec!["review".into()]),
+        ])
     }
 
     #[test]
     fn initial_ready_nodes() {
         let dag = make_dag();
-        // Only "design" has no deps, so it should be ready
         let ready = dag.ready_nodes();
         assert_eq!(ready, vec!["design"]);
     }
@@ -217,7 +309,6 @@ needs = ["review"]
         dag.mark_done("design");
         let mut ready = dag.ready_nodes();
         ready.sort();
-        // implement and test can run in parallel
         assert_eq!(ready, vec!["implement", "test"]);
     }
 
@@ -230,7 +321,6 @@ needs = ["review"]
         dag.mark_running("implement");
         dag.mark_running("test");
         dag.mark_done("implement");
-        // review not ready yet — test still running
         assert!(dag.ready_nodes().is_empty());
 
         dag.mark_done("test");
@@ -266,16 +356,40 @@ needs = ["review"]
         dag.mark_failed("design");
         assert!(dag.has_failures());
         assert!(!dag.is_complete());
-        // Nothing becomes ready after a failure
         assert!(dag.ready_nodes().is_empty());
+    }
+
+    #[test]
+    fn failure_cascade_blocks_dependents() {
+        let mut dag = make_dag();
+        dag.mark_running("design");
+        dag.mark_failed("design");
+
+        let mut blocked = dag.blocked_nodes();
+        blocked.sort();
+        assert_eq!(blocked, vec!["implement", "merge", "review", "test"]);
+    }
+
+    #[test]
+    fn failure_cascade_partial() {
+        let mut dag = make_dag();
+        dag.mark_running("design");
+        dag.mark_done("design");
+
+        dag.mark_running("implement");
+        dag.mark_running("test");
+        dag.mark_failed("implement");
+
+        assert_eq!(dag.get("test").unwrap().status, NodeStatus::Running);
+        let mut blocked = dag.blocked_nodes();
+        blocked.sort();
+        assert_eq!(blocked, vec!["merge", "review"]);
     }
 
     #[test]
     fn invalid_transitions() {
         let mut dag = make_dag();
-        // Can't mark a pending node as done
         assert!(!dag.mark_done("design"));
-        // Can't mark a non-ready node as running
         assert!(!dag.mark_running("implement"));
     }
 
@@ -286,34 +400,124 @@ needs = ["review"]
         assert_eq!(design.title, "Design");
         assert_eq!(design.description, "Think about architecture for auth");
         assert!(design.deps.is_empty());
-        assert_eq!(design.dependents.len(), 2); // implement and test
+        assert_eq!(design.dependents.len(), 2);
     }
 
     #[test]
-    fn linear_template() {
-        let toml = r#"
-name = "linear"
-description = "sequential steps"
+    fn pause_ready_node() {
+        let mut dag = make_dag();
+        // design is Ready, pause it
+        let was_running = dag.pause_node("design");
+        assert_eq!(was_running, Some(false));
+        assert_eq!(dag.get("design").unwrap().status, NodeStatus::Paused);
+        assert!(dag.ready_nodes().is_empty());
+    }
 
-[[steps]]
-id = "a"
-title = "A"
-description = "first"
+    #[test]
+    fn pause_running_node() {
+        let mut dag = make_dag();
+        dag.mark_running("design");
+        let was_running = dag.pause_node("design");
+        assert_eq!(was_running, Some(true)); // caller must kill
+        assert_eq!(dag.get("design").unwrap().status, NodeStatus::Paused);
+    }
 
-[[steps]]
-id = "b"
-title = "B"
-description = "second"
-needs = ["a"]
+    #[test]
+    fn pause_done_node_fails() {
+        let mut dag = make_dag();
+        dag.mark_running("design");
+        dag.mark_done("design");
+        assert_eq!(dag.pause_node("design"), None);
+    }
 
-[[steps]]
-id = "c"
-title = "C"
-description = "third"
-needs = ["b"]
-"#;
-        let template = Template::from_toml(toml).unwrap();
-        let mut dag = Dag::from_template(&template);
+    #[test]
+    fn resume_paused_node_ready() {
+        let mut dag = make_dag();
+        dag.pause_node("design");
+        assert!(dag.resume_node("design"));
+        // design has no deps, so it goes to Ready
+        assert_eq!(dag.get("design").unwrap().status, NodeStatus::Ready);
+    }
+
+    #[test]
+    fn resume_paused_node_pending() {
+        let mut dag = make_dag();
+        // Advance design, then pause implement (whose dep design is not done yet — actually design is done)
+        dag.mark_running("design");
+        dag.mark_done("design");
+        // Now implement is Ready. Pause it, then resume
+        dag.pause_node("implement");
+        assert!(dag.resume_node("implement"));
+        assert_eq!(dag.get("implement").unwrap().status, NodeStatus::Ready);
+
+        // Pause implement again, mark design as not done (via set_status for testing)
+        dag.pause_node("implement");
+        dag.set_status("design", NodeStatus::Running);
+        assert!(dag.resume_node("implement"));
+        assert_eq!(dag.get("implement").unwrap().status, NodeStatus::Pending);
+    }
+
+    #[test]
+    fn cancel_node_cascades() {
+        let mut dag = make_dag();
+        // Cancel design — everything downstream should be cancelled
+        let was_running = dag.cancel_node("design");
+        assert_eq!(was_running, Some(false));
+        assert_eq!(dag.get("design").unwrap().status, NodeStatus::Cancelled);
+        assert_eq!(dag.get("implement").unwrap().status, NodeStatus::Cancelled);
+        assert_eq!(dag.get("test").unwrap().status, NodeStatus::Cancelled);
+        assert_eq!(dag.get("review").unwrap().status, NodeStatus::Cancelled);
+        assert_eq!(dag.get("merge").unwrap().status, NodeStatus::Cancelled);
+    }
+
+    #[test]
+    fn cancel_running_node() {
+        let mut dag = make_dag();
+        dag.mark_running("design");
+        let was_running = dag.cancel_node("design");
+        assert_eq!(was_running, Some(true)); // caller must kill
+    }
+
+    #[test]
+    fn cancel_partial_cascades_only_downstream() {
+        let mut dag = make_dag();
+        dag.mark_running("design");
+        dag.mark_done("design");
+        dag.mark_running("implement");
+        dag.mark_running("test");
+
+        // Cancel implement — review and merge get cancelled, but test stays running
+        dag.cancel_node("implement");
+        assert_eq!(dag.get("implement").unwrap().status, NodeStatus::Cancelled);
+        assert_eq!(dag.get("test").unwrap().status, NodeStatus::Running);
+        // review depends on implement AND test, so it gets cancelled
+        assert_eq!(dag.get("review").unwrap().status, NodeStatus::Cancelled);
+        assert_eq!(dag.get("merge").unwrap().status, NodeStatus::Cancelled);
+    }
+
+    #[test]
+    fn is_complete_with_cancelled() {
+        let mut dag = make_dag();
+        dag.mark_running("design");
+        dag.mark_done("design");
+        dag.mark_running("implement");
+        dag.mark_done("implement");
+        dag.mark_running("test");
+        dag.mark_done("test");
+        dag.mark_running("review");
+        dag.mark_done("review");
+        // Cancel merge instead of running it
+        dag.cancel_node("merge");
+        assert!(dag.is_complete()); // all Done or Cancelled
+    }
+
+    #[test]
+    fn linear_dag() {
+        let mut dag = Dag::from_steps(&[
+            ("a".into(), "A".into(), "first".into(), None, vec![]),
+            ("b".into(), "B".into(), "second".into(), None, vec!["a".into()]),
+            ("c".into(), "C".into(), "third".into(), None, vec!["b".into()]),
+        ]);
 
         assert_eq!(dag.ready_nodes(), vec!["a"]);
         dag.mark_running("a");

@@ -1,24 +1,22 @@
+use enki_core::types::TaskStatus;
+
 use super::open_db;
 
 pub async fn status() -> anyhow::Result<()> {
     let db = open_db()?;
-    let projects = db.list_projects()?;
+    let tasks = db.list_tasks()?;
 
-    println!("enki workspace");
+    let open = tasks.iter().filter(|t| matches!(t.status, TaskStatus::Open | TaskStatus::Ready)).count();
+    let running = tasks.iter().filter(|t| t.status == TaskStatus::Running).count();
+    let done = tasks.iter().filter(|t| t.status == TaskStatus::Done).count();
+    let failed = tasks.iter().filter(|t| matches!(t.status, TaskStatus::Failed | TaskStatus::Blocked)).count();
+
+    let project_root = super::project_root()?;
+    let name = project_root.file_name().unwrap_or_default().to_string_lossy();
+
+    println!("enki — {name}");
     println!("──────────────");
-    println!("{} project(s)", projects.len());
-
-    for p in &projects {
-        let tasks = db.list_tasks(&p.id)?;
-        let open = tasks.iter().filter(|t| t.status.as_str() == "open").count();
-        let running = tasks.iter().filter(|t| t.status.as_str() == "running").count();
-        let done = tasks.iter().filter(|t| t.status.as_str() == "done").count();
-        let failed = tasks.iter().filter(|t| t.status.as_str() == "failed").count();
-
-        println!();
-        println!("  {} ({})", p.name, p.id);
-        println!("    tasks: {} open, {} running, {} done, {} failed", open, running, done, failed);
-    }
+    println!("tasks: {} open, {} running, {} done, {} failed ({} total)", open, running, done, failed, tasks.len());
 
     Ok(())
 }

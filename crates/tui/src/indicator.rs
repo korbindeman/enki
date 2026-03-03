@@ -29,7 +29,7 @@ pub enum Activity {
 ///
 /// // User submitted a prompt
 /// indicator.set_activity(Activity::Thinking);
-/// canvas.set_status_bar(&indicator.render());
+/// canvas.set_status_bar(&indicator.render(80));
 ///
 /// // Tool call started
 /// indicator.set_activity(Activity::Tool("Read src/main.rs".into()));
@@ -41,7 +41,7 @@ pub enum Activity {
 /// // In the event loop, tick the spinner (~12fps)
 /// if indicator.is_active() {
 ///     indicator.tick();
-///     canvas.set_status_bar(&indicator.render());
+///     canvas.set_status_bar(&indicator.render(80));
 /// }
 /// ```
 pub struct Indicator {
@@ -83,6 +83,16 @@ impl Indicator {
         self.worker_count = self.worker_count.saturating_sub(1);
     }
 
+    /// Set the worker count to an exact value (for polling-based sync).
+    pub fn set_worker_count(&mut self, count: usize) {
+        self.worker_count = count;
+    }
+
+    /// Reset the worker count to zero.
+    pub fn reset_workers(&mut self) {
+        self.worker_count = 0;
+    }
+
     /// Advance the spinner one frame. Call at ~80ms intervals.
     pub fn tick(&mut self) {
         self.frame = (self.frame + 1) % SPINNER.len();
@@ -95,8 +105,11 @@ impl Indicator {
 
     /// Render the indicator as status-bar lines.
     ///
+    /// `width` is the available terminal width in columns. The tool name is
+    /// truncated so the line never exceeds this width.
+    ///
     /// Returns an empty `Vec` when idle (which clears the status bar).
-    pub fn render(&self) -> Vec<Line> {
+    pub fn render(&self, width: u16) -> Vec<Line> {
         let spinner = SPINNER[self.frame];
 
         if let Some(activity) = &self.activity {
@@ -113,11 +126,21 @@ impl Indicator {
                     Span::styled("Thinking…", Style::new().fg(Color::DarkGrey).italic()),
                     Span::styled(time, Style::new().fg(Color::DarkGrey)),
                 ],
-                Activity::Tool(name) => vec![
-                    Span::styled(format!(" {spinner} "), Style::new().fg(Color::DarkYellow)),
-                    Span::styled(name, Style::new().fg(Color::DarkYellow)),
-                    Span::styled(time, Style::new().fg(Color::DarkGrey)),
-                ],
+                Activity::Tool(name) => {
+                    // " ⠋ " = 3 cols, time suffix, possible worker suffix.
+                    // Truncate the tool name so the line fits in `width`.
+                    let prefix_len = 3; // " ⠋ "
+                    let time_len = time.len();
+                    let worker_suffix_len = if self.worker_count > 0 { 20 } else { 0 };
+                    let overhead = prefix_len + time_len + worker_suffix_len;
+                    let max_name = (width as usize).saturating_sub(overhead);
+                    let truncated = truncate_str(name, max_name);
+                    vec![
+                        Span::styled(format!(" {spinner} "), Style::new().fg(Color::DarkYellow)),
+                        Span::styled(truncated, Style::new().fg(Color::DarkYellow)),
+                        Span::styled(time, Style::new().fg(Color::DarkGrey)),
+                    ]
+                }
             };
 
             if self.worker_count > 0 {
@@ -143,5 +166,20 @@ impl Indicator {
         }
 
         Vec::new()
+    }
+}
+
+/// Truncate a string to at most `max` characters, appending "…" if truncated.
+fn truncate_str(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = chars[..max.saturating_sub(1)].iter().collect();
+        out.push('…');
+        out
     }
 }

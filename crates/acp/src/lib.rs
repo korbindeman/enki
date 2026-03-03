@@ -4,6 +4,9 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use agent_client_protocol as acp;
+
+/// Re-export ACP schema types needed by callers (e.g., MCP server config).
+pub use agent_client_protocol as acp_schema;
 use tokio::process::Command;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
@@ -96,14 +99,29 @@ impl AgentManager {
         agent_args: &[&str],
         cwd: PathBuf,
     ) -> Result<String> {
+        self.start_session_with_mcp(agent_cmd, agent_args, cwd, vec![]).await
+    }
+
+    /// Spawn a new agent process with MCP servers configured.
+    pub async fn start_session_with_mcp(
+        &self,
+        agent_cmd: &str,
+        agent_args: &[&str],
+        cwd: PathBuf,
+        mcp_servers: Vec<acp::McpServer>,
+    ) -> Result<String> {
         tracing::debug!(cmd = agent_cmd, args = ?agent_args, cwd = %cwd.display(), "spawning agent process");
         // Spawn agent subprocess
         let mut cmd = Command::new(agent_cmd);
         cmd.args(agent_args)
+            .current_dir(&cwd)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+        // Clear CLAUDECODE so the agent doesn't think it's nested inside
+        // another Claude Code session and refuse to start.
+        cmd.env_remove("CLAUDECODE");
         for (k, v) in self.extra_env.iter() {
             cmd.env(k, v);
         }
@@ -111,6 +129,22 @@ impl AgentManager {
 
         let stdin = child.stdin.take().unwrap().compat_write();
         let stdout = child.stdout.take().unwrap().compat();
+
+        // Capture agent stderr in a background task and log it line-by-line.
+        if let Some(stderr) = child.stderr.take() {
+            let agent_cmd_owned = agent_cmd.to_string();
+            let cwd_owned = cwd.display().to_string();
+            tokio::task::spawn_local(async move {
+                use tokio::io::AsyncBufReadExt;
+                let reader = tokio::io::BufReader::new(stderr);
+                let mut lines = reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if !line.is_empty() {
+                        tracing::warn!(agent = agent_cmd_owned, cwd = cwd_owned, "agent stderr: {}", line);
+                    }
+                }
+            });
+        }
 
         // Create ACP client
         let client = EnkiClient {
@@ -152,8 +186,11 @@ impl AgentManager {
 
         // Create session
         let session_resp =
-            acp::Agent::new_session(conn.as_ref(), acp::NewSessionRequest::new(cwd))
-                .await?;
+            acp::Agent::new_session(
+                conn.as_ref(),
+                acp::NewSessionRequest::new(cwd).mcp_servers(mcp_servers),
+            )
+            .await?;
 
         let session_id = session_resp.session_id.to_string();
         tracing::info!(session_id, "ACP session created");

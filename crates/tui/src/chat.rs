@@ -38,8 +38,9 @@ use crate::canvas::{Canvas, StreamBuffer};
 use crate::indicator::{Activity, Indicator};
 use crate::input::{InputAction, InputLine};
 use crate::lines;
+use crate::notify;
 use crate::style::{Line, Span, Style};
-use crate::{poll_event, KeyCode, TermEvent};
+use crate::{poll_event, KeyCode, KeyModifiers, TermEvent};
 
 /// Trait implemented by chat consumers to handle messages and user input.
 ///
@@ -56,6 +57,13 @@ pub trait Handler<M> {
     /// "Thinking…" before this is called. Use `cx` to send text to your
     /// backend.
     fn on_submit(&mut self, text: String, cx: &mut ChatContext);
+
+    /// Called when the user requests an interrupt (Escape or new message
+    /// while one is in-flight).
+    ///
+    /// Use this to cancel any active backend operation. Safe to call when
+    /// nothing is running — implementors should no-op in that case.
+    fn on_interrupt(&mut self) {}
 
     /// Called when the user confirms quit (double Ctrl+C).
     ///
@@ -93,6 +101,7 @@ impl ChatContext {
             streaming: false,
         }
     }
+
 
     // ─── Activity ────────────────────────────────────────────
 
@@ -188,6 +197,18 @@ impl ChatContext {
         self.sync_status_bar();
     }
 
+    /// Set the worker count to an exact value (polling-based sync).
+    pub fn set_worker_count(&mut self, count: usize) {
+        self.indicator.set_worker_count(count);
+        self.sync_status_bar();
+    }
+
+    /// Reset the worker count to zero (used when all workers are stopped).
+    pub fn reset_workers(&mut self) {
+        self.indicator.reset_workers();
+        self.sync_status_bar();
+    }
+
     // ─── Queries ─────────────────────────────────────────────
 
     /// Usable content width (terminal width minus scrollbar).
@@ -195,10 +216,17 @@ impl ChatContext {
         self.canvas.content_width()
     }
 
+    // ─── Notifications ──────────────────────────────────────
+
+    /// Send a desktop notification (auto-detects terminal support).
+    pub fn notify(&self, message: &str) {
+        notify::notify(message);
+    }
+
     // ─── Internal ────────────────────────────────────────────
 
     fn sync_status_bar(&mut self) {
-        let rendered = self.indicator.render();
+        let rendered = self.indicator.render(self.canvas.width());
         self.canvas.set_status_bar(&rendered);
     }
 }
@@ -276,6 +304,7 @@ impl Chat {
             input.set_autocomplete_trigger(Some(trigger));
         }
         let mut last_spinner_tick = Instant::now();
+        let mut drag_anchor: Option<usize> = None;
 
         // Banner
         if let Some(title) = &self.title {
@@ -315,7 +344,55 @@ impl Chat {
                     TermEvent::ScrollDown(n) => {
                         cx.canvas.scroll_down(n);
                     }
+                    TermEvent::MouseDown { row, modifiers, .. } => {
+                        let cmd = modifiers.contains(KeyModifiers::SUPER);
+                        if let Some(msg_id) = cx.canvas.message_at_viewport_row(row) {
+                            if cmd {
+                                cx.canvas.toggle_selection(msg_id);
+                            } else {
+                                let already = cx.canvas.is_message_selected(msg_id);
+                                let multi = cx.canvas.selection_count() > 1;
+                                if already && !multi {
+                                    cx.canvas.clear_selection();
+                                } else {
+                                    cx.canvas.set_selection_single(msg_id);
+                                }
+                            }
+                            drag_anchor = Some(msg_id);
+                        } else {
+                            if !cmd {
+                                cx.canvas.clear_selection();
+                            }
+                            drag_anchor = None;
+                        }
+                    }
+                    TermEvent::MouseDrag { row, .. } => {
+                        if let Some(anchor) = drag_anchor {
+                            if let Some(msg_id) = cx.canvas.message_at_viewport_row(row) {
+                                let (from, to) = if anchor <= msg_id {
+                                    (anchor, msg_id)
+                                } else {
+                                    (msg_id, anchor)
+                                };
+                                cx.canvas.select_range(from, to);
+                            }
+                        }
+                    }
+                    TermEvent::MouseUp { .. } => {
+                        drag_anchor = None;
+                    }
                     TermEvent::Key(key) => {
+                        // Cmd+C → copy selected messages to clipboard.
+                        if key.code == KeyCode::Char('c')
+                            && key.modifiers.contains(KeyModifiers::SUPER)
+                            && cx.canvas.has_selection()
+                        {
+                            let text = cx.canvas.selected_text();
+                            copy_to_clipboard(&text);
+                            cx.canvas.clear_selection();
+                            continue;
+                        }
+
                         match key.code {
                             KeyCode::PageUp => {
                                 cx.canvas.scroll_up(cx.canvas.viewport_height());
@@ -359,6 +436,8 @@ impl Chat {
                                 if old_ac_count > 0 {
                                     cx.canvas.clear_autocomplete(old_ac_count);
                                 }
+                                // Interrupt any in-flight operation before sending new prompt
+                                handler.on_interrupt();
                                 cx.canvas.scroll_to_bottom();
                                 cx.finish_stream_if_active();
                                 cx.canvas.print_lines(&lines::user_message(&text));
@@ -367,7 +446,16 @@ impl Chat {
                                 cx.sync_status_bar();
                                 handler.on_submit(text, &mut cx);
                             }
+                            InputAction::Interrupt => {
+                                cx.canvas.set_hint(None);
+                                if old_ac_count > 0 {
+                                    cx.canvas.clear_autocomplete(old_ac_count);
+                                }
+                                cx.canvas.update_bubble(&input);
+                                handler.on_interrupt();
+                            }
                             InputAction::Changed => {
+                                cx.canvas.clear_selection();
                                 cx.canvas.set_hint(None);
                                 if old_ac_count > 0 {
                                     cx.canvas.clear_autocomplete(old_ac_count);
@@ -400,5 +488,17 @@ impl Chat {
                 cx.canvas.update_bubble(&input);
             }
         }
+    }
+}
+
+/// Copy text to the system clipboard (macOS: pbcopy).
+fn copy_to_clipboard(text: &str) {
+    use std::process::{Command, Stdio};
+    if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
+        if let Some(stdin) = child.stdin.as_mut() {
+            use std::io::Write;
+            stdin.write_all(text.as_bytes()).ok();
+        }
+        child.wait().ok();
     }
 }

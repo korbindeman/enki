@@ -1,91 +1,90 @@
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use enki_acp::{AgentManager, SessionUpdate};
-use enki_core::db::Db;
-use enki_core::types::{Agent, AgentRole, AgentStatus, Id, TaskStatus, Tier};
-use enki_core::worktree::{WorktreeError, WorktreeManager};
+use enki_core::monitor;
+use enki_core::orchestrator::{
+    Command, Event, MergeResult, Orchestrator, WorkerOutcome, WorkerResult,
+};
+use enki_core::scheduler::Limits;
+use enki_core::types::{Agent, AgentStatus, Id, MergeStatus, Tier};
+use enki_core::worktree::WorktreeManager;
 use tokio::sync::mpsc;
-
-/// Tier concurrency limits for worker spawning.
-struct TierLimits {
-    max_workers: usize,
-    max_heavy: usize,
-    max_standard: usize,
-    max_light: usize,
-}
-
-impl Default for TierLimits {
-    fn default() -> Self {
-        Self {
-            max_workers: 5,
-            max_heavy: 1,
-            max_standard: 3,
-            max_light: 5,
-        }
-    }
-}
 
 /// Messages sent from the TUI to the coordinator thread.
 pub enum ToCoordinator {
     Prompt(String),
+    Interrupt,
     Shutdown,
+    /// Stop all running workers immediately.
+    #[allow(dead_code)]
+    StopAll,
 }
 
 /// Activity update from a running worker agent.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum WorkerActivity {
-    /// Agent started a tool call (e.g., "Bash", "Read", "Edit").
     ToolStarted(String),
-    /// Agent finished a tool call.
     ToolDone,
-    /// Agent is producing text (thinking/writing). Sent once per text
-    /// burst, not per token.
     Thinking,
 }
 
 /// Messages sent from the coordinator thread back to the TUI.
 #[derive(Debug)]
 pub enum FromCoordinator {
-    /// Connection established, system prompt being sent.
     Connected,
-    /// System prompt processed, coordinator is ready for user input.
     Ready,
-    /// Agent produced text output.
     Text(String),
-    /// Agent started a tool call.
     ToolCall(String),
-    /// Agent finished a tool call.
     #[allow(dead_code)]
     ToolCallDone(String),
-    /// Prompt completed (stop reason).
     Done(String),
-    /// A worker was spawned for a task.
     WorkerSpawned { task_id: String, title: String },
-    /// A worker completed its task.
     WorkerCompleted { task_id: String, title: String },
-    /// A worker failed its task.
     WorkerFailed {
         task_id: String,
         title: String,
         error: String,
     },
-    /// A worker's branch had a merge conflict. The worktree is preserved for retry.
-    WorkerConflicted {
-        task_id: String,
-        title: String,
-        worktree: String,
-        // Branch name is included for logging/display by consumers even if not always rendered.
-        #[allow(dead_code)]
-        branch: String,
-    },
-    /// Live activity update from a running worker.
     #[allow(dead_code)]
     WorkerUpdate {
         task_id: String,
         activity: WorkerActivity,
     },
-    /// An error occurred.
+    #[allow(dead_code)]
+    MergeQueued {
+        mr_id: String,
+        task_id: String,
+        branch: String,
+    },
+    #[allow(dead_code)]
+    MergeLanded {
+        mr_id: String,
+        task_id: String,
+    },
+    #[allow(dead_code)]
+    MergeConflicted {
+        mr_id: String,
+        task_id: String,
+    },
+    #[allow(dead_code)]
+    MergeFailed {
+        mr_id: String,
+        task_id: String,
+        reason: String,
+    },
+    #[allow(dead_code)]
+    MergeProgress {
+        mr_id: String,
+        task_id: String,
+        branch: String,
+        status: String,
+    },
+    AllStopped { count: usize },
+    WorkerCount(usize),
+    Interrupted,
     Error(String),
 }
 
@@ -96,8 +95,6 @@ pub struct CoordinatorHandle {
 }
 
 /// Spawn the coordinator on a dedicated OS thread with its own tokio runtime + LocalSet.
-///
-/// Returns a handle with channels for bidirectional communication.
 pub fn spawn(cwd: PathBuf, db_path: String, enki_bin: PathBuf) -> CoordinatorHandle {
     let (to_coord_tx, to_coord_rx) = mpsc::unbounded_channel::<ToCoordinator>();
     let (from_coord_tx, from_coord_rx) = mpsc::unbounded_channel::<FromCoordinator>();
@@ -125,7 +122,10 @@ pub fn spawn(cwd: PathBuf, db_path: String, enki_bin: PathBuf) -> CoordinatorHan
     }
 }
 
-/// Build the system prompt that teaches the coordinator its role and tools.
+// ---------------------------------------------------------------------------
+// Prompts
+// ---------------------------------------------------------------------------
+
 fn build_system_prompt(cwd: &std::path::Path) -> String {
     let cwd_display = cwd.display();
 
@@ -139,80 +139,32 @@ You plan work, decompose user requests into tasks, assign complexity tiers, and 
 ## Current Workspace
 
 - Working directory: `{cwd_display}`
-- Database: `~/.enki/db.sqlite`
 
-## Available CLI Tools
+## Available MCP Tools
 
-You have access to the `enki` CLI via the `$ENKI_BIN` environment variable. Always invoke it as `$ENKI_BIN` (never bare `enki`) to ensure it works regardless of PATH configuration.
+You have access to enki tools via the **enki MCP server**. Use these tools directly — do not shell out to the CLI.
 
-### Project Management
-- `$ENKI_BIN project list` — List all registered projects (shows ID, name, path)
-- `$ENKI_BIN project add <path> [--name <name>]` — Register a git repo as a project
+### Execution Management
+- `enki_execution_create(steps)` — Create a multi-step execution with dependency ordering. Each step has `id`, `title`, `description`, `tier`, and `needs` (list of step IDs it depends on). Steps with no dependencies start immediately; others wait. **Use this for any work involving 2+ related steps.**
 
-### Task Management
-- `$ENKI_BIN task list <project-id>` — List tasks for a project (shows ID, status, tier, title)
-- `$ENKI_BIN task create <project-id> "<title>" [--description "<desc>"] [--tier light|standard|heavy]` — Create a single task
-- `$ENKI_BIN task update-status <task-id> <status>` — Update task status (open, ready, running, done, failed, blocked)
-- `$ENKI_BIN task retry <task-id>` — Retry a blocked task after a merge conflict (rebases branch onto main, re-merges)
+### Simple Task Creation
+- `enki_task_create(title, description?, tier?)` — Create a single standalone task. Use only for isolated, independent tasks (quick fixes, one-off changes). For multi-step work, use `enki_execution_create` instead.
 
-### Template Execution (preferred for multi-step work)
-- `$ENKI_BIN exec <project-id> <template-path> [--var key=value ...]` — Run a TOML workflow template
-
-  Templates define named steps with dependencies, tiers, and variable substitution. Enki creates all tasks in the database, resolves the dependency graph, and automatically promotes tasks to ready as their dependencies complete.
-
-  Example template (`feature.toml`):
-  ```toml
-  name = "feature"
-  description = "Implement a feature"
-
-  [vars.feature]
-  description = "Feature name"
-  required = true
-
-  [[steps]]
-  id = "design"
-  title = "Design {{feature}}"
-  description = "Produce a design doc for {{feature}}"
-  tier = "heavy"
-
-  [[steps]]
-  id = "implement"
-  title = "Implement {{feature}}"
-  description = "Implement {{feature}} based on the design"
-  needs = ["design"]
-  tier = "standard"
-
-  [[steps]]
-  id = "test"
-  title = "Test {{feature}}"
-  description = "Write tests for {{feature}}"
-  needs = ["design"]
-  tier = "light"
-  ```
-
-  Run with: `$ENKI_BIN exec proj-xxx feature.toml --var feature="auth middleware"`
-
-  Use `$ENKI_BIN exec` whenever the work has multiple steps or dependencies. For single one-off tasks, `$ENKI_BIN task create` + `$ENKI_BIN task update-status ready` is fine.
-
-### Status
-- `$ENKI_BIN status` — Show workspace overview (projects, task counts by status)
+### Status & Monitoring
+- `enki_task_list` — List all tasks (shows ID, status, tier, title)
+- `enki_task_update_status(task_id, status)` — Update task status (open, ready, running, done, failed, blocked)
+- `enki_status` — Show task counts by status
+- `enki_task_retry(task_id)` — Retry a failed task within its execution. Resets it to ready, unblocks sibling tasks, and restores the execution. **Use this instead of recreating an entire execution when only one step failed.**
+- `enki_stop_all` — Stop all running workers immediately. Use when the user asks to stop, halt, or cancel all tasks.
 
 ## Automatic Worker Spawning
 
-When a task has status **ready**, enki will **automatically** spawn a worker agent to execute it. Workers run in isolated git worktrees, complete their task, and the branch is merged back to main. Dependent tasks are promoted to ready automatically when their dependencies complete — you do not need to set them ready manually.
-
-**Workflow for a single task:**
-1. `$ENKI_BIN task create` to register the task
-2. `$ENKI_BIN task update-status <id> ready` to trigger the worker
-
-**Workflow for multi-step work (preferred):**
-1. Write a template TOML file describing the steps and dependencies
-2. `$ENKI_BIN exec <project-id> template.toml --var ...` to launch the whole workflow
+When a task has status **ready**, enki will **automatically** spawn a worker agent to execute it. Workers run in isolated git worktrees, complete their task, and a programmatic refinery rebases and merges the branch back to main. Dependent tasks are promoted to ready automatically when their dependencies complete — you do not need to set them ready manually.
 
 ## Complexity Tiers
 
 Assign a tier based on difficulty:
-- **light** — Mechanical tasks: rename, format, simple boilerplate, docs
+- **light** — Mechanical tasks: rename, format, simple boilerplate, stubs, docs
 - **standard** (default) — Feature implementation, bug fixes, test writing
 - **heavy** — Architectural decisions, ambiguous requirements, complex debugging
 
@@ -222,60 +174,188 @@ When the user asks you to implement something:
 
 1. **Understand** — Read the request carefully. Ask clarifying questions if genuinely ambiguous.
 2. **Explore** — Look at the relevant codebase files to understand the current state.
-3. **Decompose** — Break the work into small, independently testable tasks. Each task should:
-   - Have a clear title and description with acceptance criteria
-   - Be completable by a single worker agent in one session
-   - Include which files to look at and what conventions to follow
-4. **Choose the right tool** — Use `enki exec` with a template for multi-step work with dependencies. Use `enki task create` for single isolated tasks.
-5. **Report** — Summarize what you've planned.
+3. **Decompose** — Break the work into steps with clear dependencies.
+4. **Create execution** — Use `enki_execution_create` with all steps and their dependency relationships.
+5. **Report** — Summarize what you've planned: steps, dependencies, and tiers.
 
-Prefer more small tasks over fewer large tasks. Each task should change no more than a few files.
+### Scaffold-First Pattern
+
+For greenfield projects, major new features, or work that establishes a new directory/module structure, **always include a scaffold step** as the first step:
+
+- The scaffold step creates directory structure, stub files with interfaces/types, config files, and any shared contracts that parallel workers need
+- All implementation steps should depend on the scaffold step
+- The scaffold step should be **light** tier — it's mechanical work (mkdir, create files, define interfaces)
+- Implementation steps then run in parallel after the scaffold completes
+
+Example:
+```
+scaffold (light, no deps) → dirs, stubs, interfaces
+  ├── feature-a (standard, needs: scaffold)
+  ├── feature-b (standard, needs: scaffold)
+  └── feature-c (standard, needs: scaffold)
+```
+
+**Skip the scaffold step** when:
+- The project already has established structure and the tasks work within existing modules
+- You're making a bug fix or small enhancement
+- There's only a single task to do
+
+### Task Design
+
+- Prefer more small tasks over fewer large ones
+- Each task should change no more than a few files
+- Each task description should include acceptance criteria and which files to look at
+- Workers cannot see each other's work — only the output from completed upstream dependencies
+
+## Handling Failures
+
+When a task or merge fails:
+- **Use `enki_task_retry`** to retry the failed step. This preserves the execution and its sibling tasks — blocked dependents are automatically unblocked when the retried task succeeds.
+- **Do NOT recreate the entire execution.** The existing tasks, dependencies, and any completed work are preserved by retry.
+- Only create a new execution if the original plan was fundamentally wrong (e.g., wrong decomposition, missing steps).
+
+## Merging
+
+A programmatic refinery rebases and merges completed task branches. If a merge fails (conflict, verification failure), the task will be marked failed and you'll be notified.
 
 ## Responding to the User
 
 - Be concise and direct
-- When you create tasks, show the user what you created
-- When asked about status, run `$ENKI_BIN status` or `$ENKI_BIN task list` and report
+- When you create executions, show the step graph: what runs first, what runs in parallel, what depends on what
+- When asked about status, use `enki_status` or `enki_task_list` and report
 - You can also read files, explore the codebase, and answer questions directly
 
 Wait for the user's first message before taking any action."#
     )
 }
 
-/// Prompt for worker agents.
-fn build_worker_prompt(title: &str, description: &str) -> String {
-    format!(
+fn build_worker_prompt(
+    title: &str,
+    description: &str,
+    upstream_outputs: &[(String, String)],
+) -> String {
+    let mut prompt = format!(
         r#"You are a focused coding agent working on a single task.
 
 TASK: {title}
-{description}
+{description}"#
+    );
 
-APPROACH:
-1. Read the task description and understand what needs to be done
-2. Understand the existing code relevant to your task
-3. Write a failing test for the expected behavior
-4. Implement the minimum code to make the test pass
-5. Run the full test suite to verify no regressions
-6. Clean up (lint, format, review your own diff)
-7. Commit with a clear message
+    if !upstream_outputs.is_empty() {
+        prompt.push_str("\n\n## Context from upstream steps\n");
+        for (step_title, output) in upstream_outputs {
+            prompt.push_str(&format!("\n### {step_title} (completed)\n{output}\n"));
+        }
+    }
 
-RULES:
-- Only modify files relevant to your task
-- If something is ambiguous, make a reasonable choice and note it
-- Keep your changes minimal and focused"#
-    )
+    prompt.push_str(
+        r#"
+
+Make focused changes. Only modify files relevant to your task. Commit when done.
+
+When you finish, output a summary between [OUTPUT] and [/OUTPUT] tags:
+
+[OUTPUT]
+Brief summary of changes made, files modified, decisions taken.
+[/OUTPUT]"#,
+    );
+
+    prompt
 }
 
-/// Completion signal from a worker's spawn_local task.
+fn extract_output(result: &str) -> Option<String> {
+    if let Some(start) = result.find("[OUTPUT]") {
+        let content_start = start + "[OUTPUT]".len();
+        if let Some(end) = result[content_start..].find("[/OUTPUT]") {
+            let output = result[content_start..content_start + end].trim();
+            if !output.is_empty() {
+                return Some(output.to_string());
+            }
+        }
+    }
+    if result.len() > 10 {
+        let start = result.len().saturating_sub(500);
+        Some(result[start..].to_string())
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Internal channel types
+// ---------------------------------------------------------------------------
+
 struct WorkerDone {
     task_id: Id,
     agent_id: Id,
+    session_id: Option<String>,
     title: String,
     branch: String,
     bare_repo: PathBuf,
     worktree_path: PathBuf,
-    result: Result<String, String>, // Ok(stop_reason) or Err(error)
+    result: Result<String, String>,
+    execution_id: Option<Id>,
+    step_id: Option<String>,
 }
+
+struct MergerDone {
+    merge_request_id: Id,
+    outcome: enki_core::refinery::MergeOutcome,
+}
+
+// ---------------------------------------------------------------------------
+// Worker tracker (replaces 4 Rc<RefCell<HashMap>>)
+// ---------------------------------------------------------------------------
+
+struct WorkerTracker {
+    session_to_task: HashMap<String, String>,
+    last_activity: HashMap<String, Instant>,
+    current_tool: HashMap<String, String>,
+    thinking: HashSet<String>,
+}
+
+impl WorkerTracker {
+    fn new() -> Self {
+        Self {
+            session_to_task: HashMap::new(),
+            last_activity: HashMap::new(),
+            current_tool: HashMap::new(),
+            thinking: HashSet::new(),
+        }
+    }
+
+    fn register(&mut self, session_id: String, task_id: String) {
+        self.session_to_task
+            .insert(session_id.clone(), task_id);
+        self.last_activity.insert(session_id, Instant::now());
+    }
+
+    fn remove(&mut self, session_id: &str) {
+        self.session_to_task.remove(session_id);
+        self.last_activity.remove(session_id);
+        self.current_tool.remove(session_id);
+        self.thinking.remove(session_id);
+    }
+
+    /// Build the worker list for MonitorTick: (session_id, task_id, last_activity).
+    fn worker_list(&self) -> Vec<(String, String, Instant)> {
+        self.last_activity
+            .iter()
+            .filter_map(|(sid, last)| {
+                let tid = self.session_to_task.get(sid)?.clone();
+                Some((sid.clone(), tid, *last))
+            })
+            .collect()
+    }
+
+    fn worker_count(&self) -> usize {
+        self.session_to_task.len()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main loop
+// ---------------------------------------------------------------------------
 
 async fn coordinator_loop(
     cwd: PathBuf,
@@ -286,32 +366,40 @@ async fn coordinator_loop(
 ) {
     tracing::info!(cwd = %cwd.display(), enki_bin = %enki_bin.display(), "coordinator loop started");
 
-    let db = match Db::open(&db_path) {
-        Ok(db) => {
-            tracing::debug!(path = %db_path, "database opened");
-            db
-        }
+    let db = match enki_core::db::Db::open(&db_path) {
+        Ok(db) => db,
         Err(e) => {
-            tracing::error!(error = %e, "failed to open database");
             let _ = tx.send(FromCoordinator::Error(format!("failed to open db: {e}")));
             return;
         }
     };
 
+    let mut orch = Orchestrator::new(db, Limits::default());
+
     let (worker_done_tx, mut worker_done_rx) = mpsc::unbounded_channel::<WorkerDone>();
 
-    // Set ENKI_BIN so spawned agents can call `enki` regardless of PATH.
+    // Env vars for spawned agents.
+    let enki_dir = match crate::commands::enki_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            let _ = tx.send(FromCoordinator::Error(format!("failed to find .enki dir: {e}")));
+            return;
+        }
+    };
     let enki_env = {
-        let mut env = std::collections::HashMap::new();
+        let mut env = HashMap::new();
         env.insert("ENKI_BIN".to_string(), enki_bin.display().to_string());
+        env.insert("ENKI_DIR".to_string(), enki_dir.display().to_string());
         env
     };
 
-    // Shared flag to suppress update forwarding during system prompt init.
+    // Set up events directory for signal files.
+    let events_dir = enki_dir.join("events");
+    orch.set_events_dir(events_dir);
+
+    // Coordinator agent manager.
     let forward_updates = std::rc::Rc::new(std::cell::Cell::new(false));
     let forward_flag = forward_updates.clone();
-
-    // Coordinator agent manager — streams updates to TUI.
     let tx_updates = tx.clone();
     let mut coord_mgr = AgentManager::new();
     coord_mgr.set_env(enki_env.clone());
@@ -328,41 +416,36 @@ async fn coordinator_loop(
         let _ = tx_updates.send(msg);
     });
 
-    // Worker agent manager — streams activity updates (tool calls, thinking)
-    // to the TUI for per-worker status display.
+    // Worker agent manager with consolidated tracker.
+    let tracker = std::rc::Rc::new(std::cell::RefCell::new(WorkerTracker::new()));
     let mut worker_mgr = AgentManager::new();
     worker_mgr.set_env(enki_env);
 
-    // Maps ACP session_id → task_id so the worker callback can route updates.
-    let session_task_map: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, String>>> =
-        std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
-
-    // Track whether each worker is currently in a "thinking" state to avoid
-    // spamming Thinking updates on every text token.
-    let thinking_state: std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>> =
-        std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashSet::new()));
-
     {
-        let map = session_task_map.clone();
-        let thinking = thinking_state.clone();
+        let tracker_cb = tracker.clone();
         let tx_worker = tx.clone();
         worker_mgr.on_update(move |session_id, update| {
-            let map = map.borrow();
-            let Some(task_id) = map.get(session_id) else { return };
-            let task_id = task_id.clone();
+            let mut t = tracker_cb.borrow_mut();
+            t.last_activity
+                .insert(session_id.to_string(), Instant::now());
+
+            let Some(task_id) = t.session_to_task.get(session_id).cloned() else {
+                return;
+            };
 
             let activity = match update {
                 SessionUpdate::ToolCallStarted { title, .. } => {
-                    // Worker started a tool — no longer "thinking"
-                    thinking.borrow_mut().remove(session_id);
+                    t.thinking.remove(session_id);
+                    t.current_tool
+                        .insert(session_id.to_string(), title.clone());
                     WorkerActivity::ToolStarted(title)
                 }
                 SessionUpdate::ToolCallDone { .. } => {
+                    t.current_tool.remove(session_id);
                     WorkerActivity::ToolDone
                 }
                 SessionUpdate::Text(_) => {
-                    // Only send Thinking once per text burst
-                    if !thinking.borrow_mut().insert(session_id.to_string()) {
+                    if !t.thinking.insert(session_id.to_string()) {
                         return;
                     }
                     WorkerActivity::Thinking
@@ -374,14 +457,10 @@ async fn coordinator_loop(
         });
     }
 
-    // Resolve the ACP agent binary (installs on first use)
+    // Resolve agent binary.
     let agent_cmd = match enki_core::agent_runtime::resolve() {
-        Ok(cmd) => {
-            tracing::info!(program = %cmd.program.display(), "agent binary resolved");
-            cmd
-        }
+        Ok(cmd) => cmd,
         Err(e) => {
-            tracing::error!(error = %e, "failed to resolve agent binary");
             let _ = tx.send(FromCoordinator::Error(format!(
                 "failed to resolve agent binary: {e}"
             )));
@@ -389,23 +468,32 @@ async fn coordinator_loop(
         }
     };
 
-    // Start the coordinator ACP session
+    // MCP server configs.
+    let planner_mcp = vec![enki_acp::acp_schema::McpServer::Stdio(
+        enki_acp::acp_schema::McpServerStdio::new("enki", &enki_bin)
+            .args(vec!["mcp".into(), "--role".into(), "planner".into()]),
+    )];
+    let worker_mcp = vec![enki_acp::acp_schema::McpServer::Stdio(
+        enki_acp::acp_schema::McpServerStdio::new("enki", &enki_bin)
+            .args(vec!["mcp".into(), "--role".into(), "worker".into()]),
+    )];
+
+    // Start coordinator ACP session.
     let args_ref: Vec<&str> = agent_cmd.args.iter().map(|s| s.as_str()).collect();
     let session_id = match coord_mgr
-        .start_session(
+        .start_session_with_mcp(
             agent_cmd.program.to_str().unwrap(),
             &args_ref,
             cwd.clone(),
+            planner_mcp.clone(),
         )
         .await
     {
         Ok(id) => {
-            tracing::info!(session_id = %id, "coordinator ACP session started");
             let _ = tx.send(FromCoordinator::Connected);
             id
         }
         Err(e) => {
-            tracing::error!(error = %e, "failed to start coordinator ACP session");
             let _ = tx.send(FromCoordinator::Error(format!(
                 "failed to start coordinator: {e}"
             )));
@@ -413,17 +501,14 @@ async fn coordinator_loop(
         }
     };
 
-    // Send the system prompt (updates suppressed during this phase).
+    // Send system prompt (updates suppressed during this phase).
     let system_prompt = build_system_prompt(&cwd);
-    tracing::debug!(session_id, "sending system prompt");
     match coord_mgr.prompt(&session_id, &system_prompt).await {
         Ok(_) => {
-            tracing::info!(session_id, "coordinator ready");
             forward_updates.set(true);
             let _ = tx.send(FromCoordinator::Ready);
         }
         Err(e) => {
-            tracing::error!(session_id, error = %e, "system prompt failed");
             let _ = tx.send(FromCoordinator::Error(format!(
                 "system prompt failed: {e}"
             )));
@@ -431,10 +516,53 @@ async fn coordinator_loop(
         }
     }
 
-    let limits = TierLimits::default();
-    let mut active_task_ids: Vec<String> = Vec::new();
+    let mut infra_broken = false;
+    let mut pending_events: Vec<String> = Vec::new();
     let mut poll_interval = tokio::time::interval(std::time::Duration::from_secs(3));
-    poll_interval.tick().await; // skip the immediate first tick
+    poll_interval.tick().await;
+
+    let bare_path = crate::commands::bare_path().unwrap_or_default();
+
+    // Crash recovery via orchestrator.
+    let events = orch.handle(Command::Recover);
+    process_events(
+        events,
+        &mut orch,
+        &worker_mgr,
+        &tracker,
+        &worker_done_tx,
+        &tx,
+        &mut pending_events,
+        &worker_mcp,
+        &mut infra_broken,
+        &bare_path,
+    )
+    .await;
+
+    // Prompt management.
+    let (prompt_done_tx, mut prompt_done_rx) =
+        mpsc::unbounded_channel::<(u64, Result<String, String>)>();
+    let mut prompt_generation: u64 = 0;
+    let mut active_prompt: Option<tokio::task::JoinHandle<()>> = None;
+
+    // Refinery state.
+    let (merger_done_tx, mut merger_done_rx) = mpsc::unbounded_channel::<MergerDone>();
+    let mut merge_in_progress = false;
+    let mut last_merge_statuses: HashMap<String, MergeStatus> = HashMap::new();
+
+    // Ensure refinery worktree exists.
+    let merger_worktree_path = crate::commands::worktree_base()
+        .unwrap_or_default()
+        .join("refinery");
+    if !merger_worktree_path.exists() {
+        if let Ok(wt_mgr) = WorktreeManager::new(&bare_path) {
+            if let Ok(start_ref) = wt_mgr.default_start_ref() {
+                let base = merger_worktree_path.parent().unwrap();
+                let _ = std::fs::create_dir_all(base);
+                let _ = wt_mgr.create("refinery", &start_ref, base);
+            }
+        }
+    }
 
     loop {
         tokio::select! {
@@ -442,321 +570,572 @@ async fn coordinator_loop(
                 let Some(msg) = msg else { break };
                 match msg {
                     ToCoordinator::Prompt(text) => {
-                        tracing::debug!(session_id, chars = text.len(), "user prompt received");
-                        match coord_mgr.prompt(&session_id, &text).await {
-                            Ok(stop_reason) => {
-                                tracing::debug!(session_id, stop_reason, "coordinator prompt finished");
-                                let _ = tx.send(FromCoordinator::Done(stop_reason));
-                            }
-                            Err(e) => {
-                                tracing::error!(session_id, error = %e, "coordinator prompt error");
-                                let _ = tx.send(FromCoordinator::Error(format!("prompt error: {e}")));
-                            }
+                        if let Some(handle) = active_prompt.take() {
+                            let _ = coord_mgr.cancel(&session_id).await;
+                            handle.abort();
+                            let _ = tx.send(FromCoordinator::Interrupted);
+                        }
+
+                        let full_text = if pending_events.is_empty() {
+                            text
+                        } else {
+                            let events_text = pending_events.drain(..).collect::<Vec<_>>().join("\n");
+                            format!("[worker status updates]\n{events_text}\n\n[user message]\n{text}")
+                        };
+
+                        prompt_generation += 1;
+                        let generation = prompt_generation;
+                        let mgr = coord_mgr.clone();
+                        let sid = session_id.clone();
+                        let done_tx = prompt_done_tx.clone();
+                        active_prompt = Some(tokio::task::spawn_local(async move {
+                            let result = mgr.prompt(&sid, &full_text).await;
+                            let _ = done_tx.send((generation, result.map_err(|e| e.to_string())));
+                        }));
+                    }
+                    ToCoordinator::Interrupt => {
+                        if let Some(handle) = active_prompt.take() {
+                            let _ = coord_mgr.cancel(&session_id).await;
+                            handle.abort();
+                            let _ = tx.send(FromCoordinator::Interrupted);
                         }
                     }
                     ToCoordinator::Shutdown => {
-                        tracing::info!(session_id, "shutdown requested");
+                        if let Some(handle) = active_prompt.take() {
+                            handle.abort();
+                        }
                         coord_mgr.kill_session(&session_id);
                         break;
+                    }
+                    ToCoordinator::StopAll => {
+                        // Kill all worker ACP sessions.
+                        let t = tracker.borrow();
+                        for sid in t.session_to_task.keys() {
+                            worker_mgr.kill_session(sid);
+                        }
+                        drop(t);
+                        tracker.borrow_mut().session_to_task.clear();
+                        tracker.borrow_mut().last_activity.clear();
+                        tracker.borrow_mut().current_tool.clear();
+
+                        let events = orch.handle(Command::StopAll);
+                        process_events(
+                            events, &mut orch, &worker_mgr, &tracker, &worker_done_tx,
+                            &tx, &mut pending_events, &worker_mcp, &mut infra_broken, &bare_path,
+                        ).await;
+                    }
+                }
+            }
+
+            result = prompt_done_rx.recv() => {
+                if let Some((generation, result)) = result {
+                    if generation != prompt_generation { continue; }
+                    active_prompt = None;
+                    match result {
+                        Ok(stop_reason) => {
+                            let _ = tx.send(FromCoordinator::Done(stop_reason));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(FromCoordinator::Error(format!("prompt error: {e}")));
+                        }
                     }
                 }
             }
 
             done = worker_done_rx.recv() => {
                 let Some(done) = done else { continue };
-                active_task_ids.retain(|id| id != &done.task_id.0);
-                let _ = db.update_agent_status(&done.agent_id, AgentStatus::Dead);
 
-                match done.result {
-                    Ok(_) => {
-                        tracing::info!(
-                            task_id = %done.task_id.0, title = %done.title,
-                            branch = %done.branch, "worker finished, merging branch"
-                        );
-                        let merge_result = try_merge(&done.bare_repo, &done.branch);
+                // Clean up tracker.
+                if let Some(sid) = done.session_id.as_ref() {
+                    tracker.borrow_mut().remove(sid);
+                    orch.session_ended(sid);
+                }
+                let _ = orch.db().update_task_activity(&done.task_id, None);
+                let _ = orch.db().update_agent_status(&done.agent_id, AgentStatus::Dead);
 
-                        match merge_result {
-                            Ok(()) => {
-                                tracing::info!(task_id = %done.task_id.0, "branch merged successfully");
-                                cleanup_worktree(&done.bare_repo, &done.worktree_path);
-                                let _ = db.update_task_status(&done.task_id, TaskStatus::Done);
-                                promote_unblocked_tasks(&db, &done.task_id);
-                                let _ = tx.send(FromCoordinator::WorkerCompleted {
-                                    task_id: done.task_id.0,
-                                    title: done.title,
-                                });
+                // Process infrastructure and convert to WorkerResult.
+                let worker_result = process_worker_done(done, &bare_path);
+                let events = orch.handle(Command::WorkerDone(worker_result));
+                process_events(
+                    events, &mut orch, &worker_mgr, &tracker, &worker_done_tx,
+                    &tx, &mut pending_events, &worker_mcp, &mut infra_broken, &bare_path,
+                ).await;
+            }
+
+            done = merger_done_rx.recv() => {
+                let Some(done) = done else { continue };
+                merge_in_progress = false;
+
+                let events = orch.handle(Command::MergeDone(MergeResult {
+                    mr_id: done.merge_request_id,
+                    outcome: done.outcome,
+                }));
+
+                // After merge lands, update source working directory and clean up branch.
+                for event in &events {
+                    if let Event::MergeLanded { mr_id, .. } = event {
+                        if let Ok(wt_mgr) = WorktreeManager::new(&bare_path) {
+                            if let Ok(default_branch) = wt_mgr.default_branch() {
+                                let _ = wt_mgr.update_source_workdir(&default_branch);
                             }
-                            Err(WorktreeError::Conflict(_)) => {
-                                // Worktree is intact — leave it for the user to retry.
-                                tracing::warn!(
-                                    task_id = %done.task_id.0, branch = %done.branch,
-                                    worktree = %done.worktree_path.display(),
-                                    "merge conflict: marking task blocked"
-                                );
-                                let _ = db.update_task_status(&done.task_id, TaskStatus::Blocked);
-                                let _ = tx.send(FromCoordinator::WorkerConflicted {
-                                    task_id: done.task_id.0,
-                                    title: done.title,
-                                    worktree: done.worktree_path.display().to_string(),
-                                    branch: done.branch,
-                                });
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    task_id = %done.task_id.0, branch = %done.branch,
-                                    error = %e, "merge failed"
-                                );
-                                cleanup_worktree(&done.bare_repo, &done.worktree_path);
-                                let _ = db.update_task_status(&done.task_id, TaskStatus::Failed);
-                                let _ = tx.send(FromCoordinator::WorkerFailed {
-                                    task_id: done.task_id.0,
-                                    title: done.title,
-                                    error: format!("merge failed: {e}"),
-                                });
+                            // Look up the branch from the MR to clean it up.
+                            let mr_id_obj = Id(mr_id.clone());
+                            if let Ok(mr) = orch.db().get_merge_request(&mr_id_obj) {
+                                let _ = wt_mgr.delete_branch(&mr.branch);
                             }
                         }
                     }
-                    Err(error) => {
-                        tracing::error!(
-                            task_id = %done.task_id.0, title = %done.title,
-                            error, "worker failed"
-                        );
-                        cleanup_worktree(&done.bare_repo, &done.worktree_path);
-                        let _ = db.update_task_status(&done.task_id, TaskStatus::Failed);
-                        let _ = tx.send(FromCoordinator::WorkerFailed {
-                            task_id: done.task_id.0,
-                            title: done.title,
-                            error,
-                        });
-                    }
                 }
+
+                process_events(
+                    events, &mut orch, &worker_mgr, &tracker, &worker_done_tx,
+                    &tx, &mut pending_events, &worker_mcp, &mut infra_broken, &bare_path,
+                ).await;
             }
 
             _ = poll_interval.tick() => {
-                poll_ready_tasks(
-                    &worker_mgr, &db, &limits, &mut active_task_ids,
-                    &worker_done_tx, &tx, &session_task_map,
-                ).await;
+                // Check for external stop signal.
+                let stop_file = enki_dir.join("stop");
+                if stop_file.exists() {
+                    let _ = std::fs::remove_file(&stop_file);
+                    let t = tracker.borrow();
+                    for sid in t.session_to_task.keys() {
+                        worker_mgr.kill_session(sid);
+                    }
+                    drop(t);
+                    tracker.borrow_mut().session_to_task.clear();
+                    tracker.borrow_mut().last_activity.clear();
+                    tracker.borrow_mut().current_tool.clear();
+
+                    let events = orch.handle(Command::StopAll);
+                    process_events(
+                        events, &mut orch, &worker_mgr, &tracker, &worker_done_tx,
+                        &tx, &mut pending_events, &worker_mcp, &mut infra_broken, &bare_path,
+                    ).await;
+                }
+
+                // Discover new work from DB (external MCP calls) + check signal files.
+                if !infra_broken {
+                    let events = orch.handle(Command::CheckSignals);
+                    process_events(
+                        events, &mut orch, &worker_mgr, &tracker, &worker_done_tx,
+                        &tx, &mut pending_events, &worker_mcp, &mut infra_broken, &bare_path,
+                    ).await;
+
+                    let events = orch.handle(Command::DiscoverFromDb);
+                    process_events(
+                        events, &mut orch, &worker_mgr, &tracker, &worker_done_tx,
+                        &tx, &mut pending_events, &worker_mcp, &mut infra_broken, &bare_path,
+                    ).await;
+                }
+
+                // Snapshot worker activity to DB.
+                {
+                    let t = tracker.borrow();
+                    for (session_id, tool_name) in &t.current_tool {
+                        if let Some(task_id_str) = t.session_to_task.get(session_id) {
+                            let task_id = Id(task_id_str.clone());
+                            let _ = orch.db().update_task_activity(&task_id, Some(tool_name));
+                        }
+                    }
+                }
+
+                // Worker count sync.
+                let _ = tx.send(FromCoordinator::WorkerCount(tracker.borrow().worker_count()));
+
+                // Monitor patrol.
+                let workers = tracker.borrow().worker_list();
+                let events = orch.handle(Command::MonitorTick { workers });
+                for event in &events {
+                    if let Event::MonitorCancel { session_id, task_id, stale_secs } = event {
+                        tracing::warn!(session_id, task_id, stale_secs, "monitor: worker stale, cancelling");
+                        let _ = worker_mgr.cancel(session_id).await;
+                        // Update agent status.
+                        if let Ok(tasks) = orch.db().list_tasks() {
+                            if let Some(task) = tasks.iter().find(|t| t.id.0 == *task_id) {
+                                if let Some(agent_id) = &task.assigned_to {
+                                    let _ = orch.db().update_agent_status(agent_id, AgentStatus::Stuck);
+                                }
+                            }
+                        }
+                        pending_events.push(format!(
+                            "- Task ({task_id}) worker stuck (no activity for {stale_secs}s) — cancel sent"
+                        ));
+                    }
+                    if let Event::MonitorEscalation(msg) = event {
+                        pending_events.push(msg.clone());
+                    }
+                }
+
+                // Dispatch queued merge requests.
+                if !merge_in_progress {
+                    try_dispatch_merge(
+                        orch.db(), &db_path, &merger_worktree_path,
+                        &merger_done_tx, &mut merge_in_progress, &tx,
+                    );
+                }
+
+                // Merge progress polling.
+                if let Ok(active_mrs) = orch.db().get_active_merge_requests() {
+                    let mut current_ids: HashSet<String> = HashSet::new();
+                    for mr in &active_mrs {
+                        current_ids.insert(mr.id.0.clone());
+                        let changed = match last_merge_statuses.get(&mr.id.0) {
+                            Some(prev) => *prev != mr.status,
+                            None => mr.status != MergeStatus::Queued,
+                        };
+                        if changed {
+                            let _ = tx.send(FromCoordinator::MergeProgress {
+                                mr_id: mr.id.0.clone(),
+                                task_id: mr.task_id.0.clone(),
+                                branch: mr.branch.clone(),
+                                status: mr.status.as_str().to_string(),
+                            });
+                        }
+                        last_merge_statuses.insert(mr.id.0.clone(), mr.status);
+                    }
+                    last_merge_statuses.retain(|k, _| current_ids.contains(k));
+                }
+
+                // Reconcile: catch missed merge signals.
+                if !infra_broken {
+                    let events = orch.reconcile_merges();
+                    process_events(
+                        events, &mut orch, &worker_mgr, &tracker, &worker_done_tx,
+                        &tx, &mut pending_events, &worker_mcp, &mut infra_broken, &bare_path,
+                    ).await;
+                }
             }
+        }
+
+        // Flush pending events to coordinator agent when idle.
+        if active_prompt.is_none() && !pending_events.is_empty() {
+            let events_text = pending_events.drain(..).collect::<Vec<_>>().join("\n");
+            let msg = format!("[worker status updates]\n{events_text}");
+            prompt_generation += 1;
+            let generation = prompt_generation;
+            let mgr = coord_mgr.clone();
+            let sid = session_id.clone();
+            let done_tx = prompt_done_tx.clone();
+            active_prompt = Some(tokio::task::spawn_local(async move {
+                let result = mgr.prompt(&sid, &msg).await;
+                let _ = done_tx.send((generation, result.map_err(|e| e.to_string())));
+            }));
         }
     }
 }
 
-/// Look for tasks with status "ready" and spawn workers, respecting tier concurrency limits.
-async fn poll_ready_tasks(
-    mgr: &AgentManager,
-    db: &Db,
-    limits: &TierLimits,
-    active_task_ids: &mut Vec<String>,
+// ---------------------------------------------------------------------------
+// Event processing
+// ---------------------------------------------------------------------------
+
+/// Process orchestrator events: spawn workers, forward TUI messages, queue status updates.
+async fn process_events(
+    initial_events: Vec<Event>,
+    orch: &mut Orchestrator,
+    worker_mgr: &AgentManager,
+    tracker: &std::rc::Rc<std::cell::RefCell<WorkerTracker>>,
     worker_done_tx: &mpsc::UnboundedSender<WorkerDone>,
     tx: &mpsc::UnboundedSender<FromCoordinator>,
-    session_task_map: &std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, String>>>,
+    pending_events: &mut Vec<String>,
+    mcp_servers: &[enki_acp::acp_schema::McpServer],
+    infra_broken: &mut bool,
+    bare_path: &Path,
 ) {
-    let projects = match db.list_projects() {
-        Ok(p) => p,
-        Err(_) => return,
-    };
+    let mut events = initial_events;
 
-    // Count currently running tasks to enforce limits.
-    // We track in-flight counts locally within this tick so multiple
-    // tasks in the same poll don't all bypass the same limit.
-    let (mut total, mut heavy, mut standard, mut light) = count_running_by_tier(db);
-
-    for project in &projects {
-        let tasks = match db.list_tasks(&project.id) {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-
-        for task in &tasks {
-            if task.status != TaskStatus::Ready {
-                continue;
-            }
-            if active_task_ids.contains(&task.id.0) {
-                continue;
-            }
-
-            let tier = task.tier.unwrap_or(Tier::Standard);
-            if total >= limits.max_workers {
-                tracing::debug!("worker limit reached ({}), deferring task {}", limits.max_workers, task.id);
-                continue;
-            }
-            let tier_ok = match tier {
-                Tier::Heavy => heavy < limits.max_heavy,
-                Tier::Standard => standard < limits.max_standard,
-                Tier::Light => light < limits.max_light,
-            };
-            if !tier_ok {
-                tracing::debug!(task_id = %task.id, "tier limit reached, deferring task");
-                continue;
-            }
-
-            tracing::info!(
-                task_id = %task.id.0, title = %task.title,
-                project_id = %project.id.0, "spawning worker for ready task"
-            );
-
-            match spawn_worker(
-                mgr, db, &project.id, &task.id, &task.title,
-                task.description.as_deref().unwrap_or(""),
-                worker_done_tx,
-                session_task_map,
-            )
-            .await
-            {
-                Ok(()) => {
-                    active_task_ids.push(task.id.0.clone());
-                    // Update local counts so remaining tasks in this tick see current limits.
-                    total += 1;
-                    match tier {
-                        Tier::Heavy => heavy += 1,
-                        Tier::Standard => standard += 1,
-                        Tier::Light => light += 1,
+    // Process in a loop: spawn failures can produce cascading events.
+    while !events.is_empty() {
+        let batch = std::mem::take(&mut events);
+        for event in batch {
+            match event {
+                Event::SpawnWorker {
+                    task_id,
+                    title,
+                    description,
+                    tier,
+                    execution_id,
+                    step_id,
+                    upstream_outputs,
+                } => {
+                    if *infra_broken {
+                        // Infrastructure failed — tell orchestrator this task failed.
+                        let more = orch.handle(Command::WorkerDone(WorkerResult {
+                            task_id: task_id.clone(),
+                            execution_id: Some(execution_id),
+                            step_id: Some(step_id),
+                            title,
+                            branch: String::new(),
+                            outcome: WorkerOutcome::Failed {
+                                error: "infrastructure broken".into(),
+                            },
+                        }));
+                        events.extend(more);
+                        continue;
                     }
-                    let _ = tx.send(FromCoordinator::WorkerSpawned {
-                        task_id: task.id.0.clone(),
-                        title: task.title.clone(),
+
+                    match spawn_worker(
+                        worker_mgr,
+                        orch,
+                        &task_id,
+                        &title,
+                        &description,
+                        tier,
+                        &execution_id,
+                        &step_id,
+                        &upstream_outputs,
+                        worker_done_tx,
+                        tracker,
+                        mcp_servers,
+                        bare_path,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            let _ = tx.send(FromCoordinator::WorkerSpawned {
+                                task_id: task_id.0.clone(),
+                                title: title.clone(),
+                            });
+                            pending_events.push(format!(
+                                "- Worker spawned for \"{}\" ({})",
+                                title, task_id
+                            ));
+                        }
+                        Err(e) => {
+                            let error = e.to_string();
+                            tracing::error!(task_id = %task_id, error = %error, "failed to spawn worker");
+
+                            // Check if this is an infrastructure failure.
+                            if error.contains("bare repo") || error.contains("not found") {
+                                *infra_broken = true;
+                            }
+
+                            let _ = tx.send(FromCoordinator::WorkerFailed {
+                                task_id: task_id.0.clone(),
+                                title: title.clone(),
+                                error: error.clone(),
+                            });
+                            pending_events.push(format!(
+                                "- Task \"{}\" ({}) failed to spawn: {}",
+                                title, task_id, error
+                            ));
+
+                            // Tell orchestrator the worker failed.
+                            let more = orch.handle(Command::WorkerDone(WorkerResult {
+                                task_id,
+                                execution_id: Some(execution_id),
+                                step_id: Some(step_id),
+                                title,
+                                branch: String::new(),
+                                outcome: WorkerOutcome::Failed { error },
+                            }));
+                            events.extend(more);
+                        }
+                    }
+                }
+                Event::KillSession { session_id } => {
+                    worker_mgr.kill_session(&session_id);
+                    tracker.borrow_mut().remove(&session_id);
+                    orch.session_ended(&session_id);
+                }
+                Event::QueueMerge(mr) => {
+                    let _ = tx.send(FromCoordinator::MergeQueued {
+                        mr_id: mr.id.0.clone(),
+                        task_id: mr.task_id.0.clone(),
+                        branch: mr.branch.clone(),
+                    });
+                    pending_events.push(format!(
+                        "- Task \"{}\" completed, merge {} queued",
+                        mr.task_id, mr.id
+                    ));
+                }
+                Event::WorkerCompleted { task_id, title } => {
+                    let _ = tx.send(FromCoordinator::WorkerCompleted {
+                        task_id: task_id.clone(),
+                        title: title.clone(),
                     });
                 }
-                Err(e) => {
-                    tracing::error!(task_id = %task.id.0, error = %e, "failed to spawn worker");
-                    let _ = db.update_task_status(&task.id, TaskStatus::Failed);
+                Event::WorkerFailed {
+                    task_id,
+                    title,
+                    error,
+                } => {
                     let _ = tx.send(FromCoordinator::WorkerFailed {
-                        task_id: task.id.0.clone(),
-                        title: task.title.clone(),
-                        error: e.to_string(),
+                        task_id: task_id.clone(),
+                        title: title.clone(),
+                        error: error.clone(),
                     });
+                    pending_events.push(format!("- Task \"{title}\" ({task_id}) failed: {error}"));
+                }
+                Event::MergeLanded { mr_id, task_id } => {
+                    let _ = tx.send(FromCoordinator::MergeLanded {
+                        mr_id: mr_id.clone(),
+                        task_id: task_id.clone(),
+                    });
+                    pending_events
+                        .push(format!("- Merge {mr_id} landed: task {task_id} merged to main"));
+                }
+                Event::MergeConflicted { mr_id, task_id } => {
+                    let _ = tx.send(FromCoordinator::MergeConflicted {
+                        mr_id: mr_id.clone(),
+                        task_id: task_id.clone(),
+                    });
+                    pending_events
+                        .push(format!("- Merge {mr_id} conflicted — task {task_id} needs resolution"));
+                }
+                Event::MergeFailed {
+                    mr_id,
+                    task_id,
+                    reason,
+                } => {
+                    let _ = tx.send(FromCoordinator::MergeFailed {
+                        mr_id: mr_id.clone(),
+                        task_id: task_id.clone(),
+                        reason: reason.clone(),
+                    });
+                    pending_events.push(format!("- Merge {mr_id} failed: {reason}"));
+                }
+                Event::ExecutionComplete { execution_id } => {
+                    pending_events
+                        .push(format!("- Execution {execution_id} completed successfully"));
+                }
+                Event::ExecutionFailed { execution_id } => {
+                    pending_events.push(format!("- Execution {execution_id} failed"));
+                }
+                Event::AllStopped { count } => {
+                    let _ = tx.send(FromCoordinator::AllStopped { count });
+                }
+                Event::MonitorCancel { .. } | Event::MonitorEscalation(_) => {
+                    // Handled directly in the poll tick branch.
+                }
+                Event::TaskRetrying {
+                    task_id,
+                    title,
+                    attempt,
+                    max,
+                } => {
+                    pending_events.push(format!(
+                        "- Task \"{title}\" ({task_id}) timed out — retrying ({attempt}/{max})"
+                    ));
+                }
+                Event::StatusMessage(msg) => {
+                    pending_events.push(msg);
                 }
             }
         }
     }
 }
 
-/// Count tasks in `running` status across all projects, broken down by tier.
-/// Returns (total, heavy, standard, light).
-fn count_running_by_tier(db: &Db) -> (usize, usize, usize, usize) {
-    let projects = match db.list_projects() {
-        Ok(p) => p,
-        Err(_) => return (0, 0, 0, 0),
-    };
+// ---------------------------------------------------------------------------
+// Worker done processing (infrastructure layer)
+// ---------------------------------------------------------------------------
 
-    let mut total = 0usize;
-    let mut heavy = 0usize;
-    let mut standard = 0usize;
-    let mut light = 0usize;
+/// Convert a raw WorkerDone (from the channel) into an orchestrator WorkerResult.
+/// Handles auto-commit, change detection, and worktree cleanup.
+fn process_worker_done(done: WorkerDone, _bare_path: &Path) -> WorkerResult {
+    match done.result {
+        Ok(ref stop_reason) => {
+            // Auto-commit uncommitted changes.
+            if let Ok(wt) = WorktreeManager::new(&done.bare_repo) {
+                let msg = format!("enki: {}", done.title);
+                wt.commit_uncommitted(&done.worktree_path, &msg);
+            }
 
-    for project in &projects {
-        if let Ok(tasks) = db.list_tasks(&project.id) {
-            for task in &tasks {
-                if task.status == TaskStatus::Running {
-                    total += 1;
-                    match task.tier.unwrap_or(Tier::Standard) {
-                        Tier::Heavy => heavy += 1,
-                        Tier::Standard => standard += 1,
-                        Tier::Light => light += 1,
-                    }
-                }
+            // Check for actual changes.
+            let has_changes = WorktreeManager::new(&done.bare_repo)
+                .map(|wt| {
+                    let base = wt
+                        .default_start_ref()
+                        .unwrap_or_else(|_| "origin/main".into());
+                    wt.branch_has_changes(&done.branch, &base)
+                })
+                .unwrap_or(false);
+
+            if !has_changes {
+                tracing::warn!(
+                    task_id = %done.task_id, title = %done.title,
+                    "worker completed but branch has no changes"
+                );
+                cleanup_worktree(&done.bare_repo, &done.worktree_path);
+                return WorkerResult {
+                    task_id: done.task_id,
+                    execution_id: done.execution_id,
+                    step_id: done.step_id,
+                    title: done.title,
+                    branch: done.branch,
+                    outcome: WorkerOutcome::NoChanges,
+                };
+            }
+
+            // Clean up worktree but keep branch for refinery.
+            if let Ok(wt_mgr) = WorktreeManager::new(&done.bare_repo) {
+                let _ = wt_mgr.remove(&done.worktree_path, false);
+            }
+
+            let output = extract_output(stop_reason);
+            WorkerResult {
+                task_id: done.task_id,
+                execution_id: done.execution_id,
+                step_id: done.step_id,
+                title: done.title,
+                branch: done.branch,
+                outcome: WorkerOutcome::Success { output },
             }
         }
-    }
-
-    (total, heavy, standard, light)
-}
-
-/// After a task completes, promote any tasks that were waiting on it to `ready`
-/// if all their other dependencies are also done.
-fn promote_unblocked_tasks(db: &Db, completed_task_id: &Id) {
-    let dependents = match db.get_dependents(completed_task_id) {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::warn!(task_id = %completed_task_id, error = %e, "failed to get dependents");
-            return;
-        }
-    };
-
-    for dep_id in &dependents {
-        let dep_task = match db.get_task(dep_id) {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-
-        if dep_task.status != TaskStatus::Open {
-            continue;
-        }
-
-        let all_deps = match db.get_dependencies(dep_id) {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-
-        let all_done = all_deps.iter().all(|dep| {
-            db.get_task(dep)
-                .map(|t| t.status == TaskStatus::Done)
-                .unwrap_or(false)
-        });
-
-        if all_done {
-            tracing::info!(
-                task_id = %dep_id, unblocked_by = %completed_task_id,
-                "promoting task to ready"
+        Err(ref error) => {
+            tracing::error!(
+                task_id = %done.task_id, title = %done.title,
+                error, "worker failed"
             );
-            let _ = db.update_task_status(dep_id, TaskStatus::Ready);
+            cleanup_worktree(&done.bare_repo, &done.worktree_path);
+            WorkerResult {
+                task_id: done.task_id,
+                execution_id: done.execution_id,
+                step_id: done.step_id,
+                title: done.title,
+                branch: done.branch,
+                outcome: WorkerOutcome::Failed {
+                    error: error.clone(),
+                },
+            }
         }
     }
 }
 
-/// Spawn a worker ACP session for a task.
-/// Syncs the bare repo, creates a worktree, starts a session, fires off the prompt.
+// ---------------------------------------------------------------------------
+// Worker spawning
+// ---------------------------------------------------------------------------
+
 async fn spawn_worker(
     mgr: &AgentManager,
-    db: &Db,
-    project_id: &Id,
+    orch: &mut Orchestrator,
     task_id: &Id,
     title: &str,
     description: &str,
+    tier: Tier,
+    execution_id: &Id,
+    step_id: &str,
+    upstream_outputs: &[(String, String)],
     worker_done_tx: &mpsc::UnboundedSender<WorkerDone>,
-    session_task_map: &std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, String>>>,
+    tracker: &std::rc::Rc<std::cell::RefCell<WorkerTracker>>,
+    mcp_servers: &[enki_acp::acp_schema::McpServer],
+    bare_path: &Path,
 ) -> anyhow::Result<()> {
-    let project = db.get_project(project_id)?;
-
     let branch = format!("task/{}", task_id);
-    let bare_path = PathBuf::from(&project.bare_repo);
-    let worktree_dir = bare_path.parent().unwrap().join(".enki-worktrees");
+    let worktree_dir = crate::commands::worktree_base()?;
     std::fs::create_dir_all(&worktree_dir)?;
 
-    let wt_mgr = WorktreeManager::new(&bare_path)?;
+    let wt_mgr = WorktreeManager::new(bare_path)?;
 
-    // Warn if source repo has uncommitted work (workers won't see it).
-    match wt_mgr.check_source_status() {
-        Ok(status) if !status.is_clean() => {
-            tracing::warn!(
-                task_id = %task_id.0,
-                status = %status.summary(),
-                "source repo has uncommitted work — workers won't see these changes"
-            );
-        }
-        Err(e) => {
-            tracing::debug!(task_id = %task_id.0, error = %e, "could not check source status");
-        }
-        _ => {}
-    }
-
-    // Sync bare repo so workers branch from current code.
     if let Err(e) = wt_mgr.sync() {
-        tracing::warn!(task_id = %task_id.0, error = %e, "bare repo sync failed, proceeding with current state");
-    } else {
-        tracing::debug!(task_id = %task_id.0, "bare repo synced");
+        tracing::warn!(task_id = %task_id, error = %e, "bare repo sync failed, proceeding");
     }
 
-    let worktree_path = wt_mgr.create(&branch, "origin/main", &worktree_dir)?;
-    tracing::debug!(
-        task_id = %task_id.0, branch,
-        worktree = %worktree_path.display(), "worktree created"
-    );
+    let start_ref = wt_mgr.default_start_ref()?;
+    let worktree_path = wt_mgr.create(&branch, &start_ref, &worktree_dir)?;
 
-    db.update_task_status(task_id, TaskStatus::Running)?;
     let agent_id = Id::new("agent");
-    db.assign_task(
+    orch.db().assign_task(
         task_id,
         &agent_id,
         worktree_path.to_str().unwrap(),
@@ -765,8 +1144,6 @@ async fn spawn_worker(
 
     let agent = Agent {
         id: agent_id.clone(),
-        role: AgentRole::Worker,
-        project_id: Some(project_id.clone()),
         acp_session: None,
         pid: None,
         status: AgentStatus::Busy,
@@ -774,60 +1151,116 @@ async fn spawn_worker(
         started_at: chrono::Utc::now(),
         last_seen: None,
     };
-    let _ = db.insert_agent(&agent);
+    let _ = orch.db().insert_agent(&agent);
 
-    let agent_cmd = enki_core::agent_runtime::resolve()
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let agent_cmd =
+        enki_core::agent_runtime::resolve().map_err(|e| anyhow::anyhow!("{e}"))?;
     let args_ref: Vec<&str> = agent_cmd.args.iter().map(|s| s.as_str()).collect();
     let session_id = mgr
-        .start_session(
+        .start_session_with_mcp(
             agent_cmd.program.to_str().unwrap(),
             &args_ref,
             worktree_path.clone(),
+            mcp_servers.to_vec(),
         )
         .await?;
-    tracing::debug!(session_id, task_id = %task_id.0, "worker ACP session started");
 
-    // Register session→task mapping so the worker callback can route updates.
-    session_task_map.borrow_mut().insert(session_id.clone(), task_id.0.clone());
+    // Register with tracker and orchestrator.
+    tracker
+        .borrow_mut()
+        .register(session_id.clone(), task_id.0.clone());
+    orch.set_step_session(&execution_id.0, step_id, session_id.clone());
 
-    let prompt = build_worker_prompt(title, description);
+    let timeout = monitor::tier_timeout(tier);
+    let prompt = build_worker_prompt(title, description, upstream_outputs);
     let mgr_clone = mgr.clone();
-    let session_task_map = session_task_map.clone();
+    let tracker_clone = tracker.clone();
     let task_id = task_id.clone();
     let title = title.to_string();
-    let branch_owned = branch.to_string();
+    let branch_owned = branch;
     let bare_repo_owned = bare_path.to_path_buf();
     let worktree_owned = worktree_path;
     let done_tx = worker_done_tx.clone();
+    let sid_for_done = session_id.clone();
+    let exec_id_owned = Some(execution_id.clone());
+    let step_id_owned = Some(step_id.to_string());
+
     tokio::task::spawn_local(async move {
-        tracing::debug!(session_id, task_id = %task_id.0, "worker prompt started");
-        let result = mgr_clone.prompt(&session_id, &prompt).await;
-        tracing::debug!(session_id, task_id = %task_id.0, ok = result.is_ok(), "worker prompt returned");
-        session_task_map.borrow_mut().remove(&session_id);
+        let result =
+            match tokio::time::timeout(timeout, mgr_clone.prompt(&session_id, &prompt)).await {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::warn!(session_id, task_id = %task_id, "worker timed out");
+                    let _ = mgr_clone.cancel(&session_id).await;
+                    Err(enki_acp::AcpError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "worker timed out after {} minutes",
+                            timeout.as_secs() / 60
+                        ),
+                    )))
+                }
+            };
+        tracker_clone.borrow_mut().remove(&session_id);
         mgr_clone.kill_session(&session_id);
         let _ = done_tx.send(WorkerDone {
             task_id,
             agent_id,
+            session_id: Some(sid_for_done),
             title,
             branch: branch_owned,
             bare_repo: bare_repo_owned,
             worktree_path: worktree_owned,
             result: result.map_err(|e| e.to_string()),
+            execution_id: exec_id_owned,
+            step_id: step_id_owned,
         });
     });
 
     Ok(())
 }
 
-/// Merge a worker's branch into main within the bare repo.
-/// Returns the `WorktreeError` directly so callers can distinguish `Conflict` from other errors.
-fn try_merge(bare_repo: &Path, branch: &str) -> enki_core::worktree::Result<()> {
-    let wt_mgr = WorktreeManager::new(bare_repo)?;
-    wt_mgr.merge_branch(branch, "main")
+// ---------------------------------------------------------------------------
+// Refinery dispatch
+// ---------------------------------------------------------------------------
+
+fn try_dispatch_merge(
+    db: &enki_core::db::Db,
+    db_path: &str,
+    merger_worktree: &Path,
+    merger_done_tx: &mpsc::UnboundedSender<MergerDone>,
+    merge_in_progress: &mut bool,
+    _tx: &mpsc::UnboundedSender<FromCoordinator>,
+) {
+    let queued = match db.get_queued_merge_requests() {
+        Ok(q) => q,
+        Err(_) => return,
+    };
+    let Some(mr) = queued.first() else { return };
+
+    *merge_in_progress = true;
+    let mr_id = mr.id.clone();
+    let branch = mr.branch.clone();
+    let base_branch = mr.base_branch.clone();
+    tracing::info!(mr_id = %mr_id, task_id = %mr.task_id, branch = %mr.branch, "dispatching merge");
+
+    let _ = db.update_merge_status(&mr_id, MergeStatus::Processing);
+
+    let done_tx = merger_done_tx.clone();
+    let wt_path = merger_worktree.to_path_buf();
+    let db_path_clone = db_path.to_string();
+    tokio::task::spawn_blocking(move || {
+        let db =
+            enki_core::db::Db::open(&db_path_clone).expect("refinery: failed to open db");
+        let outcome =
+            enki_core::refinery::process_merge(&wt_path, &branch, &base_branch, &db, &mr_id);
+        let _ = done_tx.send(MergerDone {
+            merge_request_id: mr_id,
+            outcome,
+        });
+    });
 }
 
-/// Best-effort worktree cleanup (used on failure paths).
 fn cleanup_worktree(bare_repo: &Path, worktree_path: &Path) {
     if let Ok(wt_mgr) = WorktreeManager::new(bare_repo) {
         let _ = wt_mgr.remove(worktree_path, true);

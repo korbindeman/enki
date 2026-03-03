@@ -1,7 +1,9 @@
 pub mod agent_runtime;
 pub mod dag;
 pub mod db;
+pub mod monitor;
+pub mod orchestrator;
+pub mod refinery;
 pub mod scheduler;
-pub mod template;
 pub mod types;
 pub mod worktree;

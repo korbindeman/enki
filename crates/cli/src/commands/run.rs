@@ -20,34 +20,25 @@ pub async fn run(task_id: &str, agent_cmd: &str, agent_args: &str, keep: bool, e
         );
     }
 
-    // Load project
-    let project = db.get_project(&task.project_id)?;
-    println!("project: {} ({})", project.name, project.local_path);
     println!("task: {} — {}", task.title, task.description.as_deref().unwrap_or(""));
 
     // Create worktree
     let branch = format!("task/{}", task_id);
-    let bare_path = PathBuf::from(&project.bare_repo);
-    let worktree_dir = bare_path.parent().unwrap().join(".enki-worktrees");
+    let bare_path = super::bare_path()?;
+    let worktree_dir = super::worktree_base()?;
     std::fs::create_dir_all(&worktree_dir)?;
 
     let wt_mgr = WorktreeManager::new(&bare_path)?;
 
-    // Warn if source repo has uncommitted work (workers won't see it).
-    if let Ok(status) = wt_mgr.check_source_status() {
-        if !status.is_clean() {
-            eprintln!("warning: source repo has uncommitted work — workers won't see these changes");
-            eprintln!("  {}", status.summary());
-        }
-    }
-
-    // Sync bare repo before branching so the worker starts from current code.
+    // Sync bare repo before branching so the worker starts from current code
+    // (including uncommitted/untracked files).
     if let Err(e) = wt_mgr.sync() {
         eprintln!("warning: bare repo sync failed: {e}");
     }
 
-    println!("creating worktree on branch '{}'...", branch);
-    let worktree_path = wt_mgr.create(&branch, "origin/main", &worktree_dir)?;
+    let start_ref = wt_mgr.default_start_ref()?;
+    println!("creating worktree on branch '{}' from '{}'...", branch, start_ref);
+    let worktree_path = wt_mgr.create(&branch, &start_ref, &worktree_dir)?;
     println!("worktree: {}", worktree_path.display());
 
     // Update task status
@@ -113,9 +104,12 @@ async fn run_acp_session(
 ) -> anyhow::Result<String> {
     let mut mgr = AgentManager::new();
 
-    // Set ENKI_BIN so the agent can call `enki` regardless of PATH.
+    // Set env vars so the agent can call `enki` and find the project DB.
     let mut env = std::collections::HashMap::new();
     env.insert("ENKI_BIN".to_string(), enki_bin.display().to_string());
+    if let Ok(enki_dir) = super::enki_dir() {
+        env.insert("ENKI_DIR".to_string(), enki_dir.display().to_string());
+    }
     mgr.set_env(env);
 
     mgr.on_update(|_session_id, update| match update {

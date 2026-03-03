@@ -8,11 +8,17 @@ crossterm = "0.29"
 
 [features]
 default = ["markdown"]
-markdown = ["dep:termimad"]
+markdown = ["dep:termimad", "dep:syntect"]
 
 [dependencies.termimad]
 version = "0.30"
 optional = true
+
+[dependencies.syntect]
+version = "5"
+optional = true
+default-features = false
+features = ["default-fancy", "html"]
 
 [dev-dependencies]
 tokio = { workspace = true }

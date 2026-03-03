@@ -3,9 +3,6 @@ mod coordinator;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use chrono::Utc;
-use enki_core::types::{Id, Project};
-use enki_core::worktree::WorktreeManager;
 use enki_tui::chat::{Chat, ChatContext, Handler};
 use enki_tui::lines;
 use enki_tui::Color;
@@ -16,22 +13,14 @@ const PROMPT: &str = "› ";
 
 /// Run the chat interface. This takes over terminal input (raw mode)
 /// with a pinned input bubble at the bottom.
-pub async fn run(db: enki_core::db::Db, db_path: String, enki_bin: PathBuf) -> anyhow::Result<()> {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-
-    let (project_cwd, status_msg) = match resolve_project(&db, &cwd) {
-        ProjectResolution::Existing { path, name } => {
-            (path, format!("Project: {name}"))
-        }
-        ProjectResolution::Registered { path, name } => {
-            (path, format!("Registered new project: {name}"))
-        }
-        ProjectResolution::NotAGitRepo => {
-            anyhow::bail!(
-                "Not a git repository. Run `git init` first, or cd into an existing repo."
-            );
-        }
-    };
+pub async fn run(_db: enki_core::db::Db, db_path: String, enki_bin: PathBuf) -> anyhow::Result<()> {
+    let project_cwd = crate::commands::project_root()?;
+    let project_name = project_cwd
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let status_msg = format!("Project: {project_name}");
 
     // Spawn coordinator
     let mut coord_handle = coordinator::spawn(project_cwd.clone(), db_path, enki_bin);
@@ -76,6 +65,7 @@ impl Handler<FromCoordinator> for CoordinatorHandler<'_> {
             FromCoordinator::Done(_reason) => {
                 cx.finish_markdown();
                 cx.clear_activity();
+                cx.notify("Enki is waiting for input");
             }
             FromCoordinator::WorkerSpawned { task_id, title } => {
                 cx.print(&lines::event(
@@ -105,34 +95,67 @@ impl Handler<FromCoordinator> for CoordinatorHandler<'_> {
                 ));
                 cx.remove_worker();
             }
-            FromCoordinator::WorkerConflicted {
-                task_id,
-                title,
-                worktree,
-                branch: _,
-            } => {
+            FromCoordinator::MergeQueued { mr_id: _, task_id: _, branch } => {
+                cx.print(&lines::event(
+                    "⊕",
+                    &format!("Merge queued: {branch}"),
+                    Color::DarkCyan,
+                ));
+            }
+            FromCoordinator::MergeLanded { mr_id: _, task_id } => {
+                cx.print(&lines::event(
+                    "✓",
+                    &format!("Merge landed ({task_id})"),
+                    Color::Green,
+                ));
+            }
+            FromCoordinator::MergeConflicted { mr_id: _, task_id } => {
                 cx.print(&lines::event_bold(
                     "⚠",
-                    &format!("Merge conflict: {title} ({task_id})"),
+                    &format!("Merge conflict ({task_id})"),
                     Color::Yellow,
                 ));
-                cx.print(&lines::detail(
-                    &format!("Worktree preserved at: {worktree}"),
-                    Color::Yellow,
+                cx.notify(&format!("Merge conflict: {task_id}"));
+            }
+            FromCoordinator::MergeFailed { mr_id: _, task_id, reason } => {
+                cx.print(&lines::event(
+                    "✗",
+                    &format!("Merge failed ({task_id}): {reason}"),
+                    Color::Red,
                 ));
-                cx.print(&lines::detail(
-                    &format!("Run: enki task retry {task_id}"),
-                    Color::Yellow,
+            }
+            FromCoordinator::MergeProgress { mr_id: _, task_id: _, branch, status } => {
+                cx.print(&lines::event(
+                    "⊕",
+                    &format!("Merge {status}: {branch}"),
+                    Color::DarkCyan,
                 ));
-                cx.remove_worker();
+            }
+            FromCoordinator::AllStopped { count } => {
+                let msg = if count == 0 {
+                    "No workers were running.".to_string()
+                } else {
+                    format!("Stopped {} worker{}.", count, if count == 1 { "" } else { "s" })
+                };
+                cx.print(&lines::event("■", &msg, Color::Yellow));
+                cx.reset_workers();
+                cx.notify(&msg);
+            }
+            FromCoordinator::WorkerCount(count) => {
+                cx.set_worker_count(count);
             }
             FromCoordinator::WorkerUpdate { .. } => {
                 // Activity updates are subsumed by the worker count indicator.
+            }
+            FromCoordinator::Interrupted => {
+                cx.finish();
+                cx.clear_activity();
             }
             FromCoordinator::Error(e) => {
                 cx.finish();
                 cx.print(&lines::error(&format!("error: {e}")));
                 cx.clear_activity();
+                cx.notify(&format!("Enki error: {e}"));
             }
         }
     }
@@ -141,76 +164,16 @@ impl Handler<FromCoordinator> for CoordinatorHandler<'_> {
         let _ = self.tx.send(ToCoordinator::Prompt(text));
     }
 
+    fn on_interrupt(&mut self) {
+        let _ = self.tx.send(ToCoordinator::Interrupt);
+    }
+
     fn on_quit(&mut self) {
         let _ = self.tx.send(ToCoordinator::Shutdown);
     }
 
     fn autocomplete(&self, query: &str) -> Vec<String> {
         complete_files(&self.project_cwd, query)
-    }
-}
-
-enum ProjectResolution {
-    Existing { path: PathBuf, name: String },
-    Registered { path: PathBuf, name: String },
-    NotAGitRepo,
-}
-
-fn resolve_project(db: &enki_core::db::Db, cwd: &Path) -> ProjectResolution {
-    // Check if CWD is inside an already-registered project.
-    if let Ok(projects) = db.list_projects() {
-        if let Some(project) = projects
-            .iter()
-            .find(|p| cwd.starts_with(&p.local_path) || Path::new(&p.local_path) == cwd)
-        {
-            return ProjectResolution::Existing {
-                path: PathBuf::from(&project.local_path),
-                name: project.name.clone(),
-            };
-        }
-    }
-
-    // Not registered — auto-register if this is a git repo.
-    if !cwd.join(".git").exists() {
-        return ProjectResolution::NotAGitRepo;
-    }
-
-    let canonical = match std::fs::canonicalize(cwd) {
-        Ok(p) => p,
-        Err(_) => return ProjectResolution::NotAGitRepo,
-    };
-
-    let name = canonical
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-
-    let bare_path = canonical.join(".enki.git");
-    if !bare_path.exists() {
-        if let Err(e) = WorktreeManager::init_bare(&canonical, &bare_path) {
-            eprintln!("warning: failed to init bare repo: {e}");
-            return ProjectResolution::NotAGitRepo;
-        }
-    }
-
-    let project = Project {
-        id: Id::new("proj"),
-        name: name.clone(),
-        repo_url: None,
-        local_path: canonical.to_string_lossy().to_string(),
-        bare_repo: bare_path.to_string_lossy().to_string(),
-        created_at: Utc::now(),
-    };
-
-    if let Err(e) = db.insert_project(&project) {
-        eprintln!("warning: failed to register project: {e}");
-        return ProjectResolution::NotAGitRepo;
-    }
-
-    ProjectResolution::Registered {
-        path: canonical,
-        name,
     }
 }
 

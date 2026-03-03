@@ -6,7 +6,6 @@ run *ARGS:
 chat:
     cargo run -p enki-tui --example chat
 
-# Build release and copy to ~/dev/_scripts
+# Build and install release binary to ~/.cargo/bin
 install:
-    cargo build --release --bin enki
-    cp target/release/enki ~/dev/_scripts/enki
+    cargo install --path crates/cli

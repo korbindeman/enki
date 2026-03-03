@@ -81,6 +81,119 @@ impl WorktreeManager {
         Ok(Self { bare_repo })
     }
 
+    /// Detect the default branch name (e.g., `main` or `master`).
+    ///
+    /// Returns an error if the repo has no branches (empty repo with no commits).
+    pub fn default_branch(&self) -> Result<String> {
+        for candidate in &["main", "master"] {
+            let output = Command::new("git")
+                .args(["rev-parse", "--verify", candidate])
+                .env("GIT_DIR", &self.bare_repo)
+                .output();
+            if let Ok(out) = output {
+                if out.status.success() {
+                    return Ok(candidate.to_string());
+                }
+            }
+        }
+
+        Err(WorktreeError::Git(
+            "no branches found — the repo needs at least one commit before workers can run".into(),
+        ))
+    }
+
+    /// The remote-tracking ref to branch workers from (e.g., `origin/main`).
+    pub fn default_start_ref(&self) -> Result<String> {
+        let branch = self.default_branch()?;
+        // Prefer the remote-tracking ref if it exists.
+        let origin_ref = format!("origin/{branch}");
+        let output = Command::new("git")
+            .args(["rev-parse", "--verify", &origin_ref])
+            .env("GIT_DIR", &self.bare_repo)
+            .output();
+        if let Ok(out) = output {
+            if out.status.success() {
+                return Ok(origin_ref);
+            }
+        }
+        // No remote tracking ref — fall back to the local branch.
+        Ok(branch)
+    }
+
+    /// Commit any uncommitted changes in a worktree.
+    ///
+    /// Workers may finish without committing (the agent isn't always reliable
+    /// about running `git commit`). This captures their work so it isn't lost
+    /// when the worktree is removed. Returns `true` if a commit was created.
+    pub fn commit_uncommitted(&self, worktree_path: &Path, message: &str) -> bool {
+        // Check for dirty state (modified, untracked, deleted).
+        let status = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(worktree_path)
+            .output();
+        let has_dirty = match status {
+            Ok(ref out) => !String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+            Err(_) => return false,
+        };
+        if !has_dirty {
+            return false;
+        }
+
+        // Stage everything and commit.
+        let add = Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(worktree_path)
+            .output();
+        if add.is_err() || !add.unwrap().status.success() {
+            tracing::warn!(worktree = %worktree_path.display(), "auto-commit: git add -A failed");
+            return false;
+        }
+
+        let commit = Command::new("git")
+            .args(["commit", "-m", message, "--no-verify"])
+            .current_dir(worktree_path)
+            .output();
+        match commit {
+            Ok(ref out) if out.status.success() => {
+                tracing::info!(worktree = %worktree_path.display(), "auto-committed uncommitted worker changes");
+                true
+            }
+            Ok(ref out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                tracing::warn!(worktree = %worktree_path.display(), stderr = %stderr, "auto-commit: git commit failed");
+                false
+            }
+            Err(e) => {
+                tracing::warn!(worktree = %worktree_path.display(), error = %e, "auto-commit: failed to run git commit");
+                false
+            }
+        }
+    }
+
+    /// Check whether a branch has any file changes compared to its starting ref.
+    ///
+    /// Returns `true` if the branch tree differs from the base ref tree (i.e. the
+    /// worker actually produced output). Works against the bare repo directly —
+    /// no worktree needed.
+    pub fn branch_has_changes(&self, branch: &str, base_ref: &str) -> bool {
+        let tree_of = |refspec: &str| -> Option<String> {
+            let output = Command::new("git")
+                .args(["rev-parse", &format!("{refspec}^{{tree}}")])
+                .env("GIT_DIR", &self.bare_repo)
+                .output()
+                .ok()?;
+            if output.status.success() {
+                Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+            } else {
+                None
+            }
+        };
+        match (tree_of(base_ref), tree_of(branch)) {
+            (Some(base), Some(br)) => base != br,
+            _ => false, // can't determine — assume no changes
+        }
+    }
+
     /// Create a new worktree with a new branch based on the given base ref.
     /// Returns the path to the created worktree.
     ///
@@ -142,6 +255,21 @@ impl WorktreeManager {
             }
         }
 
+        Ok(())
+    }
+
+    /// Delete a branch from the bare repo.
+    pub fn delete_branch(&self, branch: &str) -> Result<()> {
+        let output = Command::new("git")
+            .args(["branch", "-D", branch])
+            .env("GIT_DIR", &self.bare_repo)
+            .output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(WorktreeError::Git(format!(
+                "branch delete failed: {stderr}"
+            )));
+        }
         Ok(())
     }
 
@@ -279,6 +407,15 @@ impl WorktreeManager {
         Ok(())
     }
 
+    /// Check if a branch has been merged into the target branch.
+    pub fn branch_merged(&self, branch: &str, target: &str) -> bool {
+        let output = Command::new("git")
+            .args(["merge-base", "--is-ancestor", branch, target])
+            .env("GIT_DIR", &self.bare_repo)
+            .output();
+        matches!(output, Ok(o) if o.status.success())
+    }
+
     /// Get the branch checked out in a worktree.
     fn branch_at(&self, worktree_path: &Path) -> Result<String> {
         let output = Command::new("git")
@@ -296,13 +433,17 @@ impl WorktreeManager {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
-    /// Fetch the latest commits from origin into the bare repo.
+    /// Fetch the latest commits from origin into the bare repo, including
+    /// any uncommitted/untracked changes in the source working tree.
     ///
-    /// The bare repo's origin is the local source repo used when cloning.
-    /// This keeps the bare repo in sync so workers branch from current code.
-    /// After the refspec configuration in `init_bare`, this populates
-    /// `refs/remotes/origin/*` without touching local branches.
+    /// 1. Fetches committed changes (`refs/remotes/origin/*`).
+    /// 2. If the source working tree is dirty, creates a snapshot commit
+    ///    using plumbing commands (without touching HEAD, index, or working
+    ///    tree in the source) and overwrites `origin/main` in the bare repo
+    ///    so workers branch from the actual filesystem state.
     pub fn sync(&self) -> Result<()> {
+        tracing::debug!(bare_repo = %self.bare_repo.display(), "syncing bare repo from source");
+
         let output = Command::new("git")
             .args(["fetch", "origin", "--prune"])
             .env("GIT_DIR", &self.bare_repo)
@@ -310,9 +451,251 @@ impl WorktreeManager {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::error!(stderr = %stderr, "bare repo fetch failed");
             return Err(WorktreeError::Git(format!("fetch failed: {stderr}")));
         }
 
+        tracing::debug!("bare repo fetch succeeded, snapshotting dirty state");
+
+        // Snapshot dirty state so workers see the actual filesystem.
+        self.snapshot_dirty_state()?;
+
+        Ok(())
+    }
+
+    /// Create a snapshot commit of the source's dirty state and update
+    /// `origin/<default_branch>` in the bare repo to point at it.
+    ///
+    /// Uses only plumbing commands — never touches the source repo's HEAD,
+    /// index, or working tree.
+    fn snapshot_dirty_state(&self) -> Result<()> {
+        let source = self.source_repo()?;
+
+        // Quick check: is the source dirty?
+        let output = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&source)
+            .output()?;
+        let status_out = String::from_utf8_lossy(&output.stdout);
+        if status_out.trim().is_empty() {
+            tracing::debug!(source = %source.display(), "source is clean, skipping dirty snapshot");
+            return Ok(()); // Clean — nothing to snapshot.
+        }
+
+        let dirty_file_count = status_out.lines().count();
+        tracing::debug!(
+            source = %source.display(),
+            dirty_files = dirty_file_count,
+            "source is dirty, creating snapshot commit"
+        );
+
+        let git_dir = source.join(".git");
+        let tmp_index = git_dir.join("enki-snapshot-index");
+
+        // Copy the real index as a starting point so tracked files are present.
+        let real_index = git_dir.join("index");
+        if real_index.exists() {
+            std::fs::copy(&real_index, &tmp_index)?;
+        }
+
+        // Stage everything (tracked modifications + untracked, respects .gitignore).
+        let output = Command::new("git")
+            .args(["add", "-A"])
+            .env("GIT_INDEX_FILE", &tmp_index)
+            .current_dir(&source)
+            .output()?;
+        if !output.status.success() {
+            let _ = std::fs::remove_file(&tmp_index);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(WorktreeError::Git(format!(
+                "snapshot: git add -A failed: {stderr}"
+            )));
+        }
+
+        // Write tree from the temp index.
+        let output = Command::new("git")
+            .args(["write-tree"])
+            .env("GIT_INDEX_FILE", &tmp_index)
+            .current_dir(&source)
+            .output()?;
+        let _ = std::fs::remove_file(&tmp_index);
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(WorktreeError::Git(format!(
+                "snapshot: write-tree failed: {stderr}"
+            )));
+        }
+        let tree_hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+        // Get current HEAD of source.
+        let output = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&source)
+            .output()?;
+        if !output.status.success() {
+            return Err(WorktreeError::Git("snapshot: rev-parse HEAD failed".into()));
+        }
+        let head_hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+        // Create a commit object (doesn't move any refs in the source).
+        let output = Command::new("git")
+            .args([
+                "commit-tree", &tree_hash,
+                "-p", &head_hash,
+                "-m", "enki: filesystem snapshot (uncommitted changes)",
+            ])
+            .env("GIT_AUTHOR_NAME", "enki")
+            .env("GIT_AUTHOR_EMAIL", "enki@local")
+            .env("GIT_COMMITTER_NAME", "enki")
+            .env("GIT_COMMITTER_EMAIL", "enki@local")
+            .current_dir(&source)
+            .output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(WorktreeError::Git(format!(
+                "snapshot: commit-tree failed: {stderr}"
+            )));
+        }
+        let commit_hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+        // Store on a temp ref in source so we can fetch it into the bare repo.
+        let output = Command::new("git")
+            .args(["update-ref", "refs/enki/snapshot", &commit_hash])
+            .current_dir(&source)
+            .output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(WorktreeError::Git(format!(
+                "snapshot: update-ref failed: {stderr}"
+            )));
+        }
+
+        // Fetch the snapshot into the bare repo, overwriting origin/<branch>.
+        let default_branch = self.default_branch().unwrap_or_else(|_| "main".to_string());
+        let output = Command::new("git")
+            .args([
+                "fetch", "origin",
+                &format!("refs/enki/snapshot:refs/remotes/origin/{default_branch}"),
+            ])
+            .env("GIT_DIR", &self.bare_repo)
+            .output()?;
+
+        // Clean up temp ref regardless of fetch outcome.
+        let _ = Command::new("git")
+            .args(["update-ref", "-d", "refs/enki/snapshot"])
+            .current_dir(&source)
+            .output();
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(WorktreeError::Git(format!(
+                "snapshot: fetch into bare failed: {stderr}"
+            )));
+        }
+
+        tracing::info!("synced dirty filesystem snapshot into bare repo");
+        Ok(())
+    }
+
+    /// Pull merged work from the bare repo into the source working directory.
+    ///
+    /// Stashes any uncommitted changes, fetches the branch from the bare repo,
+    /// resets the working tree, then pops the stash. If the stash pop conflicts,
+    /// the stash is preserved and a warning is logged.
+    pub fn update_source_workdir(&self, branch: &str) -> Result<()> {
+        let source = self.source_repo()?;
+        tracing::debug!(source = %source.display(), branch, "pulling merged work into source working directory");
+
+        // Check for dirty state and stash if needed.
+        let output = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&source)
+            .output()?;
+        let is_dirty = !String::from_utf8_lossy(&output.stdout).trim().is_empty();
+
+        let did_stash = if is_dirty {
+            tracing::debug!("source has uncommitted changes, stashing before reset");
+            let output = Command::new("git")
+                .args([
+                    "stash", "push", "--include-untracked",
+                    "-m", "enki: auto-stash before pulling merged work",
+                ])
+                .current_dir(&source)
+                .output()?;
+            // "No local changes to save" means stash didn't actually save anything.
+            let stashed = output.status.success()
+                && !String::from_utf8_lossy(&output.stdout).contains("No local changes");
+            tracing::debug!(stashed, "stash result");
+            stashed
+        } else {
+            false
+        };
+
+        // Fetch the branch from bare repo (sets FETCH_HEAD).
+        let bare_str = self.bare_repo.to_string_lossy().to_string();
+        let output = Command::new("git")
+            .args(["fetch", &bare_str, branch])
+            .current_dir(&source)
+            .output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // Pop stash before returning error.
+            if did_stash {
+                let _ = Command::new("git")
+                    .args(["stash", "pop"])
+                    .current_dir(&source)
+                    .output();
+            }
+            return Err(WorktreeError::Git(format!(
+                "fetch from bare failed: {stderr}"
+            )));
+        }
+
+        // Merge the fetched commit into the source working tree.
+        // We use merge instead of `reset --hard` because reset recreates the
+        // entire working tree, which invalidates the inode of the cwd for any
+        // shell session sitting inside the repo (causing "No such file or
+        // directory" errors). Merge only touches files that actually changed.
+        let output = Command::new("git")
+            .args(["merge", "FETCH_HEAD", "--no-edit", "--ff"])
+            .env("GIT_AUTHOR_NAME", "enki")
+            .env("GIT_AUTHOR_EMAIL", "enki@local")
+            .env("GIT_COMMITTER_NAME", "enki")
+            .env("GIT_COMMITTER_EMAIL", "enki@local")
+            .current_dir(&source)
+            .output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // Abort the failed merge so the repo isn't left in a conflicted state.
+            let _ = Command::new("git")
+                .args(["merge", "--abort"])
+                .current_dir(&source)
+                .output();
+            if did_stash {
+                let _ = Command::new("git")
+                    .args(["stash", "pop"])
+                    .current_dir(&source)
+                    .output();
+            }
+            return Err(WorktreeError::Git(format!(
+                "merge FETCH_HEAD failed: {stderr}"
+            )));
+        }
+
+        // Restore stashed changes.
+        if did_stash {
+            let output = Command::new("git")
+                .args(["stash", "pop"])
+                .current_dir(&source)
+                .output()?;
+            if !output.status.success() {
+                tracing::warn!(
+                    "stash pop had conflicts — user's uncommitted changes preserved in git stash"
+                );
+            }
+        }
+
+        tracing::info!(branch, "updated source working directory from bare repo");
         Ok(())
     }
 
@@ -407,11 +790,7 @@ impl WorktreeManager {
     /// so a subsequent `merge_branch` will always fast-forward.
     pub fn rebase_onto(&self, worktree_path: &Path, target_branch: &str) -> Result<()> {
         let output = Command::new("git")
-            .args([
-                "-c", "user.name=enki",
-                "-c", "user.email=enki@local",
-                "rebase", target_branch,
-            ])
+            .args(["rebase", target_branch])
             .current_dir(worktree_path)
             .output()?;
 
@@ -440,6 +819,31 @@ impl WorktreeManager {
     ///
     /// Matches Gastown's `configureRefspec()` pattern.
     pub fn init_bare(source_repo: &Path, bare_path: &Path) -> Result<()> {
+        // If the source repo has no commits, create an initial one so the
+        // bare clone has something to work with.
+        let head_check = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(source_repo)
+            .output();
+        let is_empty = match head_check {
+            Ok(out) => !out.status.success(),
+            Err(_) => true,
+        };
+        if is_empty {
+            let output = Command::new("git")
+                .args([
+                    "commit", "--allow-empty", "-m", "Initial commit (created by enki)",
+                ])
+                .current_dir(source_repo)
+                .output()?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(WorktreeError::Git(format!(
+                    "failed to create initial commit in empty repo: {stderr}"
+                )));
+            }
+        }
+
         let output = Command::new("git")
             .args(["clone", "--bare"])
             .arg(source_repo)
@@ -532,6 +936,10 @@ fn parse_worktree_list(output: &str) -> Vec<WorktreeInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::Db;
+    use crate::refinery::{self, MergeOutcome};
+    use crate::types::{Id, MergeRequest, MergeStatus, Task, TaskStatus};
+    use chrono::Utc;
 
     // ─── Helpers ──────────────────────────────────────────────
 
@@ -769,46 +1177,76 @@ branch refs/heads/task/fix-login
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    // ─── Uncommitted changes do NOT propagate ────────────────
+    // ─── Uncommitted changes DO propagate via dirty snapshot ──
 
     #[test]
-    fn uncommitted_changes_not_propagated() {
+    fn uncommitted_changes_propagated() {
         let tmp = tmp_dir("uncommitted");
         let (source, _, worktrees, mgr) = setup_all(&tmp);
 
         // Modify a tracked file WITHOUT committing
         std::fs::write(source.join("README.md"), "# modified but not committed").unwrap();
 
-        // Sync and create worktree
+        // Sync snapshots the dirty state into origin/main
         mgr.sync().unwrap();
         let wt = mgr.create("task/test", "origin/main", &worktrees).unwrap();
 
-        // Worktree should have the ORIGINAL content, not the uncommitted change
+        // Worktree should have the MODIFIED content
         assert_eq!(
             std::fs::read_to_string(wt.join("README.md")).unwrap(),
-            "# test"
+            "# modified but not committed"
+        );
+
+        // Source repo's actual HEAD should be unchanged (snapshot used plumbing only)
+        let head_content = git_output(&source, &["show", "HEAD:README.md"]);
+        assert_eq!(head_content, "# test", "source HEAD should be untouched");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // ─── Untracked files DO propagate via dirty snapshot ─────
+
+    #[test]
+    fn untracked_files_propagated() {
+        let tmp = tmp_dir("untracked");
+        let (source, _, worktrees, mgr) = setup_all(&tmp);
+
+        // Add a new file WITHOUT staging or committing
+        std::fs::write(source.join("new_file.txt"), "hello from source").unwrap();
+
+        // Sync snapshots the dirty state
+        mgr.sync().unwrap();
+        let wt = mgr.create("task/test", "origin/main", &worktrees).unwrap();
+
+        // Worktree should have the untracked file
+        assert!(wt.join("new_file.txt").exists(),
+            "untracked files should appear in worktrees via dirty snapshot");
+        assert_eq!(
+            std::fs::read_to_string(wt.join("new_file.txt")).unwrap(),
+            "hello from source"
         );
 
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    // ─── Untracked files do NOT propagate ────────────────────
+    // ─── Gitignored files do NOT propagate ───────────────────
 
     #[test]
-    fn untracked_files_not_propagated() {
-        let tmp = tmp_dir("untracked");
+    fn gitignored_files_not_propagated() {
+        let tmp = tmp_dir("gitignored");
         let (source, _, worktrees, mgr) = setup_all(&tmp);
 
-        // Add a new file WITHOUT staging or committing
+        // Create .gitignore and an ignored file
+        std::fs::write(source.join(".gitignore"), "secret.env\n").unwrap();
+        run_git(&source, &["add", ".gitignore"]);
+        run_git_with_author(&source, &["commit", "-m", "add gitignore"]);
         std::fs::write(source.join("secret.env"), "API_KEY=hunter2").unwrap();
 
-        // Sync and create worktree
         mgr.sync().unwrap();
         let wt = mgr.create("task/test", "origin/main", &worktrees).unwrap();
 
-        // Worktree should NOT have the untracked file
         assert!(!wt.join("secret.env").exists(),
-            "untracked files should not appear in worktrees");
+            "gitignored files should not appear in worktrees");
 
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -893,6 +1331,51 @@ branch refs/heads/task/fix-login
         // Remove and verify cleanup
         mgr.remove(&wt, true).unwrap();
         assert!(!wt.exists());
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // ─── Worktree is functional for command execution ─────────
+    // Verifies that a worktree created from the bare repo can actually
+    // run git and shell commands — the same environment workers get.
+
+    #[test]
+    fn worktree_supports_command_execution() {
+        let tmp = tmp_dir("cmd-exec");
+        let (_source, _, worktrees, mgr) = setup_all(&tmp);
+
+        let wt = mgr.create("task/cmd-test", "origin/main", &worktrees).unwrap();
+
+        // .git file should exist (points to bare repo's worktrees dir).
+        assert!(wt.join(".git").exists(), "worktree should have .git entry");
+
+        // git status should work (basic git operation).
+        let output = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&wt)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git status should succeed in worktree");
+
+        // git rev-parse should report the correct branch.
+        let branch = git_output(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        assert_eq!(branch, "task/cmd-test");
+
+        // Shell commands should work with the worktree as cwd.
+        let output = Command::new("ls")
+            .current_dir(&wt)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "ls should succeed in worktree");
+        let ls_output = String::from_utf8_lossy(&output.stdout);
+        assert!(ls_output.contains("README.md"), "ls should show worktree files");
+
+        // Writing files + git add + git commit should work.
+        std::fs::write(wt.join("test.txt"), "hello").unwrap();
+        run_git(&wt, &["add", "test.txt"]);
+        run_git_with_author(&wt, &["commit", "-m", "test commit"]);
+        let log = git_output(&wt, &["log", "--oneline", "-1"]);
+        assert!(log.contains("test commit"), "commit should be in log");
 
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -1031,6 +1514,359 @@ branch refs/heads/task/fix-login
         assert_eq!(
             std::fs::read_to_string(verify.join("file2.txt")).unwrap(),
             "from feature-2"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // ─── E2E refinery helpers ─────────────────────────────────
+
+    /// Create an in-memory DB with a task and merge request, returning (db, task_id, mr_id).
+    fn setup_db_with_mr(branch: &str) -> (Db, Id, Id) {
+        let db = Db::open_in_memory().unwrap();
+        let task_id = Id::new("tsk");
+        let now = Utc::now();
+        db.insert_task(&Task {
+            id: task_id.clone(),
+            title: "test task".into(),
+            description: None,
+            status: TaskStatus::Running,
+            assigned_to: None,
+            worktree: None,
+            branch: Some(branch.to_string()),
+            tier: None,
+            current_activity: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .unwrap();
+
+        let mr_id = Id::new("mr");
+        db.insert_merge_request(&MergeRequest {
+            id: mr_id.clone(),
+            task_id: task_id.clone(),
+            branch: branch.to_string(),
+            base_branch: "main".to_string(),
+            status: MergeStatus::Queued,
+            priority: 0,
+            diff_stats: None,
+            review_note: None,
+            execution_id: None,
+            step_id: None,
+            queued_at: now,
+            started_at: None,
+            merged_at: None,
+        })
+        .unwrap();
+
+        (db, task_id, mr_id)
+    }
+
+    // ─── E2E: full pipeline tests ───────────────────────────
+
+    #[test]
+    fn e2e_worker_commits_merge_and_update_source() {
+        let tmp = tmp_dir("e2e-merge");
+        let (source, _bare, worktrees, mgr) = setup_all(&tmp);
+
+        mgr.sync().unwrap();
+
+        // Worker branches from origin/main, writes code, commits.
+        let wt = mgr.create("task/worker-1", "origin/main", &worktrees).unwrap();
+        std::fs::write(wt.join("feature.rs"), "fn feature() {}").unwrap();
+        run_git(&wt, &["add", "."]);
+        run_git_with_author(&wt, &["commit", "-m", "implement feature"]);
+
+        // Create refinery worktree and run process_merge.
+        let refinery_wt = mgr.create("refinery", "main", &worktrees).unwrap();
+        let (db, _task_id, mr_id) = setup_db_with_mr("task/worker-1");
+
+        let outcome = refinery::process_merge(&refinery_wt, "task/worker-1", "main", &db, &mr_id);
+        assert!(
+            matches!(outcome, MergeOutcome::Merged),
+            "expected Merged, got {outcome:?}"
+        );
+
+        // Bare repo's main should contain worker's file.
+        let verify = mgr.create("verify-main", "main", &worktrees).unwrap();
+        assert!(
+            verify.join("feature.rs").exists(),
+            "bare repo main should contain worker's feature.rs"
+        );
+        assert_eq!(
+            std::fs::read_to_string(verify.join("feature.rs")).unwrap(),
+            "fn feature() {}"
+        );
+
+        // Pull into source working directory.
+        mgr.update_source_workdir("main").unwrap();
+
+        // Source should now have the worker's file.
+        assert!(
+            source.join("feature.rs").exists(),
+            "source should have feature.rs after update_source_workdir"
+        );
+        assert_eq!(
+            std::fs::read_to_string(source.join("feature.rs")).unwrap(),
+            "fn feature() {}"
+        );
+
+        // Source's git log should include the worker's commit.
+        let log = git_output(&source, &["log", "--oneline"]);
+        assert!(
+            log.contains("implement feature"),
+            "source git log should contain worker's commit message"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn e2e_empty_worker_rejected_by_refinery() {
+        let tmp = tmp_dir("e2e-empty");
+        let (_source, bare, worktrees, mgr) = setup_all(&tmp);
+
+        mgr.sync().unwrap();
+
+        // Record main's commit before merge attempt.
+        let main_before = git_output_bare(&bare, &["rev-parse", "main"]);
+
+        // Worker branches from origin/main but does NOT commit anything.
+        let _wt = mgr.create("task/empty-worker", "origin/main", &worktrees).unwrap();
+
+        // Refinery should reject this.
+        let refinery_wt = mgr.create("refinery", "main", &worktrees).unwrap();
+        let (db, _task_id, mr_id) = setup_db_with_mr("task/empty-worker");
+
+        let outcome =
+            refinery::process_merge(&refinery_wt, "task/empty-worker", "main", &db, &mr_id);
+        assert!(
+            matches!(outcome, MergeOutcome::Failed(ref msg) if msg.contains("no file changes")),
+            "expected Failed with 'no file changes', got {outcome:?}"
+        );
+
+        // Bare repo's main should be unchanged.
+        let main_after = git_output_bare(&bare, &["rev-parse", "main"]);
+        assert_eq!(main_before, main_after, "main should not move on empty worker");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn e2e_dirty_source_snapshot_does_not_create_false_merge() {
+        let tmp = tmp_dir("e2e-snapshot");
+        let (source, bare, worktrees, mgr) = setup_all(&tmp);
+
+        // Source has dirty (uncommitted) files.
+        std::fs::write(source.join("dirty.txt"), "uncommitted work").unwrap();
+
+        // Sync — this creates a snapshot commit on origin/main that differs
+        // from local main (origin/main has dirty.txt, local main does not).
+        mgr.sync().unwrap();
+
+        // Verify origin/main diverged from local main.
+        let local_main = git_output_bare(&bare, &["rev-parse", "main"]);
+        let origin_main = git_output_bare(&bare, &["rev-parse", "origin/main"]);
+        assert_ne!(
+            local_main, origin_main,
+            "snapshot should make origin/main diverge from local main"
+        );
+
+        // Worker branches from origin/main (includes snapshot) but does NOT commit.
+        let _wt = mgr.create("task/snapshot-worker", "origin/main", &worktrees).unwrap();
+
+        // Refinery should reject — the branch has the snapshot commit but no
+        // actual worker file changes vs origin/main.
+        let refinery_wt = mgr.create("refinery", "main", &worktrees).unwrap();
+        let (db, _task_id, mr_id) = setup_db_with_mr("task/snapshot-worker");
+
+        let outcome =
+            refinery::process_merge(&refinery_wt, "task/snapshot-worker", "main", &db, &mr_id);
+        assert!(
+            matches!(outcome, MergeOutcome::Failed(ref msg) if msg.contains("no file changes")),
+            "snapshot-only branch should be rejected, got {outcome:?}"
+        );
+
+        // Local main should NOT have moved to the snapshot commit.
+        let main_after = git_output_bare(&bare, &["rev-parse", "main"]);
+        assert_eq!(
+            local_main, main_after,
+            "local main must not move to snapshot commit"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn e2e_multiple_workers_sequential_merge() {
+        let tmp = tmp_dir("e2e-multi");
+        let (source, _bare, worktrees, mgr) = setup_all(&tmp);
+
+        mgr.sync().unwrap();
+
+        // Worker 1 commits file A.
+        let wt1 = mgr.create("task/worker-1", "origin/main", &worktrees).unwrap();
+        std::fs::write(wt1.join("file_a.rs"), "// file A").unwrap();
+        run_git(&wt1, &["add", "."]);
+        run_git_with_author(&wt1, &["commit", "-m", "add file A"]);
+
+        let refinery_wt = mgr.create("refinery", "main", &worktrees).unwrap();
+        let (db, _, mr_id1) = setup_db_with_mr("task/worker-1");
+
+        let outcome1 = refinery::process_merge(&refinery_wt, "task/worker-1", "main", &db, &mr_id1);
+        assert!(matches!(outcome1, MergeOutcome::Merged), "worker 1: {outcome1:?}");
+
+        // Worker 2 commits file B.
+        let wt2 = mgr.create("task/worker-2", "origin/main", &worktrees).unwrap();
+        std::fs::write(wt2.join("file_b.rs"), "// file B").unwrap();
+        run_git(&wt2, &["add", "."]);
+        run_git_with_author(&wt2, &["commit", "-m", "add file B"]);
+
+        let (db2, _, mr_id2) = setup_db_with_mr("task/worker-2");
+
+        let outcome2 =
+            refinery::process_merge(&refinery_wt, "task/worker-2", "main", &db2, &mr_id2);
+        assert!(matches!(outcome2, MergeOutcome::Merged), "worker 2: {outcome2:?}");
+
+        // Pull into source.
+        mgr.update_source_workdir("main").unwrap();
+
+        // Source should have both files.
+        assert!(source.join("file_a.rs").exists(), "source should have file A");
+        assert!(source.join("file_b.rs").exists(), "source should have file B");
+        assert_eq!(
+            std::fs::read_to_string(source.join("file_a.rs")).unwrap(),
+            "// file A"
+        );
+        assert_eq!(
+            std::fs::read_to_string(source.join("file_b.rs")).unwrap(),
+            "// file B"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn e2e_source_dirty_state_roundtrip() {
+        let tmp = tmp_dir("e2e-dirty-rt");
+        let (source, _bare, worktrees, mgr) = setup_all(&tmp);
+
+        // Source has uncommitted changes (modified + untracked).
+        std::fs::write(source.join("README.md"), "# user edits in progress").unwrap();
+        std::fs::write(source.join("notes.txt"), "user notes").unwrap();
+
+        // Sync snapshots the dirty state.
+        mgr.sync().unwrap();
+
+        // Worker branches, writes code, commits.
+        let wt = mgr.create("task/worker-1", "origin/main", &worktrees).unwrap();
+        // Worker should see the dirty state.
+        assert_eq!(
+            std::fs::read_to_string(wt.join("README.md")).unwrap(),
+            "# user edits in progress",
+            "worker should see user's uncommitted edits"
+        );
+        assert!(
+            wt.join("notes.txt").exists(),
+            "worker should see user's untracked files"
+        );
+
+        // Worker adds its own file.
+        std::fs::write(wt.join("worker_output.rs"), "fn worker() {}").unwrap();
+        run_git(&wt, &["add", "."]);
+        run_git_with_author(&wt, &["commit", "-m", "worker output"]);
+
+        // Merge via refinery.
+        let refinery_wt = mgr.create("refinery", "main", &worktrees).unwrap();
+        let (db, _, mr_id) = setup_db_with_mr("task/worker-1");
+
+        let outcome = refinery::process_merge(&refinery_wt, "task/worker-1", "main", &db, &mr_id);
+        assert!(matches!(outcome, MergeOutcome::Merged), "merge: {outcome:?}");
+
+        // Pull into source.
+        mgr.update_source_workdir("main").unwrap();
+
+        // Source should have worker's new file.
+        assert!(
+            source.join("worker_output.rs").exists(),
+            "source should have worker's output"
+        );
+
+        // Source should preserve user's uncommitted changes.
+        assert_eq!(
+            std::fs::read_to_string(source.join("README.md")).unwrap(),
+            "# user edits in progress",
+            "user's uncommitted edits should be preserved"
+        );
+        assert_eq!(
+            std::fs::read_to_string(source.join("notes.txt")).unwrap(),
+            "user notes",
+            "user's untracked files should be preserved"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // ─── update_source_workdir ───────────────────────────────
+
+    #[test]
+    fn update_source_workdir_pulls_merged_work() {
+        let tmp = tmp_dir("update-src");
+        let (source, _, worktrees, mgr) = setup_all(&tmp);
+
+        // Worker makes a change and merges into bare's main.
+        let wt = mgr.create("task/worker-1", "origin/main", &worktrees).unwrap();
+        std::fs::write(wt.join("feature.rs"), "// new feature").unwrap();
+        run_git(&wt, &["add", "."]);
+        run_git_with_author(&wt, &["commit", "-m", "add feature"]);
+        mgr.merge_branch("task/worker-1", "main").unwrap();
+
+        // Source should NOT have feature.rs yet.
+        assert!(!source.join("feature.rs").exists());
+
+        // Pull merged work into source.
+        mgr.update_source_workdir("main").unwrap();
+
+        // Source should now have feature.rs.
+        assert!(source.join("feature.rs").exists());
+        assert_eq!(
+            std::fs::read_to_string(source.join("feature.rs")).unwrap(),
+            "// new feature"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn update_source_workdir_preserves_dirty_state() {
+        let tmp = tmp_dir("update-dirty");
+        let (source, _, worktrees, mgr) = setup_all(&tmp);
+
+        // Worker makes a change and merges.
+        let wt = mgr.create("task/worker-1", "origin/main", &worktrees).unwrap();
+        std::fs::write(wt.join("feature.rs"), "// new feature").unwrap();
+        run_git(&wt, &["add", "."]);
+        run_git_with_author(&wt, &["commit", "-m", "add feature"]);
+        mgr.merge_branch("task/worker-1", "main").unwrap();
+
+        // User has uncommitted work in source.
+        std::fs::write(source.join("README.md"), "# user edits").unwrap();
+        std::fs::write(source.join("scratch.txt"), "user notes").unwrap();
+
+        // Pull merged work.
+        mgr.update_source_workdir("main").unwrap();
+
+        // Merged work should be present.
+        assert!(source.join("feature.rs").exists());
+
+        // User's uncommitted changes should be restored.
+        assert_eq!(
+            std::fs::read_to_string(source.join("README.md")).unwrap(),
+            "# user edits"
+        );
+        assert_eq!(
+            std::fs::read_to_string(source.join("scratch.txt")).unwrap(),
+            "user notes"
         );
 
         std::fs::remove_dir_all(&tmp).ok();

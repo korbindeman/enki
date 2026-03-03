@@ -11,8 +11,6 @@ use super::open_db;
 pub enum TaskCmd {
     /// Create a new task.
     Create {
-        /// Project ID.
-        project: String,
         /// Task title.
         title: String,
         /// Task description.
@@ -22,11 +20,8 @@ pub enum TaskCmd {
         #[arg(long, default_value = "standard")]
         tier: String,
     },
-    /// List tasks for a project.
-    List {
-        /// Project ID.
-        project: String,
-    },
+    /// List all tasks.
+    List,
     /// Update a task's status.
     UpdateStatus {
         /// Task ID.
@@ -47,19 +42,17 @@ pub enum TaskCmd {
 pub async fn task(cmd: TaskCmd) -> anyhow::Result<()> {
     match cmd {
         TaskCmd::Create {
-            project,
             title,
             description,
             tier,
-        } => create_task(project, title, description, tier).await,
-        TaskCmd::List { project } => list_tasks(project).await,
+        } => create_task(title, description, tier).await,
+        TaskCmd::List => list_tasks().await,
         TaskCmd::UpdateStatus { task_id, status } => update_status(task_id, status).await,
         TaskCmd::Retry { task_id } => retry_task(task_id).await,
     }
 }
 
 async fn create_task(
-    project_id: String,
     title: String,
     description: Option<String>,
     tier_str: String,
@@ -68,22 +61,18 @@ async fn create_task(
         .ok_or_else(|| anyhow::anyhow!("invalid tier: {tier_str}. Use light, standard, or heavy"))?;
 
     let db = open_db()?;
-    let project_id = Id(project_id);
-
-    // Verify project exists
-    db.get_project(&project_id)?;
 
     let now = Utc::now();
     let task = Task {
         id: Id::new("task"),
-        project_id,
         title: title.clone(),
         description,
-        status: TaskStatus::Open,
+        status: TaskStatus::Ready,
         assigned_to: None,
         worktree: None,
         branch: None,
         tier: Some(tier),
+        current_activity: None,
         created_at: now,
         updated_at: now,
     };
@@ -106,13 +95,12 @@ async fn update_status(task_id: String, status_str: String) -> anyhow::Result<()
     Ok(())
 }
 
-async fn list_tasks(project_id: String) -> anyhow::Result<()> {
+async fn list_tasks() -> anyhow::Result<()> {
     let db = open_db()?;
-    let project_id = Id(project_id);
-    let tasks = db.list_tasks(&project_id)?;
+    let tasks = db.list_tasks()?;
 
     if tasks.is_empty() {
-        println!("no tasks for this project.");
+        println!("no tasks.");
         return Ok(());
     }
 
@@ -158,8 +146,7 @@ async fn retry_task(task_id_str: String) -> anyhow::Result<()> {
         );
     }
 
-    let project = db.get_project(&task.project_id)?;
-    let bare_path = PathBuf::from(&project.bare_repo);
+    let bare_path = super::bare_path()?;
     let wt_mgr = WorktreeManager::new(&bare_path)?;
 
     // Sync bare repo so we rebase onto the latest main.
@@ -193,6 +180,8 @@ async fn retry_task(task_id_str: String) -> anyhow::Result<()> {
     println!("task {} marked done.", task_id);
 
     // Promote dependents whose all deps are now done.
+    // For scheduler-managed executions this is redundant (the scheduler handles it),
+    // but it ensures correctness for tasks with DB-level dependencies.
     let dependents = db.get_dependents(&task_id).unwrap_or_default();
     for dep_id in &dependents {
         let Ok(dep_task) = db.get_task(dep_id) else { continue };

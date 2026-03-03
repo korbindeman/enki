@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::io::{self, Stdout, Write};
 
 use crossterm::cursor::{Hide, Show};
@@ -16,6 +16,9 @@ use crate::style::{self, Line, Span, Style};
 
 /// Maximum number of content lines in the input bubble (not counting borders).
 const MAX_BUBBLE_LINES: u16 = 10;
+
+/// Background color for selected messages.
+const HIGHLIGHT_BG: Color = Color::Rgb { r: 30, g: 40, b: 60 };
 
 // ─── Logical buffer ───────────────────────────────────────────
 //
@@ -107,6 +110,20 @@ pub struct Canvas {
     banner_lines: Vec<Line>,
     /// Height of the banner in rows (0 when hidden).
     banner_height: u16,
+
+    // ─── Message tracking ────────────────────────────────────
+    /// Message id for each logical entry (parallel to `logical`).
+    logical_message_id: VecDeque<Option<usize>>,
+    /// Message id for each buffer row (parallel to `buffer`).
+    buffer_message_id: VecDeque<Option<usize>>,
+    /// Total number of messages created.
+    message_count: usize,
+    /// Active message being built (during streaming).
+    current_message: Option<usize>,
+
+    // ─── Selection ───────────────────────────────────────────
+    /// Indices of selected messages.
+    selected_messages: BTreeSet<usize>,
 }
 
 impl Canvas {
@@ -147,6 +164,11 @@ impl Canvas {
             status_bar_height: 0,
             banner_lines: Vec::new(),
             banner_height: 0,
+            logical_message_id: VecDeque::new(),
+            buffer_message_id: VecDeque::new(),
+            message_count: 0,
+            current_message: None,
+            selected_messages: BTreeSet::new(),
         };
 
         canvas.apply_scroll_region();
@@ -221,16 +243,25 @@ impl Canvas {
     fn rebuild_buffer(&mut self) {
         // Take logical out to avoid borrow conflicts while writing to buffer.
         let logical = std::mem::take(&mut self.logical);
+        let logical_msg_ids = std::mem::take(&mut self.logical_message_id);
         self.buffer.clear();
+        self.buffer_message_id.clear();
 
         let width = self.content_width() as usize;
         let cw = self.content_width();
 
-        for entry in &logical {
+        for (i, entry) in logical.iter().enumerate() {
+            let msg_id = logical_msg_ids.get(i).copied().flatten();
+            let before = self.buffer.len();
             Self::push_logical_to_buffer(&mut self.buffer, entry, width, cw);
+            let after = self.buffer.len();
+            for _ in before..after {
+                self.buffer_message_id.push_back(msg_id);
+            }
         }
 
         self.logical = logical;
+        self.logical_message_id = logical_msg_ids;
 
         // If a stream is active, the streaming entries are NOT yet in `logical`
         // (they're added at end_streaming / replace_stream_block_markdown).
@@ -242,6 +273,7 @@ impl Canvas {
             for line in self.stream_logical_text.lines() {
                 for chunk in wrap_plain_text(line, width) {
                     self.buffer.push_back(BufferedLine::Raw(chunk));
+                    self.buffer_message_id.push_back(self.current_message);
                 }
             }
             // streaming_line (partial row) is accounted for by buffer_len().
@@ -314,6 +346,14 @@ impl Canvas {
         };
         let draw_count = view_end.saturating_sub(draw_start).min(sr_height);
 
+        // Pre-compute selection state for visible rows.
+        let selected_rows: Vec<bool> = (0..draw_count)
+            .map(|i| {
+                let buf_idx = draw_start + i;
+                self.is_buffer_row_selected(buf_idx)
+            })
+            .collect();
+
         let sr_top = self.scroll_region_top();
 
         // Clear all rows first.
@@ -327,8 +367,20 @@ impl Canvas {
             let buf_idx = draw_start + i;
             if buf_idx < total {
                 let row = sr_top + i as u16;
+                let selected = selected_rows[i];
+
                 write!(self.out, "\x1b[{row};1H").ok();
-                self.render_buffered_line(buf_idx);
+                if selected {
+                    // Clear the line with highlight bg (BCE fills the row).
+                    write!(self.out, "{}", SetBackgroundColor(HIGHLIGHT_BG)).ok();
+                    write!(self.out, "{}", terminal::Clear(ClearType::CurrentLine)).ok();
+                }
+
+                self.render_buffered_line(buf_idx, selected);
+
+                if selected {
+                    write!(self.out, "{}", ResetColor).ok();
+                }
             }
         }
 
@@ -350,11 +402,15 @@ impl Canvas {
     }
 
     /// Render a single buffered row at the current cursor position.
-    fn render_buffered_line(&mut self, idx: usize) {
+    fn render_buffered_line(&mut self, idx: usize, selected: bool) {
         if idx < self.buffer.len() {
             match &self.buffer[idx] {
                 BufferedLine::Styled(line) => {
-                    style::write_line_content(&mut self.out, line).ok();
+                    if selected {
+                        write_line_content_highlighted(&mut self.out, line, HIGHLIGHT_BG).ok();
+                    } else {
+                        style::write_line_content(&mut self.out, line).ok();
+                    }
                 }
                 BufferedLine::Raw(text) => {
                     write!(self.out, "{text}").ok();
@@ -376,10 +432,13 @@ impl Canvas {
     pub fn print_line(&mut self, line: &Line) {
         let width = self.content_width() as usize;
         let rows = wrap_styled_line(line, width);
+        let msg_id = self.next_message_id();
 
         self.logical.push_back(LogicalEntry::Styled(line.clone()));
+        self.logical_message_id.push_back(Some(msg_id));
         for row in &rows {
             self.buffer.push_back(BufferedLine::Styled(row.clone()));
+            self.buffer_message_id.push_back(Some(msg_id));
         }
         if self.follow {
             for row in &rows {
@@ -390,14 +449,17 @@ impl Canvas {
         }
     }
 
-    /// Print multiple styled lines in the scroll region.
+    /// Print multiple styled lines in the scroll region (as a single message).
     pub fn print_lines(&mut self, lines: &[Line]) {
         let width = self.content_width() as usize;
+        let msg_id = self.next_message_id();
         for line in lines {
             let rows = wrap_styled_line(line, width);
             self.logical.push_back(LogicalEntry::Styled(line.clone()));
+            self.logical_message_id.push_back(Some(msg_id));
             for row in &rows {
                 self.buffer.push_back(BufferedLine::Styled(row.clone()));
+                self.buffer_message_id.push_back(Some(msg_id));
             }
             if self.follow {
                 for row in &rows {
@@ -414,7 +476,9 @@ impl Canvas {
     /// Print a blank line in the scroll region.
     pub fn blank_line(&mut self) {
         self.logical.push_back(LogicalEntry::Blank);
+        self.logical_message_id.push_back(None);
         self.buffer.push_back(BufferedLine::Blank);
+        self.buffer_message_id.push_back(None);
         if self.follow {
             write!(self.out, "\r\n").ok();
             self.out.flush().ok();
@@ -431,6 +495,9 @@ impl Canvas {
         self.stream_logical_text.clear();
         self.stream_start_idx = self.buffer.len();
         self.logical_stream_start = self.logical.len();
+        // Start a new message for this stream block.
+        self.current_message = Some(self.message_count);
+        self.message_count += 1;
     }
 
     /// Write streaming text. Handles `\n` → `\r\n` for raw mode.
@@ -447,6 +514,7 @@ impl Canvas {
                 self.stream_logical_text.push('\n');
                 // One row in the rendered buffer.
                 self.buffer.push_back(BufferedLine::Raw(finished));
+                self.buffer_message_id.push_back(self.current_message);
                 if self.follow {
                     write!(self.out, "\r\n").ok();
                 }
@@ -471,6 +539,7 @@ impl Canvas {
             let finished = std::mem::take(&mut self.streaming_line);
             self.stream_logical_text.push_str(&finished);
             self.buffer.push_back(BufferedLine::Raw(finished));
+            self.buffer_message_id.push_back(self.current_message);
         }
         self.streaming_line.clear();
         self.streaming = false;
@@ -479,16 +548,23 @@ impl Canvas {
         // word-wrapping, and populate the logical buffer.
         let width = self.content_width() as usize;
         let logical_text = std::mem::take(&mut self.stream_logical_text);
+        let msg_id = self.current_message;
 
         self.buffer.truncate(self.stream_start_idx);
+        self.buffer_message_id.truncate(self.stream_start_idx);
         self.logical.truncate(self.logical_stream_start);
+        self.logical_message_id.truncate(self.logical_stream_start);
 
         for line in logical_text.lines() {
             self.logical.push_back(LogicalEntry::PlainText(line.to_string()));
+            self.logical_message_id.push_back(msg_id);
             for chunk in wrap_plain_text(line, width) {
                 self.buffer.push_back(BufferedLine::Raw(chunk));
+                self.buffer_message_id.push_back(msg_id);
             }
         }
+
+        self.current_message = None;
 
         if self.follow {
             write!(self.out, "\r\n").ok();
@@ -508,12 +584,18 @@ impl Canvas {
     ///
     /// Prefer `replace_stream_block_markdown` when you have the source text.
     pub fn replace_stream_block_raw(&mut self, lines: Vec<String>) {
+        let msg_id = self.current_message;
         self.buffer.truncate(self.stream_start_idx);
+        self.buffer_message_id.truncate(self.stream_start_idx);
         for line in &lines {
             self.buffer.push_back(BufferedLine::Raw(line.clone()));
+            self.buffer_message_id.push_back(msg_id);
         }
         self.logical.truncate(self.logical_stream_start);
+        self.logical_message_id.truncate(self.logical_stream_start);
         self.logical.push_back(LogicalEntry::RawAnsi(lines));
+        self.logical_message_id.push_back(msg_id);
+        self.current_message = None;
         if self.follow {
             self.redraw_viewport();
         }
@@ -522,12 +604,18 @@ impl Canvas {
     /// Replace the raw streamed lines with pre-rendered markdown output,
     /// retaining the original `source` text for resize re-rendering.
     pub fn replace_stream_block_markdown(&mut self, source: String, rendered: Vec<String>) {
+        let msg_id = self.current_message;
         self.buffer.truncate(self.stream_start_idx);
+        self.buffer_message_id.truncate(self.stream_start_idx);
         for line in &rendered {
             self.buffer.push_back(BufferedLine::Raw(line.clone()));
+            self.buffer_message_id.push_back(msg_id);
         }
         self.logical.truncate(self.logical_stream_start);
+        self.logical_message_id.truncate(self.logical_stream_start);
         self.logical.push_back(LogicalEntry::Markdown(source));
+        self.logical_message_id.push_back(msg_id);
+        self.current_message = None;
         if self.follow {
             self.redraw_viewport();
         }
@@ -954,9 +1042,14 @@ impl Canvas {
     pub fn clear_screen(&mut self) {
         self.buffer.clear();
         self.logical.clear();
+        self.logical_message_id.clear();
+        self.buffer_message_id.clear();
         self.stream_logical_text.clear();
         self.scroll_offset = 0;
         self.follow = true;
+        self.message_count = 0;
+        self.current_message = None;
+        self.selected_messages.clear();
         write!(self.out, "\x1b[r").ok();
         write!(self.out, "\x1b[2J\x1b[H").ok();
         self.apply_scroll_region();
@@ -965,6 +1058,148 @@ impl Canvas {
 
     pub fn flush(&mut self) {
         self.out.flush().ok();
+    }
+
+    // ─── Message tracking ────────────────────────────────────
+
+    /// Allocate a new message id.
+    fn next_message_id(&mut self) -> usize {
+        let id = self.message_count;
+        self.message_count += 1;
+        id
+    }
+
+    /// Check if a buffer row belongs to a selected message.
+    fn is_buffer_row_selected(&self, buf_idx: usize) -> bool {
+        self.buffer_message_id
+            .get(buf_idx)
+            .and_then(|id| *id)
+            .is_some_and(|id| self.selected_messages.contains(&id))
+    }
+
+    // ─── Hit testing ─────────────────────────────────────────
+
+    /// Return the message id at the given terminal row, if any.
+    pub fn message_at_viewport_row(&self, term_row: u16) -> Option<usize> {
+        let sr_top = self.scroll_region_top();
+        if term_row < sr_top {
+            return None; // Banner area
+        }
+
+        let sr_height = self.viewport_height() as usize;
+        let viewport_offset = (term_row - sr_top) as usize;
+        if viewport_offset >= sr_height {
+            return None; // Below scroll region
+        }
+
+        let total = self.buffer_len();
+        let view_end = total.saturating_sub(self.scroll_offset);
+        let view_start = view_end.saturating_sub(sr_height);
+        let is_full = (view_end - view_start) >= sr_height;
+
+        let draw_start = if self.follow && !self.streaming && is_full {
+            view_start + 1
+        } else {
+            view_start
+        };
+
+        let buf_idx = draw_start + viewport_offset;
+        if buf_idx < self.buffer_message_id.len() {
+            self.buffer_message_id[buf_idx]
+        } else {
+            None
+        }
+    }
+
+    // ─── Selection ───────────────────────────────────────────
+
+    /// Select a single message (clearing any prior selection).
+    pub fn set_selection_single(&mut self, msg_id: usize) {
+        self.selected_messages.clear();
+        self.selected_messages.insert(msg_id);
+        self.redraw_viewport();
+    }
+
+    /// Toggle a message's selection state.
+    pub fn toggle_selection(&mut self, msg_id: usize) {
+        if !self.selected_messages.remove(&msg_id) {
+            self.selected_messages.insert(msg_id);
+        }
+        self.redraw_viewport();
+    }
+
+    /// Select all messages in a range (inclusive), replacing prior selection.
+    pub fn select_range(&mut self, from: usize, to: usize) {
+        self.selected_messages.clear();
+        for id in from..=to {
+            self.selected_messages.insert(id);
+        }
+        self.redraw_viewport();
+    }
+
+    /// Clear all selections.
+    pub fn clear_selection(&mut self) {
+        if !self.selected_messages.is_empty() {
+            self.selected_messages.clear();
+            self.redraw_viewport();
+        }
+    }
+
+    /// Whether any messages are selected.
+    pub fn has_selection(&self) -> bool {
+        !self.selected_messages.is_empty()
+    }
+
+    /// Number of selected messages.
+    pub fn selection_count(&self) -> usize {
+        self.selected_messages.len()
+    }
+
+    /// Whether a specific message is selected.
+    pub fn is_message_selected(&self, msg_id: usize) -> bool {
+        self.selected_messages.contains(&msg_id)
+    }
+
+    /// Extract plain text from all selected messages, joined by blank lines.
+    pub fn selected_text(&self) -> String {
+        if self.selected_messages.is_empty() {
+            return String::new();
+        }
+
+        let mut messages: Vec<(usize, Vec<String>)> = Vec::new();
+
+        for &msg_id in &self.selected_messages {
+            let mut lines: Vec<String> = Vec::new();
+            for (i, entry) in self.logical.iter().enumerate() {
+                if self.logical_message_id.get(i).copied().flatten() == Some(msg_id) {
+                    match entry {
+                        LogicalEntry::Styled(line) => {
+                            let text: String =
+                                line.spans.iter().map(|s| s.text.as_str()).collect();
+                            lines.push(text);
+                        }
+                        LogicalEntry::PlainText(s) => lines.push(s.clone()),
+                        LogicalEntry::Markdown(s) => lines.push(s.clone()),
+                        LogicalEntry::RawAnsi(raw) => {
+                            for l in raw {
+                                lines.push(strip_ansi(l));
+                            }
+                        }
+                        LogicalEntry::Blank => lines.push(String::new()),
+                    }
+                }
+            }
+            if !lines.is_empty() {
+                messages.push((msg_id, lines));
+            }
+        }
+
+        messages.sort_by_key(|(id, _)| *id);
+        messages
+            .iter()
+            .map(|(_, lines)| lines.join("\n"))
+            .collect::<Vec<_>>()
+            .join("\n\n")
     }
 }
 
@@ -1185,6 +1420,65 @@ fn wrap_text(text: &str, width: usize) -> Vec<VisualLine> {
 fn display_width_with_cursor(text: &str, has_cursor: bool) -> usize {
     let base = text.chars().count();
     if has_cursor { base + 1 } else { base }
+}
+
+// ─── Selection rendering ──────────────────────────────────────
+
+/// Write a line's spans with a forced background color for selection highlighting.
+///
+/// Each span gets the highlight `bg` unless it already has its own background.
+/// After each span's reset, the highlight bg is restored so remaining space
+/// on the row stays highlighted.
+fn write_line_content_highlighted(w: &mut impl Write, line: &Line, bg: Color) -> io::Result<()> {
+    for span in &line.spans {
+        write!(w, "{}", SetBackgroundColor(span.style.bg.unwrap_or(bg)))?;
+        if let Some(fg) = span.style.fg {
+            write!(w, "{}", SetForegroundColor(fg))?;
+        }
+        if span.style.bold {
+            write!(w, "{}", SetAttribute(Attribute::Bold))?;
+        }
+        if span.style.dim {
+            write!(w, "{}", SetAttribute(Attribute::Dim))?;
+        }
+        if span.style.italic {
+            write!(w, "{}", SetAttribute(Attribute::Italic))?;
+        }
+        if span.style.underline {
+            write!(w, "{}", SetAttribute(Attribute::Underlined))?;
+        }
+        if span.style.negative {
+            write!(w, "{}", SetAttribute(Attribute::Reverse))?;
+        }
+        write!(w, "{}", span.text)?;
+        write!(w, "{}{}", SetAttribute(Attribute::Reset), ResetColor)?;
+        // Restore highlight bg for next span and trailing space.
+        write!(w, "{}", SetBackgroundColor(bg))?;
+    }
+    Ok(())
+}
+
+/// Strip ANSI escape sequences from a string.
+fn strip_ansi(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            // Skip CSI sequence: ESC [ ... (letter)
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                while let Some(&c) = chars.peek() {
+                    chars.next();
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+    result
 }
 
 // ─── StreamBuffer ─────────────────────────────────────────────
