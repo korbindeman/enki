@@ -102,12 +102,20 @@ pub struct Canvas {
     status_bar_lines: Vec<Line>,
     /// Height of the status bar in rows (0 when hidden).
     status_bar_height: u16,
+
+    /// Banner lines rendered at the top of the screen (fixed, non-scrolling).
+    banner_lines: Vec<Line>,
+    /// Height of the banner in rows (0 when hidden).
+    banner_height: u16,
 }
 
 impl Canvas {
     /// Enter raw mode, set up scroll regions, and create the canvas.
     pub fn enter(prompt: &str) -> io::Result<Self> {
         terminal::enable_raw_mode()?;
+        // Clear screen before taking over the terminal
+        write!(io::stdout(), "\x1b[2J\x1b[H")?;
+        io::stdout().flush()?;
         crossterm::execute!(io::stdout(), EnableMouseCapture, Hide)?;
         let _ = crossterm::execute!(
             io::stdout(),
@@ -137,11 +145,13 @@ impl Canvas {
             hint: None,
             status_bar_lines: Vec::new(),
             status_bar_height: 0,
+            banner_lines: Vec::new(),
+            banner_height: 0,
         };
 
         canvas.apply_scroll_region();
-        let scroll_bottom = rows - bubble_height;
-        write!(canvas.out, "\x1b[{scroll_bottom};1H").ok();
+        let sr_top = canvas.scroll_region_top();
+        write!(canvas.out, "\x1b[{sr_top};1H").ok();
         canvas.out.flush().ok();
 
         Ok(canvas)
@@ -150,9 +160,17 @@ impl Canvas {
     // ─── Scroll region management ─────────────────────────────
 
     fn apply_scroll_region(&mut self) {
-        let scroll_bottom = self.term_rows.saturating_sub(self.bubble_height);
-        write!(self.out, "\x1b[1;{scroll_bottom}r").ok();
+        let scroll_top = self.banner_height + 1;
+        let scroll_bottom = self.term_rows
+            .saturating_sub(self.bubble_height)
+            .saturating_sub(self.status_bar_height);
+        write!(self.out, "\x1b[{scroll_top};{scroll_bottom}r").ok();
         self.out.flush().ok();
+    }
+
+    /// First terminal row of the scroll region (1-based).
+    fn scroll_region_top(&self) -> u16 {
+        self.banner_height + 1
     }
 
     /// Height of the scroll region in rows.
@@ -160,6 +178,7 @@ impl Canvas {
         self.term_rows
             .saturating_sub(self.bubble_height)
             .saturating_sub(self.status_bar_height)
+            .saturating_sub(self.banner_height)
     }
 
     /// Handle terminal resize.
@@ -170,6 +189,7 @@ impl Canvas {
         self.bubble_height = needed;
         self.apply_scroll_region();
         self.rebuild_buffer();
+        self.draw_banner();
         self.redraw_viewport();
         self.draw_status_bar();
         self.draw_bubble(input);
@@ -294,8 +314,11 @@ impl Canvas {
         };
         let draw_count = view_end.saturating_sub(draw_start).min(sr_height);
 
+        let sr_top = self.scroll_region_top();
+
         // Clear all rows first.
-        for row in 1..=(sr_height as u16) {
+        for i in 0..(sr_height as u16) {
+            let row = sr_top + i;
             write!(self.out, "\x1b[{row};1H{}", terminal::Clear(ClearType::CurrentLine)).ok();
         }
 
@@ -303,7 +326,7 @@ impl Canvas {
         for i in 0..draw_count {
             let buf_idx = draw_start + i;
             if buf_idx < total {
-                let row = (i + 1) as u16;
+                let row = sr_top + i as u16;
                 write!(self.out, "\x1b[{row};1H").ok();
                 self.render_buffered_line(buf_idx);
             }
@@ -312,11 +335,11 @@ impl Canvas {
         // Park cursor.
         if self.follow {
             if !self.streaming {
-                let cursor_row = (draw_count + 1).min(sr_height) as u16;
+                let cursor_row = sr_top + (draw_count as u16).min(sr_height as u16);
                 write!(self.out, "\x1b[{cursor_row};1H").ok();
             }
         } else {
-            let sr_bottom = self.viewport_height();
+            let sr_bottom = sr_top + self.viewport_height().saturating_sub(1);
             write!(self.out, "\x1b[{sr_bottom};1H").ok();
         }
 
@@ -552,8 +575,11 @@ impl Canvas {
         let col = self.term_cols;
         let total = self.buffer_len();
 
+        let sr_top = self.scroll_region_top() as usize;
+
         if total <= vh {
-            for row in 1..=vh {
+            for i in 0..vh {
+                let row = sr_top + i;
                 write!(self.out, "\x1b[{row};{col}H ").ok();
             }
             write!(self.out, "\x1b8").ok();
@@ -574,7 +600,7 @@ impl Canvas {
         let thumb_bg = Color::Rgb { r: 100, g: 100, b: 100 };
 
         for row_idx in 0..vh {
-            let row = row_idx + 1;
+            let row = sr_top + row_idx;
             write!(self.out, "\x1b[{row};{col}H").ok();
             let bg = if row_idx >= thumb_top && row_idx < thumb_top + thumb_size {
                 thumb_bg
@@ -658,6 +684,45 @@ impl Canvas {
 
         for (i, line) in self.status_bar_lines.iter().enumerate() {
             let row = bar_top + i as u16;
+            write!(self.out, "\x1b[{row};1H").ok();
+            write!(self.out, "{}", terminal::Clear(ClearType::CurrentLine)).ok();
+            style::write_line_content(&mut self.out, line).ok();
+        }
+
+        write!(self.out, "\x1b8").ok(); // restore cursor
+        self.out.flush().ok();
+    }
+
+    // ─── Banner ──────────────────────────────────────────
+
+    /// Set the banner content at the top of the screen.
+    ///
+    /// Recalculates layout and redraws if the height changed.
+    pub fn set_banner(&mut self, lines: &[Line]) {
+        let new_height = lines.len() as u16;
+        let height_changed = new_height != self.banner_height;
+
+        self.banner_lines = lines.to_vec();
+        self.banner_height = new_height;
+
+        if height_changed {
+            self.apply_scroll_region();
+            self.redraw_viewport();
+        }
+
+        self.draw_banner();
+    }
+
+    /// Render the banner at the top of the screen.
+    fn draw_banner(&mut self) {
+        if self.banner_height == 0 {
+            return;
+        }
+
+        write!(self.out, "\x1b7").ok(); // save cursor
+
+        for (i, line) in self.banner_lines.iter().enumerate() {
+            let row = (i + 1) as u16;
             write!(self.out, "\x1b[{row};1H").ok();
             write!(self.out, "{}", terminal::Clear(ClearType::CurrentLine)).ok();
             style::write_line_content(&mut self.out, line).ok();
@@ -905,11 +970,13 @@ impl Canvas {
 
 impl Drop for Canvas {
     fn drop(&mut self) {
+        // Reset scroll region
         let _ = write!(self.out, "\x1b[r");
+        // Clear screen and move cursor home
+        let _ = write!(self.out, "\x1b[2J\x1b[H");
         let _ = crossterm::execute!(self.out, PopKeyboardEnhancementFlags);
         let _ = crossterm::execute!(self.out, DisableMouseCapture, Show);
         let _ = terminal::disable_raw_mode();
-        let _ = writeln!(self.out);
     }
 }
 

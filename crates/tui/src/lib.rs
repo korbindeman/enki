@@ -1,5 +1,8 @@
 pub mod canvas;
+pub mod chat;
+pub mod indicator;
 pub mod input;
+pub mod lines;
 pub mod style;
 
 #[cfg(feature = "markdown")]

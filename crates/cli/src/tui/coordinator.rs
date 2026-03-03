@@ -33,6 +33,7 @@ pub enum ToCoordinator {
 
 /// Activity update from a running worker agent.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum WorkerActivity {
     /// Agent started a tool call (e.g., "Bash", "Read", "Edit").
     ToolStarted(String),
@@ -55,6 +56,7 @@ pub enum FromCoordinator {
     /// Agent started a tool call.
     ToolCall(String),
     /// Agent finished a tool call.
+    #[allow(dead_code)]
     ToolCallDone(String),
     /// Prompt completed (stop reason).
     Done(String),
@@ -78,6 +80,7 @@ pub enum FromCoordinator {
         branch: String,
     },
     /// Live activity update from a running worker.
+    #[allow(dead_code)]
     WorkerUpdate {
         task_id: String,
         activity: WorkerActivity,
@@ -95,7 +98,7 @@ pub struct CoordinatorHandle {
 /// Spawn the coordinator on a dedicated OS thread with its own tokio runtime + LocalSet.
 ///
 /// Returns a handle with channels for bidirectional communication.
-pub fn spawn(cwd: PathBuf, db_path: String) -> CoordinatorHandle {
+pub fn spawn(cwd: PathBuf, db_path: String, enki_bin: PathBuf) -> CoordinatorHandle {
     let (to_coord_tx, to_coord_rx) = mpsc::unbounded_channel::<ToCoordinator>();
     let (from_coord_tx, from_coord_rx) = mpsc::unbounded_channel::<FromCoordinator>();
 
@@ -110,7 +113,7 @@ pub fn spawn(cwd: PathBuf, db_path: String) -> CoordinatorHandle {
             rt.block_on(async {
                 let local = tokio::task::LocalSet::new();
                 local
-                    .run_until(coordinator_loop(cwd, db_path, to_coord_rx, from_coord_tx))
+                    .run_until(coordinator_loop(cwd, db_path, enki_bin, to_coord_rx, from_coord_tx))
                     .await;
             });
         })
@@ -140,20 +143,20 @@ You plan work, decompose user requests into tasks, assign complexity tiers, and 
 
 ## Available CLI Tools
 
-You have access to the `enki` CLI. Use it via your terminal to manage the workspace:
+You have access to the `enki` CLI via the `$ENKI_BIN` environment variable. Always invoke it as `$ENKI_BIN` (never bare `enki`) to ensure it works regardless of PATH configuration.
 
 ### Project Management
-- `enki project list` — List all registered projects (shows ID, name, path)
-- `enki project add <path> [--name <name>]` — Register a git repo as a project
+- `$ENKI_BIN project list` — List all registered projects (shows ID, name, path)
+- `$ENKI_BIN project add <path> [--name <name>]` — Register a git repo as a project
 
 ### Task Management
-- `enki task list <project-id>` — List tasks for a project (shows ID, status, tier, title)
-- `enki task create <project-id> "<title>" [--description "<desc>"] [--tier light|standard|heavy]` — Create a single task
-- `enki task update-status <task-id> <status>` — Update task status (open, ready, running, done, failed, blocked)
-- `enki task retry <task-id>` — Retry a blocked task after a merge conflict (rebases branch onto main, re-merges)
+- `$ENKI_BIN task list <project-id>` — List tasks for a project (shows ID, status, tier, title)
+- `$ENKI_BIN task create <project-id> "<title>" [--description "<desc>"] [--tier light|standard|heavy]` — Create a single task
+- `$ENKI_BIN task update-status <task-id> <status>` — Update task status (open, ready, running, done, failed, blocked)
+- `$ENKI_BIN task retry <task-id>` — Retry a blocked task after a merge conflict (rebases branch onto main, re-merges)
 
 ### Template Execution (preferred for multi-step work)
-- `enki exec <project-id> <template-path> [--var key=value ...]` — Run a TOML workflow template
+- `$ENKI_BIN exec <project-id> <template-path> [--var key=value ...]` — Run a TOML workflow template
 
   Templates define named steps with dependencies, tiers, and variable substitution. Enki creates all tasks in the database, resolves the dependency graph, and automatically promotes tasks to ready as their dependencies complete.
 
@@ -187,24 +190,24 @@ You have access to the `enki` CLI. Use it via your terminal to manage the worksp
   tier = "light"
   ```
 
-  Run with: `enki exec proj-xxx feature.toml --var feature="auth middleware"`
+  Run with: `$ENKI_BIN exec proj-xxx feature.toml --var feature="auth middleware"`
 
-  Use `enki exec` whenever the work has multiple steps or dependencies. For single one-off tasks, `enki task create` + `enki task update-status ready` is fine.
+  Use `$ENKI_BIN exec` whenever the work has multiple steps or dependencies. For single one-off tasks, `$ENKI_BIN task create` + `$ENKI_BIN task update-status ready` is fine.
 
 ### Status
-- `enki status` — Show workspace overview (projects, task counts by status)
+- `$ENKI_BIN status` — Show workspace overview (projects, task counts by status)
 
 ## Automatic Worker Spawning
 
 When a task has status **ready**, enki will **automatically** spawn a worker agent to execute it. Workers run in isolated git worktrees, complete their task, and the branch is merged back to main. Dependent tasks are promoted to ready automatically when their dependencies complete — you do not need to set them ready manually.
 
 **Workflow for a single task:**
-1. `enki task create` to register the task
-2. `enki task update-status <id> ready` to trigger the worker
+1. `$ENKI_BIN task create` to register the task
+2. `$ENKI_BIN task update-status <id> ready` to trigger the worker
 
 **Workflow for multi-step work (preferred):**
 1. Write a template TOML file describing the steps and dependencies
-2. `enki exec <project-id> template.toml --var ...` to launch the whole workflow
+2. `$ENKI_BIN exec <project-id> template.toml --var ...` to launch the whole workflow
 
 ## Complexity Tiers
 
@@ -232,7 +235,7 @@ Prefer more small tasks over fewer large tasks. Each task should change no more 
 
 - Be concise and direct
 - When you create tasks, show the user what you created
-- When asked about status, run `enki status` or `enki task list` and report
+- When asked about status, run `$ENKI_BIN status` or `$ENKI_BIN task list` and report
 - You can also read files, explore the codebase, and answer questions directly
 
 Wait for the user's first message before taking any action."#
@@ -277,10 +280,11 @@ struct WorkerDone {
 async fn coordinator_loop(
     cwd: PathBuf,
     db_path: String,
+    enki_bin: PathBuf,
     mut rx: mpsc::UnboundedReceiver<ToCoordinator>,
     tx: mpsc::UnboundedSender<FromCoordinator>,
 ) {
-    tracing::info!(cwd = %cwd.display(), "coordinator loop started");
+    tracing::info!(cwd = %cwd.display(), enki_bin = %enki_bin.display(), "coordinator loop started");
 
     let db = match Db::open(&db_path) {
         Ok(db) => {
@@ -296,13 +300,21 @@ async fn coordinator_loop(
 
     let (worker_done_tx, mut worker_done_rx) = mpsc::unbounded_channel::<WorkerDone>();
 
+    // Set ENKI_BIN so spawned agents can call `enki` regardless of PATH.
+    let enki_env = {
+        let mut env = std::collections::HashMap::new();
+        env.insert("ENKI_BIN".to_string(), enki_bin.display().to_string());
+        env
+    };
+
     // Shared flag to suppress update forwarding during system prompt init.
     let forward_updates = std::rc::Rc::new(std::cell::Cell::new(false));
     let forward_flag = forward_updates.clone();
 
     // Coordinator agent manager — streams updates to TUI.
     let tx_updates = tx.clone();
-    let coord_mgr = AgentManager::new();
+    let mut coord_mgr = AgentManager::new();
+    coord_mgr.set_env(enki_env.clone());
     coord_mgr.on_update(move |_session_id, update| {
         if !forward_flag.get() {
             return;
@@ -318,7 +330,8 @@ async fn coordinator_loop(
 
     // Worker agent manager — streams activity updates (tool calls, thinking)
     // to the TUI for per-worker status display.
-    let worker_mgr = AgentManager::new();
+    let mut worker_mgr = AgentManager::new();
+    worker_mgr.set_env(enki_env);
 
     // Maps ACP session_id → task_id so the worker callback can route updates.
     let session_task_map: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, String>>> =

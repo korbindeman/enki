@@ -59,6 +59,8 @@ pub struct AgentManager {
     update_callback: Rc<RefCell<Option<UpdateCallback>>>,
     /// Permission auto-approve (for non-interactive orchestrator use).
     auto_approve_permissions: bool,
+    /// Extra environment variables injected into every spawned agent and terminal process.
+    extra_env: Rc<HashMap<String, String>>,
 }
 
 impl AgentManager {
@@ -67,7 +69,14 @@ impl AgentManager {
             sessions: Rc::new(RefCell::new(HashMap::new())),
             update_callback: Rc::new(RefCell::new(None)),
             auto_approve_permissions: true,
+            extra_env: Rc::new(HashMap::new()),
         }
+    }
+
+    /// Set environment variables that will be injected into every spawned subprocess
+    /// (both agent processes and terminal commands).
+    pub fn set_env(&mut self, env: HashMap<String, String>) {
+        self.extra_env = Rc::new(env);
     }
 
     /// Set a callback to receive session updates from all agents.
@@ -89,13 +98,16 @@ impl AgentManager {
     ) -> Result<String> {
         tracing::debug!(cmd = agent_cmd, args = ?agent_args, cwd = %cwd.display(), "spawning agent process");
         // Spawn agent subprocess
-        let mut child = Command::new(agent_cmd)
-            .args(agent_args)
+        let mut cmd = Command::new(agent_cmd);
+        cmd.args(agent_args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .spawn()?;
+            .kill_on_drop(true);
+        for (k, v) in self.extra_env.iter() {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn()?;
 
         let stdin = child.stdin.take().unwrap().compat_write();
         let stdout = child.stdout.take().unwrap().compat();
@@ -106,6 +118,7 @@ impl AgentManager {
             auto_approve: self.auto_approve_permissions,
             terminals: Rc::new(RefCell::new(HashMap::new())),
             next_terminal_id: Rc::new(std::cell::Cell::new(1)),
+            extra_env: self.extra_env.clone(),
         };
 
         let (conn, handle_io) = acp::ClientSideConnection::new(client, stdin, stdout, |fut| {
@@ -236,6 +249,7 @@ struct EnkiClient {
     auto_approve: bool,
     terminals: Rc<RefCell<HashMap<String, TerminalState>>>,
     next_terminal_id: Rc<std::cell::Cell<u64>>,
+    extra_env: Rc<HashMap<String, String>>,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -351,6 +365,9 @@ impl acp::Client for EnkiClient {
 
         for env_var in &args.env {
             cmd.env(&env_var.name, &env_var.value);
+        }
+        for (k, v) in self.extra_env.iter() {
+            cmd.env(k, v);
         }
 
         cmd.stdout(std::process::Stdio::piped());

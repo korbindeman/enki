@@ -58,6 +58,15 @@ async fn main() {
     // and closes the background writer thread.
     let _log_guard = init_logging(is_tui);
 
+    // Resolve our own binary path once so spawned agents can call `enki`
+    // via $ENKI_BIN regardless of the user's PATH.
+    let enki_bin = std::env::current_exe()
+        .and_then(|p| p.canonicalize())
+        .unwrap_or_else(|e| {
+            eprintln!("warning: could not resolve enki binary path: {e}");
+            std::path::PathBuf::from("enki")
+        });
+
     let result = match cli {
         Cli::Tui => {
             let db_path = commands::db_path();
@@ -69,7 +78,7 @@ async fn main() {
                     std::process::exit(1);
                 }
             };
-            tui::run(db, db_path_str).await
+            tui::run(db, db_path_str, enki_bin).await
         }
         Cli::Init => commands::init().await,
         Cli::Project { cmd } => commands::project(cmd).await,
@@ -80,7 +89,7 @@ async fn main() {
             agent,
             agent_args,
             keep,
-        } => commands::run(&task_id, &agent, &agent_args, keep).await,
+        } => commands::run(&task_id, &agent, &agent_args, keep, enki_bin).await,
         Cli::Status => commands::status().await,
     };
 

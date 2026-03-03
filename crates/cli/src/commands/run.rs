@@ -6,7 +6,7 @@ use enki_core::worktree::WorktreeManager;
 
 use super::open_db;
 
-pub async fn run(task_id: &str, agent_cmd: &str, agent_args: &str, keep: bool) -> anyhow::Result<()> {
+pub async fn run(task_id: &str, agent_cmd: &str, agent_args: &str, keep: bool, enki_bin: std::path::PathBuf) -> anyhow::Result<()> {
     let db = open_db()?;
     let task_id = Id(task_id.to_string());
 
@@ -73,6 +73,7 @@ pub async fn run(task_id: &str, agent_cmd: &str, agent_args: &str, keep: bool) -
             &args,
             worktree_path.clone(),
             &prompt,
+            &enki_bin,
         ))
         .await;
 
@@ -108,8 +109,14 @@ async fn run_acp_session(
     agent_args: &[&str],
     cwd: PathBuf,
     prompt: &str,
+    enki_bin: &std::path::Path,
 ) -> anyhow::Result<String> {
-    let mgr = AgentManager::new();
+    let mut mgr = AgentManager::new();
+
+    // Set ENKI_BIN so the agent can call `enki` regardless of PATH.
+    let mut env = std::collections::HashMap::new();
+    env.insert("ENKI_BIN".to_string(), enki_bin.display().to_string());
+    mgr.set_env(env);
 
     mgr.on_update(|_session_id, update| match update {
         SessionUpdate::Text(text) => {

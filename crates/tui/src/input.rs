@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -41,6 +41,7 @@ pub struct InputLine {
     pub autocomplete: Option<Autocomplete>,
     trigger: Option<char>,
     ctrl_c_time: Option<Instant>,
+    exit_confirm_timeout: Duration,
 }
 
 impl Default for InputLine {
@@ -57,7 +58,26 @@ impl InputLine {
             autocomplete: None,
             trigger: None,
             ctrl_c_time: None,
+            exit_confirm_timeout: Duration::from_secs(5),
         }
+    }
+
+    /// Set how long the "press Ctrl+C again to exit" confirmation stays active.
+    pub fn set_exit_confirm_timeout(&mut self, timeout: Duration) {
+        self.exit_confirm_timeout = timeout;
+    }
+
+    /// Returns true if a pending exit confirmation has expired, clearing it.
+    ///
+    /// Call this in the event loop tick to clear stale hints.
+    pub fn check_exit_expired(&mut self) -> bool {
+        if let Some(t) = self.ctrl_c_time {
+            if t.elapsed() >= self.exit_confirm_timeout {
+                self.ctrl_c_time = None;
+                return true;
+            }
+        }
+        false
     }
 
     /// Set the character that triggers autocomplete (e.g., '@').
@@ -111,7 +131,7 @@ impl InputLine {
             // Empty input: check for double-tap
             if self
                 .ctrl_c_time
-                .is_some_and(|t| t.elapsed().as_millis() < 1500)
+                .is_some_and(|t| t.elapsed() < self.exit_confirm_timeout)
             {
                 return InputAction::Quit;
             }
