@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use crate::dag::{Dag, NodeStatus};
+use crate::dag::Dag;
 use crate::db::Db;
 use crate::monitor::{MonitorAction, MonitorState};
 use crate::refinery::MergeOutcome;
@@ -87,8 +87,6 @@ pub enum Command {
     MonitorTick {
         workers: Vec<(String, String, Instant)>,
     },
-    /// Rebuild scheduler state from DB on startup (crash recovery).
-    Recover,
     /// Discover new executions/tasks in DB created by external processes (MCP).
     DiscoverFromDb,
     /// Check for signal files in the events directory.
@@ -192,16 +190,22 @@ pub struct Orchestrator {
     db: Db,
     monitor: MonitorState,
     events_dir: Option<PathBuf>,
+    session_id: String,
 }
 
 impl Orchestrator {
-    pub fn new(db: Db, limits: Limits) -> Self {
+    pub fn new(db: Db, limits: Limits, session_id: String) -> Self {
         Self {
             scheduler: Scheduler::new(limits),
             db,
             monitor: MonitorState::new(),
             events_dir: None,
+            session_id,
         }
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
     }
 
     /// Set the directory where signal files are written by external processes.
@@ -221,7 +225,7 @@ impl Orchestrator {
 
     /// Process a command and return events for the CLI layer.
     pub fn handle(&mut self, cmd: Command) -> Vec<Event> {
-        match cmd {
+        let events = match cmd {
             Command::CreateExecution { steps } => self.create_execution(steps),
             Command::CreateTask {
                 title,
@@ -236,9 +240,21 @@ impl Orchestrator {
             Command::Cancel(target) => self.cancel(target),
             Command::StopAll => self.stop_all(),
             Command::MonitorTick { workers } => self.monitor_tick(workers),
-            Command::Recover => self.recover(),
             Command::DiscoverFromDb => self.discover_from_db(),
             Command::CheckSignals => self.check_signals(),
+        };
+        self.persist_dags();
+        events
+    }
+
+    /// Save all active execution DAGs to the database.
+    fn persist_dags(&self) {
+        for exec_id in self.scheduler.active_executions() {
+            if let Some(dag) = self.scheduler.get_dag(exec_id) {
+                if let Err(e) = self.db.save_dag(&Id(exec_id.to_string()), dag) {
+                    tracing::warn!(execution_id = %exec_id, error = %e, "failed to persist dag");
+                }
+            }
         }
     }
 
@@ -253,6 +269,7 @@ impl Orchestrator {
         // Create execution record.
         let execution = Execution {
             id: exec_id.clone(),
+            session_id: Some(self.session_id.clone()),
             status: ExecutionStatus::Running,
             created_at: now,
         };
@@ -270,12 +287,14 @@ impl Orchestrator {
             let task_id = Id::new("task");
             let task = Task {
                 id: task_id.clone(),
+                session_id: Some(self.session_id.clone()),
                 title: step.title.clone(),
                 description: Some(step.description.clone()),
-                status: TaskStatus::Open,
+                status: TaskStatus::Pending,
                 assigned_to: None,
-                worktree: None,
+                copy_path: None,
                 branch: None,
+                base_branch: None,
                 tier: Some(step.tier),
                 current_activity: None,
                 created_at: now,
@@ -340,12 +359,14 @@ impl Orchestrator {
 
         let task = Task {
             id: task_id.clone(),
+            session_id: Some(self.session_id.clone()),
             title: title.clone(),
             description: description.clone(),
-            status: TaskStatus::Open,
+            status: TaskStatus::Pending,
             assigned_to: None,
-            worktree: None,
+            copy_path: None,
             branch: None,
+            base_branch: None,
             tier: Some(tier),
             current_activity: None,
             created_at: now,
@@ -359,6 +380,7 @@ impl Orchestrator {
 
         let execution = Execution {
             id: exec_id.clone(),
+            session_id: Some(self.session_id.clone()),
             status: ExecutionStatus::Running,
             created_at: now,
         };
@@ -391,12 +413,18 @@ impl Orchestrator {
                 self.monitor.clear_retries(&result.task_id.0);
 
                 // Create merge request.
+                let base_branch = self
+                    .db
+                    .get_task(&result.task_id)
+                    .ok()
+                    .and_then(|t| t.base_branch)
+                    .unwrap_or_else(|| "main".to_string());
                 let mr_id = Id::new("mr");
                 let mr = MergeRequest {
                     id: mr_id.clone(),
                     task_id: result.task_id.clone(),
                     branch: result.branch.clone(),
-                    base_branch: "main".to_string(), // CLI should pass this
+                    base_branch,
                     status: MergeStatus::Queued,
                     priority: 2,
                     diff_stats: None,
@@ -540,7 +568,7 @@ impl Orchestrator {
 
     fn retry_task(&mut self, task_id: Id) -> Vec<Event> {
         // Reset the task to Ready.
-        let _ = self.db.update_task_status(&task_id, TaskStatus::Ready);
+        let _ = self.db.update_task_status(&task_id, TaskStatus::Pending);
         self.monitor.clear_retries(&task_id.0);
 
         // Find the execution and step for this task.
@@ -560,7 +588,7 @@ impl Orchestrator {
         match target {
             Target::Execution(exec_id) => {
                 self.scheduler.pause_execution(&exec_id);
-                if let Ok(exec) = self.db.get_running_executions()
+                if let Ok(exec) = self.db.get_running_executions(None)
                     && let Some(e) = exec.iter().find(|e| e.id.0 == exec_id)
                 {
                     let _ = self
@@ -584,7 +612,7 @@ impl Orchestrator {
         match target {
             Target::Execution(exec_id) => {
                 self.scheduler.resume_execution(&exec_id);
-                if let Ok(exec) = self.db.get_running_executions()
+                if let Ok(exec) = self.db.get_running_executions(None)
                     && let Some(e) = exec.iter().find(|e| e.id.0 == exec_id)
                 {
                     let _ = self
@@ -666,37 +694,11 @@ impl Orchestrator {
         events
     }
 
-    fn recover(&mut self) -> Vec<Event> {
-        // Reset any MRs stuck in intermediate states.
-        if let Ok(count) = self.db.reset_stuck_merge_requests()
-            && count > 0
-        {
-            tracing::info!(count, "recovery: reset stuck merge requests");
-        }
-
-        let executions = match self.db.get_running_executions() {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::error!(error = %e, "recovery: failed to load executions");
-                return Vec::new();
-            }
-        };
-
-        for exec in executions {
-            if self.scheduler.has_execution(&exec.id.0) {
-                continue;
-            }
-            self.register_execution_from_db(&exec.id);
-        }
-
-        self.tick_scheduler()
-    }
-
     fn discover_from_db(&mut self) -> Vec<Event> {
         let mut found_new = false;
 
-        // Discover new executions.
-        if let Ok(executions) = self.db.get_running_executions() {
+        // Discover new executions created by MCP tools in this session.
+        if let Ok(executions) = self.db.get_running_executions(Some(&self.session_id)) {
             for exec in executions {
                 if self.scheduler.has_execution(&exec.id.0) {
                     continue;
@@ -706,8 +708,8 @@ impl Orchestrator {
             }
         }
 
-        // Wrap orphan ready tasks in single-node executions.
-        if let Ok(orphans) = self.db.get_orphan_ready_tasks() {
+        // Wrap orphan ready tasks (this session only) in single-node executions.
+        if let Ok(orphans) = self.db.get_orphan_ready_tasks(&self.session_id) {
             for task in orphans {
                 let exec_id = Id::new("exec");
                 let step_id = "task";
@@ -722,6 +724,7 @@ impl Orchestrator {
 
                 let execution = Execution {
                     id: exec_id.clone(),
+                    session_id: Some(self.session_id.clone()),
                     status: ExecutionStatus::Running,
                     created_at: chrono::Utc::now(),
                 };
@@ -901,7 +904,7 @@ impl Orchestrator {
         events
     }
 
-    /// Rebuild an execution from DB state and register with the scheduler.
+    /// Register an execution created externally (via MCP) with the in-memory scheduler.
     fn register_execution_from_db(&mut self, execution_id: &Id) {
         let steps = match self.db.get_execution_steps(execution_id) {
             Ok(s) => s,
@@ -919,6 +922,7 @@ impl Orchestrator {
 
         // Build step data for DAG construction.
         let mut step_data = Vec::new();
+        let mut step_tasks = HashMap::new();
         for (step_id, task_id) in &steps {
             let task = match self.db.get_task(task_id) {
                 Ok(t) => t,
@@ -936,46 +940,15 @@ impl Orchestrator {
                 task.tier,
                 dep_step_ids,
             ));
+            step_tasks.insert(step_id.clone(), task_id.clone());
         }
         let dag = Dag::from_steps(&step_data);
 
-        // Map task statuses to node statuses.
-        let mut step_tasks = HashMap::new();
-        let mut step_statuses = HashMap::new();
-        let mut step_outputs = HashMap::new();
-
-        for (step_id, task_id) in &steps {
-            step_tasks.insert(step_id.clone(), task_id.clone());
-            if let Ok(task) = self.db.get_task(task_id) {
-                let node_status = match task.status {
-                    TaskStatus::Done => NodeStatus::Done,
-                    TaskStatus::Running => {
-                        // Running tasks at startup are crashed — reset to Ready.
-                        let _ = self.db.update_task_status(task_id, TaskStatus::Ready);
-                        NodeStatus::Running // rebuild_execution resets Running → Ready
-                    }
-                    TaskStatus::Failed => NodeStatus::Failed,
-                    TaskStatus::Blocked => NodeStatus::Blocked,
-                    TaskStatus::Ready => NodeStatus::Ready,
-                    TaskStatus::Open => NodeStatus::Pending,
-                    TaskStatus::Paused => NodeStatus::Paused,
-                    TaskStatus::Cancelled => NodeStatus::Cancelled,
-                };
-                step_statuses.insert(step_id.clone(), node_status);
-            }
-            if let Ok(Some(output)) = self.db.get_task_output(task_id) {
-                step_outputs.insert(step_id.clone(), output);
-            }
-        }
-
-        let project_id = Id("project".into());
-        self.scheduler.rebuild_execution(
+        self.scheduler.add_execution(
             execution_id.clone(),
-            project_id,
+            Id("project".into()),
             dag,
             step_tasks,
-            step_statuses,
-            step_outputs,
         );
         tracing::info!(execution_id = %execution_id, steps = steps.len(), "execution registered from DB");
     }
@@ -998,7 +971,7 @@ impl Orchestrator {
             return false;
         }
         let retry_count = self.monitor.record_retry(&task_id.0);
-        let _ = self.db.update_task_status(task_id, TaskStatus::Ready);
+        let _ = self.db.update_task_status(task_id, TaskStatus::Pending);
         tracing::info!(
             task_id = %task_id, title,
             retry = retry_count,
@@ -1055,7 +1028,7 @@ mod tests {
 
     fn test_orchestrator() -> Orchestrator {
         let db = Db::open_in_memory().unwrap();
-        Orchestrator::new(db, Limits::default())
+        Orchestrator::new(db, Limits::default(), "test-session".into())
     }
 
     #[test]
@@ -1311,7 +1284,7 @@ mod tests {
 
         // Task should be Ready again (retried).
         let task = orch.db().get_task(&task_id).unwrap();
-        assert_eq!(task.status, TaskStatus::Ready);
+        assert_eq!(task.status, TaskStatus::Pending);
     }
 
     #[test]
@@ -1378,63 +1351,22 @@ mod tests {
     }
 
     #[test]
-    fn recover_rebuilds_from_db() {
-        let mut orch = test_orchestrator();
-
-        // Create an execution directly in DB (simulating what MCP does).
-        let exec_id = Id::new("exec");
-        let task_id = Id::new("task");
-        let now = chrono::Utc::now();
-
-        let exec = Execution {
-            id: exec_id.clone(),
-            status: ExecutionStatus::Running,
-            created_at: now,
-        };
-        orch.db().insert_execution(&exec).unwrap();
-
-        let task = Task {
-            id: task_id.clone(),
-            title: "Recover me".into(),
-            description: Some("Test recovery".into()),
-            status: TaskStatus::Ready,
-            assigned_to: None,
-            worktree: None,
-            branch: None,
-            tier: Some(Tier::Standard),
-            current_activity: None,
-            created_at: now,
-            updated_at: now,
-        };
-        orch.db().insert_task(&task).unwrap();
-        orch.db()
-            .insert_execution_step(&exec_id, "step1", &task_id)
-            .unwrap();
-
-        // Recover should find and register the execution, then spawn the ready task.
-        let events = orch.handle(Command::Recover);
-        let spawns: Vec<_> = events
-            .iter()
-            .filter(|e| matches!(e, Event::SpawnWorker { .. }))
-            .collect();
-        assert_eq!(spawns.len(), 1);
-    }
-
-    #[test]
     fn discover_from_db_wraps_orphan_tasks() {
         let mut orch = test_orchestrator();
         let now = chrono::Utc::now();
 
-        // Insert an orphan ready task (not part of any execution).
+        // Insert an orphan ready task in the current session (not part of any execution).
         let task_id = Id::new("task");
         let task = Task {
             id: task_id.clone(),
+            session_id: Some("test-session".into()),
             title: "Orphan task".into(),
             description: None,
-            status: TaskStatus::Ready,
+            status: TaskStatus::Pending,
             assigned_to: None,
-            worktree: None,
+            copy_path: None,
             branch: None,
+            base_branch: None,
             tier: Some(Tier::Light),
             current_activity: None,
             created_at: now,

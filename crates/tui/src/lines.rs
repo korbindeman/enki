@@ -112,14 +112,3 @@ pub fn event_bold(icon: &str, text: &str, color: Color) -> Line {
     )])
 }
 
-/// Indented detail line (for follow-up info under an event).
-///
-/// ```text
-///     Worktree preserved at: /path/to/worktree
-/// ```
-pub fn detail(text: &str, color: Color) -> Line {
-    Line::new(vec![Span::styled(
-        format!("    {text}"),
-        Style::new().fg(color),
-    )])
-}

@@ -1,4 +1,5 @@
 mod doctor;
+mod history;
 mod init;
 pub mod mcp;
 mod run;
@@ -7,6 +8,7 @@ mod stop;
 mod task;
 
 pub use doctor::doctor;
+pub use history::history;
 pub use init::init;
 pub use run::run;
 pub use status::status;
@@ -52,7 +54,7 @@ pub fn project_root() -> anyhow::Result<PathBuf> {
 
 /// Global enki directory for logs and shared caches.
 pub fn global_dir() -> PathBuf {
-    home::home_dir()
+    dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".enki")
 }

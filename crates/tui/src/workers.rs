@@ -27,7 +27,7 @@ use std::time::Instant;
 
 use crossterm::style::Color;
 
-use crate::style::{Line, Span, Style};
+use crate::style::{Line, Span, Style, truncate_str};
 
 /// Per-worker state tracked by the panel.
 struct WorkerEntry {
@@ -163,11 +163,11 @@ impl WorkerPanel {
             // Truncate title so the row fits
             let fixed_overhead = 4 + 10 + 2 + 8 + 2; // " ▶ " + "[tier    ]" + "  " + "Xm XXs" + "  "
             let max_title = (w / 2).saturating_sub(fixed_overhead);
-            let title = truncate(&entry.title, max_title);
+            let title = truncate_str(&entry.title, max_title);
             let title_padded = format!("{title:<width$}", width = max_title);
 
             let max_activity = w.saturating_sub(fixed_overhead + max_title + 2);
-            let activity = truncate(&entry.activity, max_activity);
+            let activity = truncate_str(&entry.activity, max_activity);
 
             lines.push(Line::new(vec![
                 Span::styled(" ▶ ", Style::new().fg(tier_color)),
@@ -191,17 +191,3 @@ impl WorkerPanel {
     }
 }
 
-/// Truncate a string to at most `max` characters, appending "…" if truncated.
-fn truncate(s: &str, max: usize) -> String {
-    if max == 0 {
-        return String::new();
-    }
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= max {
-        s.to_string()
-    } else {
-        let mut out: String = chars[..max.saturating_sub(1)].iter().collect();
-        out.push('…');
-        out
-    }
-}

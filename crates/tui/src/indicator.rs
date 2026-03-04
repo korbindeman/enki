@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use crate::style::{Line, Span, Style};
+use crate::style::{Line, Span, Style, truncate_str};
 use crossterm::style::Color;
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -166,20 +166,5 @@ impl Indicator {
         }
 
         Vec::new()
-    }
-}
-
-/// Truncate a string to at most `max` characters, appending "…" if truncated.
-fn truncate_str(s: &str, max: usize) -> String {
-    if max == 0 {
-        return String::new();
-    }
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= max {
-        s.to_string()
-    } else {
-        let mut out: String = chars[..max.saturating_sub(1)].iter().collect();
-        out.push('…');
-        out
     }
 }

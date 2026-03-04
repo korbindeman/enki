@@ -29,13 +29,18 @@ enum Cmd {
         /// Additional agent args.
         #[arg(long, default_value = "@zed-industries/claude-code-acp")]
         agent_args: String,
-        /// Keep the worktree after the run instead of cleaning it up.
+        /// Keep the copy after the run instead of cleaning it up.
         #[arg(long)]
         keep: bool,
     },
     /// Show workspace status.
     Status,
-    /// Diagnose project health (bare repo, worktrees, agent, logs).
+    /// Show past session history.
+    History {
+        /// Session ID to show details for.
+        session_id: Option<String>,
+    },
+    /// Diagnose project health (copies, agent, logs).
     Doctor,
     /// Stop all running workers immediately.
     Stop,
@@ -97,6 +102,7 @@ async fn main() {
             keep,
         }) => commands::run(&task_id, &agent, &agent_args, keep, enki_bin).await,
         Some(Cmd::Status) => commands::status().await,
+        Some(Cmd::History { session_id }) => commands::history(session_id).await,
         Some(Cmd::Doctor) => commands::doctor().await,
         Some(Cmd::Stop) => commands::stop().await,
         Some(Cmd::Mcp { role, task_id }) => commands::mcp::run(&role, task_id.as_deref()),

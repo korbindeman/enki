@@ -1,8 +1,11 @@
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::types::Tier;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum NodeStatus {
     Pending,
     Ready,
@@ -14,7 +17,7 @@ pub enum NodeStatus {
     Cancelled,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
     pub id: String,
     pub title: String,
@@ -28,7 +31,7 @@ pub struct Node {
 }
 
 /// A directed acyclic graph tracking execution of a rendered template.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Dag {
     nodes: Vec<Node>,
     index: HashMap<String, usize>,

@@ -15,7 +15,7 @@ anyhow = "1"
 serde_json = { workspace = true }
 chrono = { workspace = true }
 clap = { version = "4", features = ["derive"] }
-home = "0.5"
+dirs = "6"
 ignore = "0.4"
 nucleo-matcher = "0.3"
 tokio = { workspace = true }

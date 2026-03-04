@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, Write};
 
 use chrono::Utc;
+use enki_core::orchestrator::StepDef;
 use enki_core::types::{
     Execution, ExecutionStatus, Id, Message, MessagePriority, MessageType, Task, TaskStatus, Tier,
 };
@@ -29,6 +30,7 @@ fn tools_for_role(role: &str) -> &'static [&'static str] {
             "enki_status",
             "enki_task_list",
             "enki_worker_report",
+            "enki_edit_file",
             "enki_mail_send",
             "enki_mail_check",
             "enki_mail_read",
@@ -194,7 +196,7 @@ fn all_tool_definitions() -> Vec<Value> {
                 "properties": {
                     "task_id": {
                         "type": "string",
-                        "description": "ID of the failed task to retry."
+                        "description": "ID of the failed task to retry. Accepts full ID or short prefix (e.g. 'a1b2')."
                     }
                 },
                 "required": ["task_id"]
@@ -248,6 +250,24 @@ fn all_tool_definitions() -> Vec<Value> {
                     }
                 },
                 "required": ["status"]
+            }
+        }),
+        json!({
+            "name": "enki_edit_file",
+            "description": "Edit a file using hashline anchors from your last read. Lines with a {line}:{hash}| prefix reference existing lines (anchors). Lines without a prefix are new content. The region between the first and last anchor is replaced.\n\nExamples:\n- Replace lines 3-4: anchor line 2, new content, anchor line 5\n- Insert after line 2: anchor line 2, new content\n- Delete lines 3-4: anchor line 2, anchor line 5",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute path to the file to edit."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Edit content mixing hashline anchors and new lines."
+                    }
+                },
+                "required": ["path", "content"]
             }
         }),
         json!({
@@ -361,6 +381,7 @@ fn handle_tools_call(id: Option<Value>, params: &Value, role: &str, task_id: Opt
         "enki_pause" => tool_pause(args),
         "enki_cancel" => tool_cancel(args),
         "enki_worker_report" => tool_worker_report(args, task_id),
+        "enki_edit_file" => tool_edit_file(args),
         "enki_mail_send" => tool_mail_send(args, &my_addr),
         "enki_mail_check" => tool_mail_check(&my_addr),
         "enki_mail_read" => tool_mail_read(args),
@@ -429,33 +450,41 @@ fn write_signal_file(signal: &Value) -> Result<(), String> {
 
 fn tool_status() -> Result<String, String> {
     let db = open_db().map_err(|e| e.to_string())?;
-    let tasks = db.list_tasks().map_err(|e| e.to_string())?;
+    let session_id = std::env::var("ENKI_SESSION_ID").ok();
+    let tasks = if let Some(ref sid) = session_id {
+        db.list_session_tasks(sid).map_err(|e| e.to_string())?
+    } else {
+        db.list_tasks().map_err(|e| e.to_string())?
+    };
 
-    let open = tasks.iter().filter(|t| matches!(t.status, TaskStatus::Open | TaskStatus::Ready)).count();
+    let pending = tasks.iter().filter(|t| t.status == TaskStatus::Pending).count();
     let running = tasks.iter().filter(|t| t.status == TaskStatus::Running).count();
     let done = tasks.iter().filter(|t| t.status == TaskStatus::Done).count();
     let failed = tasks.iter().filter(|t| matches!(t.status, TaskStatus::Failed | TaskStatus::Blocked)).count();
 
-    Ok(format!("tasks: {} open, {} running, {} done, {} failed ({} total)", open, running, done, failed, tasks.len()))
+    Ok(format!("tasks: {} pending, {} running, {} done, {} failed ({} total)", pending, running, done, failed, tasks.len()))
 }
 
 fn tool_task_create(args: &Value) -> Result<String, String> {
     let title = args["title"].as_str().ok_or("missing required parameter: title")?;
     let description = args["description"].as_str().map(String::from);
-    let tier_str = args["tier"].as_str().unwrap_or("standard");
+    let tier_str = args["tier"].as_str().unwrap_or("heavy");
 
     let tier = Tier::from_str(tier_str).ok_or_else(|| format!("invalid tier: {tier_str}"))?;
     let db = open_db().map_err(|e| e.to_string())?;
+    let session_id = std::env::var("ENKI_SESSION_ID").ok();
 
     let now = Utc::now();
     let task = Task {
         id: Id::new("task"),
+        session_id: session_id.clone(),
         title: title.to_string(),
         description,
-        status: TaskStatus::Ready,
+        status: TaskStatus::Pending,
         assigned_to: None,
-        worktree: None,
+        copy_path: None,
         branch: None,
+        base_branch: None,
         tier: Some(tier),
         current_activity: None,
         created_at: now,
@@ -464,12 +493,17 @@ fn tool_task_create(args: &Value) -> Result<String, String> {
 
     db.insert_task(&task).map_err(|e| e.to_string())?;
     write_signal_file(&json!({"type": "task_created", "task_id": task.id.as_str()}))?;
-    Ok(format!("Created task '{}' ({}) — status: ready, tier: {}", title, task.id, tier_str))
+    Ok(format!("Created task '{}' ({}) — status: ready, tier: {}", title, task.id.short(), tier_str))
 }
 
 fn tool_task_list() -> Result<String, String> {
     let db = open_db().map_err(|e| e.to_string())?;
-    let tasks = db.list_tasks().map_err(|e| e.to_string())?;
+    let session_id = std::env::var("ENKI_SESSION_ID").ok();
+    let tasks = if let Some(ref sid) = session_id {
+        db.list_session_tasks(sid).map_err(|e| e.to_string())?
+    } else {
+        db.list_tasks().map_err(|e| e.to_string())?
+    };
 
     if tasks.is_empty() {
         return Ok("No tasks.".into());
@@ -480,10 +514,11 @@ fn tool_task_list() -> Result<String, String> {
         .map(|t| {
             let tier = t.tier.map(|t| t.as_str()).unwrap_or("-");
             let activity = t.current_activity.as_deref().unwrap_or("");
+            let short = t.id.short();
             if activity.is_empty() {
-                format!("{} | {} | {} | {}", t.id, t.status.as_str(), tier, t.title)
+                format!("{short} | {} | {} | {}", t.status.as_str(), tier, t.title)
             } else {
-                format!("{} | {} | {} | {} [{}]", t.id, t.status.as_str(), tier, t.title, activity)
+                format!("{short} | {} | {} | {} [{activity}]", t.status.as_str(), tier, t.title)
             }
         })
         .collect();
@@ -500,14 +535,6 @@ fn tool_execution_create(args: &Value) -> Result<String, String> {
     }
 
     // Parse and validate all steps up front.
-    struct StepDef {
-        id: String,
-        title: String,
-        description: String,
-        tier: Tier,
-        needs: Vec<String>,
-    }
-
     let mut defs: Vec<StepDef> = Vec::new();
     let mut step_ids: HashSet<String> = HashSet::new();
 
@@ -524,7 +551,7 @@ fn tool_execution_create(args: &Value) -> Result<String, String> {
             .as_str()
             .ok_or("each step must have a 'description'")?
             .to_string();
-        let tier_str = step["tier"].as_str().unwrap_or("standard");
+        let tier_str = step["tier"].as_str().unwrap_or("heavy");
         let tier =
             Tier::from_str(tier_str).ok_or_else(|| format!("invalid tier: {tier_str}"))?;
         let needs: Vec<String> = step["needs"]
@@ -567,9 +594,11 @@ fn tool_execution_create(args: &Value) -> Result<String, String> {
     let db = open_db().map_err(|e| e.to_string())?;
     let execution_id = Id::new("exec");
     let now = Utc::now();
+    let session_id = std::env::var("ENKI_SESSION_ID").ok();
 
     let execution = Execution {
         id: execution_id.clone(),
+        session_id: session_id.clone(),
         status: ExecutionStatus::Running,
         created_at: now,
     };
@@ -580,18 +609,20 @@ fn tool_execution_create(args: &Value) -> Result<String, String> {
     for def in &defs {
         let task_id = Id::new("task");
         let status = if def.needs.is_empty() {
-            TaskStatus::Ready
+            TaskStatus::Pending
         } else {
-            TaskStatus::Open
+            TaskStatus::Pending
         };
         let task = Task {
             id: task_id.clone(),
+            session_id: session_id.clone(),
             title: def.title.clone(),
             description: Some(def.description.clone()),
             status,
             assigned_to: None,
-            worktree: None,
+            copy_path: None,
             branch: None,
+            base_branch: None,
             tier: Some(def.tier),
             current_activity: None,
             created_at: now,
@@ -616,14 +647,10 @@ fn tool_execution_create(args: &Value) -> Result<String, String> {
     write_signal_file(&json!({"type": "execution_created", "execution_id": execution_id.as_str()}))?;
 
     // Build response.
-    let mut lines = vec![format!("execution: {}", execution_id)];
+    let mut lines = vec![format!("execution: {}", execution_id.short())];
     for def in &defs {
         let task_id = &step_task_ids[&def.id];
-        let status = if def.needs.is_empty() {
-            "ready"
-        } else {
-            "open"
-        };
+        let status = "pending";
         let deps = if def.needs.is_empty() {
             String::new()
         } else {
@@ -631,7 +658,7 @@ fn tool_execution_create(args: &Value) -> Result<String, String> {
         };
         lines.push(format!(
             "  {} → {} | {} | {}{}",
-            def.id, task_id, status, def.title, deps
+            def.id, task_id.short(), status, def.title, deps
         ));
     }
     Ok(lines.join("\n"))
@@ -640,7 +667,7 @@ fn tool_execution_create(args: &Value) -> Result<String, String> {
 fn tool_task_retry(args: &Value) -> Result<String, String> {
     let task_id_str = args["task_id"].as_str().ok_or("missing required parameter: task_id")?;
     let db = open_db().map_err(|e| e.to_string())?;
-    let task_id = Id(task_id_str.to_string());
+    let task_id = db.resolve_task_id(task_id_str, None).map_err(|e| e.to_string())?;
 
     // Verify the task exists and is actually failed.
     let task = db.get_task(&task_id).map_err(|e| e.to_string())?;
@@ -655,15 +682,15 @@ fn tool_task_retry(args: &Value) -> Result<String, String> {
     // Find the execution this task belongs to.
     let Some((exec_id, _step_id)) = db.get_execution_for_task(&task_id).map_err(|e| e.to_string())? else {
         // Standalone task — just reset to ready.
-        db.update_task_status(&task_id, TaskStatus::Ready).map_err(|e| e.to_string())?;
-        return Ok(format!("Task {} reset to ready (standalone, no execution).", task_id_str));
+        db.update_task_status(&task_id, TaskStatus::Pending).map_err(|e| e.to_string())?;
+        return Ok(format!("Task {} reset to pending (standalone, no execution).", task_id_str));
     };
 
-    // Reset the failed task to ready.
-    db.update_task_status(&task_id, TaskStatus::Ready).map_err(|e| e.to_string())?;
+    // Reset the failed task to pending.
+    db.update_task_status(&task_id, TaskStatus::Pending).map_err(|e| e.to_string())?;
 
-    // Reset any sibling tasks that were blocked by this failure back to open
-    // (the scheduler's DAG rebuild will re-evaluate their readiness).
+    // Reset any blocked siblings to pending
+    // (the scheduler's DAG will re-evaluate their readiness).
     let steps = db.get_execution_steps(&exec_id).map_err(|e| e.to_string())?;
     let mut unblocked = 0;
     for (_step_id, sibling_task_id) in &steps {
@@ -672,7 +699,7 @@ fn tool_task_retry(args: &Value) -> Result<String, String> {
         }
         let sibling = db.get_task(sibling_task_id).map_err(|e| e.to_string())?;
         if sibling.status == TaskStatus::Blocked {
-            db.update_task_status(sibling_task_id, TaskStatus::Open).map_err(|e| e.to_string())?;
+            db.update_task_status(sibling_task_id, TaskStatus::Pending).map_err(|e| e.to_string())?;
             unblocked += 1;
         }
     }
@@ -682,7 +709,7 @@ fn tool_task_retry(args: &Value) -> Result<String, String> {
 
     write_signal_file(&json!({"type": "task_created", "task_id": task_id_str}))?;
 
-    let mut result = format!("Task {} reset to ready.", task_id_str);
+    let mut result = format!("Task {} reset to pending.", task_id_str);
     if unblocked > 0 {
         result.push_str(&format!(" {} blocked sibling task(s) unblocked.", unblocked));
     }
@@ -745,6 +772,21 @@ fn tool_worker_report(args: &Value, task_id: Option<&str>) -> Result<String, Str
     }))?;
 
     Ok(format!("Status reported: {status}"))
+}
+
+fn tool_edit_file(args: &Value) -> Result<String, String> {
+    let path = args["path"].as_str().ok_or("missing required parameter: path")?;
+    let content = args["content"].as_str().ok_or("missing required parameter: content")?;
+
+    let current = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read {path}: {e}"))?;
+
+    let result = enki_core::hashline::apply_edit(content, &current)?;
+
+    std::fs::write(path, &result)
+        .map_err(|e| format!("failed to write {path}: {e}"))?;
+
+    Ok(format!("ok"))
 }
 
 // --- Mail helpers ---
@@ -829,7 +871,7 @@ fn tool_mail_check(my_addr: &str) -> Result<String, String> {
     let db = open_db().map_err(|e| e.to_string())?;
     let mut messages = db.list_messages(my_addr, true).map_err(|e| e.to_string())?;
     // Also include broadcast messages.
-    let broadcast = db.list_broadcast_messages("@workers", true).map_err(|e| e.to_string())?;
+    let broadcast = db.list_messages("@workers", true).map_err(|e| e.to_string())?;
     messages.extend(broadcast);
     // Sort by priority desc, then by time desc.
     messages.sort_by(|a, b| {
@@ -880,7 +922,7 @@ fn tool_mail_read(args: &Value) -> Result<String, String> {
 fn tool_mail_inbox(my_addr: &str) -> Result<String, String> {
     let db = open_db().map_err(|e| e.to_string())?;
     let mut messages = db.list_messages(my_addr, false).map_err(|e| e.to_string())?;
-    let broadcast = db.list_broadcast_messages("@workers", false).map_err(|e| e.to_string())?;
+    let broadcast = db.list_messages("@workers", false).map_err(|e| e.to_string())?;
     messages.extend(broadcast);
     messages.sort_by(|a, b| {
         b.priority.sort_key().cmp(&a.priority.sort_key())

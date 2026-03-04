@@ -4,13 +4,13 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-rusqlite = { version = "0.35", features = ["bundled"] }
+rusqlite = { version = "0.38", features = ["bundled"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-toml = "0.8"
 chrono = { workspace = true }
-ulid = { workspace = true }
-which = "7"
+rand = "0.9"
+which = "8"
 dirs = "6"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }

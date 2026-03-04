@@ -20,7 +20,7 @@ pub async fn run(_db: enki_core::db::Db, db_path: String, enki_bin: PathBuf) -> 
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
-    let status_msg = format!("Project: {project_name}");
+    let status_msg = project_name;
 
     // Spawn coordinator
     let mut coord_handle = coordinator::spawn(project_cwd.clone(), db_path, enki_bin);
@@ -70,7 +70,7 @@ impl Handler<FromCoordinator> for CoordinatorHandler<'_> {
             FromCoordinator::WorkerSpawned { task_id, title, tier } => {
                 cx.print(&lines::event(
                     "▶",
-                    &format!("Worker spawned: {title} ({task_id})"),
+                    &format!("Worker spawned: {title} ({})", enki_core::types::short_id(&task_id)),
                     Color::DarkCyan,
                 ));
                 cx.add_worker();
@@ -79,7 +79,7 @@ impl Handler<FromCoordinator> for CoordinatorHandler<'_> {
             FromCoordinator::WorkerCompleted { task_id, title } => {
                 cx.print(&lines::event(
                     "✓",
-                    &format!("Worker completed: {title} ({task_id})"),
+                    &format!("Worker completed: {title} ({})", enki_core::types::short_id(&task_id)),
                     Color::Green,
                 ));
                 cx.remove_worker();
@@ -92,7 +92,7 @@ impl Handler<FromCoordinator> for CoordinatorHandler<'_> {
             } => {
                 cx.print(&lines::event(
                     "✗",
-                    &format!("Worker failed: {title} ({task_id}): {error}"),
+                    &format!("Worker failed: {title} ({}): {error}", enki_core::types::short_id(&task_id)),
                     Color::Red,
                 ));
                 cx.remove_worker();

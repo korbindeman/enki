@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use agent_client_protocol as acp;
+use acp::{StreamMessageContent, StreamMessageDirection};
 
 /// Re-export ACP schema types needed by callers (e.g., MCP server config).
 pub use agent_client_protocol as acp_schema;
@@ -92,14 +93,15 @@ impl AgentManager {
     ///
     /// `agent_cmd` is the command to run (e.g., "claude" or "npx").
     /// `agent_args` are additional arguments (e.g., ["--acp"] or ["@zed-industries/claude-code-acp"]).
-    /// `cwd` is the working directory for the session (typically a git worktree path).
+    /// `cwd` is the working directory for the session (typically a copy path).
     pub async fn start_session(
         &self,
         agent_cmd: &str,
         agent_args: &[&str],
         cwd: PathBuf,
+        label: &str,
     ) -> Result<String> {
-        self.start_session_with_mcp(agent_cmd, agent_args, cwd, vec![]).await
+        self.start_session_with_mcp(agent_cmd, agent_args, cwd, vec![], label).await
     }
 
     /// Spawn a new agent process with MCP servers configured.
@@ -109,6 +111,7 @@ impl AgentManager {
         agent_args: &[&str],
         cwd: PathBuf,
         mcp_servers: Vec<acp::McpServer>,
+        label: &str,
     ) -> Result<String> {
         tracing::debug!(cmd = agent_cmd, args = ?agent_args, cwd = %cwd.display(), "spawning agent process");
         // Spawn agent subprocess
@@ -164,6 +167,64 @@ impl AgentManager {
         tokio::task::spawn_local(async move {
             if let Err(e) = handle_io.await {
                 tracing::error!("ACP I/O error: {e}");
+            }
+        });
+
+        // Subscribe to all JSON-RPC messages and log to per-session file.
+        let mut stream_rx = conn.subscribe();
+        let log_label = label.to_string();
+        tokio::task::spawn_local(async move {
+            let log_dir = dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".enki/logs/sessions");
+            if let Err(e) = tokio::fs::create_dir_all(&log_dir).await {
+                tracing::warn!("failed to create session log dir: {e}");
+                return;
+            }
+            let log_path = log_dir.join(format!("{log_label}.log"));
+            let file = match tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                .await
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::warn!("failed to open session log {}: {e}", log_path.display());
+                    return;
+                }
+            };
+            use tokio::io::AsyncWriteExt;
+            let mut writer = tokio::io::BufWriter::new(file);
+
+            while let Ok(msg) = stream_rx.recv().await {
+                let arrow = match msg.direction {
+                    StreamMessageDirection::Outgoing => "→",
+                    StreamMessageDirection::Incoming => "←",
+                };
+                let now = chrono::Local::now().format("%H:%M:%S");
+                let line = match &msg.message {
+                    StreamMessageContent::Request { id, method, params } => {
+                        let params_str = truncate_json(params.as_ref());
+                        format!("[{now}] {arrow} {method} id={id} params={params_str}\n")
+                    }
+                    StreamMessageContent::Response { id, result } => {
+                        let result_str = match result {
+                            Ok(val) => truncate_json(val.as_ref()),
+                            Err(e) => format!("error: {e}"),
+                        };
+                        format!("[{now}] {arrow} response id={id} result={result_str}\n")
+                    }
+                    StreamMessageContent::Notification { method, params } => {
+                        let params_str = truncate_json(params.as_ref());
+                        format!("[{now}] {arrow} {method} params={params_str}\n")
+                    }
+                };
+                if let Err(e) = writer.write_all(line.as_bytes()).await {
+                    tracing::warn!("session log write error: {e}");
+                    break;
+                }
+                let _ = writer.flush().await;
             }
         });
 
@@ -376,14 +437,39 @@ impl acp::Client for EnkiClient {
         let content = tokio::fs::read_to_string(&args.path)
             .await
             .map_err(acp::Error::into_internal_error)?;
-        Ok(acp::ReadTextFileResponse::new(content))
+        let tagged = enki_core::hashline::tag_content(&content);
+        Ok(acp::ReadTextFileResponse::new(tagged))
     }
 
     async fn write_text_file(
         &self,
         args: acp::WriteTextFileRequest,
     ) -> acp::Result<acp::WriteTextFileResponse> {
-        tokio::fs::write(&args.path, &args.content)
+        let path = std::path::Path::new(&args.path);
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(acp::Error::into_internal_error)?;
+        }
+
+        // If the content has hashline prefixes, verify hashes against current
+        // file content (stale edit detection), then strip before writing.
+        let content = if enki_core::hashline::looks_like_tagged(&args.content) {
+            if path.exists() {
+                let current = tokio::fs::read_to_string(&args.path)
+                    .await
+                    .map_err(acp::Error::into_internal_error)?;
+                enki_core::hashline::verify_hashlines(&args.content, &current)
+                    .map_err(|e| acp::Error::into_internal_error(
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+                    ))?;
+            }
+            enki_core::hashline::strip_hashlines(&args.content)
+        } else {
+            args.content.clone()
+        };
+
+        tokio::fs::write(&args.path, &content)
             .await
             .map_err(acp::Error::into_internal_error)?;
         Ok(acp::WriteTextFileResponse::default())
@@ -393,8 +479,15 @@ impl acp::Client for EnkiClient {
         &self,
         args: acp::CreateTerminalRequest,
     ) -> acp::Result<acp::CreateTerminalResponse> {
-        let mut cmd = tokio::process::Command::new(&args.command);
-        cmd.args(&args.args);
+        // Claude Code sends the full command as a single string (e.g. "ls -R /path").
+        // We need to run it through a shell so it's parsed correctly.
+        let mut full_command = args.command.clone();
+        for arg in &args.args {
+            full_command.push(' ');
+            full_command.push_str(arg);
+        }
+        let mut cmd = tokio::process::Command::new("bash");
+        cmd.args(["-c", &full_command]);
 
         if let Some(cwd) = &args.cwd {
             cmd.current_dir(cwd);
@@ -641,5 +734,20 @@ impl EnkiClient {
                 );
             }
         }
+    }
+}
+
+/// Truncate a JSON value to a reasonable size for logging.
+fn truncate_json(value: Option<&serde_json::Value>) -> String {
+    const MAX_LEN: usize = 500;
+    let Some(value) = value else {
+        return "null".to_string();
+    };
+    let s = value.to_string();
+    if s.len() <= MAX_LEN {
+        s
+    } else {
+        let truncated = s.len() - MAX_LEN;
+        format!("{}[...truncated {truncated} chars]", &s[..MAX_LEN])
     }
 }

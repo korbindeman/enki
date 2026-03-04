@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Debug, thiserror::Error)]
-pub enum WorktreeError {
+pub enum CopyError {
     #[error("git command failed: {0}")]
     Git(String),
     #[error("io error: {0}")]
@@ -11,33 +11,145 @@ pub enum WorktreeError {
     Conflict(String),
 }
 
-pub type Result<T> = std::result::Result<T, WorktreeError>;
+pub type Result<T> = std::result::Result<T, CopyError>;
 
-/// Manages APFS copy-on-write clones of the project for worker isolation.
+/// The user's git identity, read once from `git config`.
+#[derive(Debug, Clone)]
+pub struct GitIdentity {
+    pub name: String,
+    pub email: String,
+}
+
+impl GitIdentity {
+    /// Read `user.name` and `user.email` from git config in the given directory.
+    pub fn from_git_config(dir: &Path) -> Result<Self> {
+        let name = git_config_get(dir, "user.name")?;
+        let email = git_config_get(dir, "user.email")?;
+        Ok(Self { name, email })
+    }
+
+    /// Apply this identity as env vars on a `Command`.
+    pub fn apply<'a>(&self, cmd: &'a mut Command) -> &'a mut Command {
+        cmd.env("GIT_AUTHOR_NAME", &self.name)
+            .env("GIT_AUTHOR_EMAIL", &self.email)
+            .env("GIT_COMMITTER_NAME", &self.name)
+            .env("GIT_COMMITTER_EMAIL", &self.email)
+    }
+}
+
+fn git_config_get(dir: &Path, key: &str) -> Result<String> {
+    git(dir, &["config", key]).map_err(|_| {
+        CopyError::Git(format!(
+            "git config {key} not set — configure it with: git config --global {key} <value>"
+        ))
+    })
+}
+
+/// Run a git command in `dir`, returning trimmed stdout on success.
+fn git(dir: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .map_err(|e| CopyError::Git(format!("git {}: {e}", args.first().unwrap_or(&""))))?;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(CopyError::Git(format!(
+            "git {} failed: {stderr}",
+            args.join(" ")
+        )))
+    }
+}
+
+/// Like `git()` but returns `None` instead of `Err` on failure.
+fn git_ok(dir: &Path, args: &[&str]) -> Option<String> {
+    git(dir, args).ok()
+}
+
+/// Clone a single filesystem entry using platform-appropriate copy-on-write.
 ///
-/// Each worker gets `cp -Rc <project_root> .enki/copies/<task_id>` — an instant
-/// filesystem clone that includes everything (build artifacts, .gitignored files,
-/// node_modules, etc.). Git is only used to commit changes at task completion
+/// - macOS (APFS): `cp -Rc` — instant CoW via `clonefile(2)`
+/// - Linux (btrfs/XFS): `cp --reflink=auto -a` — CoW where supported, regular copy otherwise
+/// - Other: `cp -a` — regular recursive copy
+fn clone_entry(src: &Path, dst: &Path) -> Result<()> {
+    let output = if cfg!(target_os = "macos") {
+        Command::new("cp")
+            .args(["-Rc"])
+            .arg(src)
+            .arg(dst)
+            .output()?
+    } else if cfg!(target_os = "linux") {
+        Command::new("cp")
+            .args(["--reflink=auto", "-a"])
+            .arg(src)
+            .arg(dst)
+            .output()?
+    } else {
+        Command::new("cp")
+            .args(["-a"])
+            .arg(src)
+            .arg(dst)
+            .output()?
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(CopyError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("cp failed for {}: {stderr}", src.display()),
+        )));
+    }
+    Ok(())
+}
+
+/// Get the current HEAD sha of a repo, or None if unborn/not a repo.
+pub fn head_sha(dir: &Path) -> Option<String> {
+    git_ok(dir, &["rev-parse", "HEAD"])
+}
+
+/// Manages copy-on-write clones of the project for worker isolation.
+///
+/// Each worker gets a clone of the project at `.enki/copies/<task_id>` that
+/// includes everything (build artifacts, .gitignored files, node_modules, etc.).
+/// Uses platform-appropriate CoW (APFS on macOS, reflink on Linux) for instant,
+/// space-efficient clones. Git is only used to commit changes at task completion
 /// and merge them back into the source repo.
 pub struct CopyManager {
     project_root: PathBuf,
     copies_dir: PathBuf,
+    git_identity: GitIdentity,
 }
 
 impl CopyManager {
-    pub fn new(project_root: PathBuf, copies_dir: PathBuf) -> Self {
+    pub fn new(project_root: PathBuf, copies_dir: PathBuf, git_identity: GitIdentity) -> Self {
         Self {
             project_root,
             copies_dir,
+            git_identity,
         }
     }
 
-    /// Create an APFS clone of the project for a worker.
+    /// Create a copy-on-write clone of the project for a worker.
     ///
-    /// 1. `cp -Rc <project_root> .enki/copies/<task_id>`
-    /// 2. Remove `.enki/` from the copy (avoid nested copies + DB conflicts)
-    /// 3. `git checkout -b task/<task_id>` inside the copy
-    pub fn create_copy(&self, task_id: &str) -> Result<PathBuf> {
+    /// 1. Record the current HEAD commit (the "base") and branch name
+    /// 2. Clone each top-level entry except `.enki/` into a temp directory
+    /// 3. Atomically rename the temp directory to the final path
+    /// 4. `git checkout -b task/<task_id>` inside the copy
+    ///
+    /// Skipping `.enki/` avoids copying nested copies and the database.
+    /// Using a temp directory + rename ensures the final path only appears
+    /// atomically — a crash mid-copy won't leave a partial copy at the
+    /// canonical path.
+    ///
+    /// Returns `(copy_path, base_commit, base_branch)`. `base_commit` is `None`
+    /// for unborn repos. `base_branch` is the branch to merge back into.
+    pub fn create_copy(&self, task_id: &str) -> Result<(PathBuf, Option<String>, String)> {
+        let base_commit = git_ok(&self.project_root, &["rev-parse", "HEAD"]);
+        let base_branch = self.current_branch()?;
+
         std::fs::create_dir_all(&self.copies_dir)?;
 
         let copy_path = self.copies_dir.join(task_id);
@@ -45,41 +157,38 @@ impl CopyManager {
             std::fs::remove_dir_all(&copy_path)?;
         }
 
-        // APFS clone — instant, zero extra space on macOS (copy-on-write).
-        let output = Command::new("cp")
-            .args(["-Rc"])
-            .arg(&self.project_root)
-            .arg(&copy_path)
-            .output()?;
+        // Build into a temp directory, then atomically rename.
+        let tmp_path = self.copies_dir.join(format!(".tmp-{task_id}"));
+        if tmp_path.exists() {
+            std::fs::remove_dir_all(&tmp_path)?;
+        }
+        std::fs::create_dir_all(&tmp_path)?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(WorktreeError::Git(format!("cp -Rc failed: {stderr}")));
+        // Clone each top-level entry except .enki/ — preserves CoW semantics
+        // while skipping nested copies and the database.
+        for entry in std::fs::read_dir(&self.project_root)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if name == ".enki" {
+                continue;
+            }
+            if let Err(e) = clone_entry(&entry.path(), &tmp_path.join(&name)) {
+                let _ = std::fs::remove_dir_all(&tmp_path);
+                return Err(e);
+            }
         }
 
-        // Remove .enki/ from copy to avoid nested DB/copies.
-        let nested_enki = copy_path.join(".enki");
-        if nested_enki.exists() {
-            std::fs::remove_dir_all(&nested_enki)?;
-        }
+        // Atomic rename (same filesystem, instant).
+        std::fs::rename(&tmp_path, &copy_path)?;
 
         // Create a new branch for the worker's changes.
         let branch = format!("task/{task_id}");
-        let output = Command::new("git")
-            .args(["checkout", "-b", &branch])
-            .current_dir(&copy_path)
-            .output()?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // Clean up on failure.
+        if let Err(e) = git(&copy_path, &["checkout", "-b", &branch]) {
             let _ = std::fs::remove_dir_all(&copy_path);
-            return Err(WorktreeError::Git(format!(
-                "git checkout -b {branch} failed: {stderr}"
-            )));
+            return Err(e);
         }
 
-        Ok(copy_path)
+        Ok((copy_path, base_commit, base_branch))
     }
 
     /// Commit all changes in a copy. Returns true if a commit was created.
@@ -88,42 +197,28 @@ impl CopyManager {
     /// we can merge it back.
     pub fn commit_copy(&self, copy_path: &Path, message: &str) -> bool {
         // Check for dirty state.
-        let status = Command::new("git")
-            .args(["status", "--porcelain"])
-            .current_dir(copy_path)
-            .output();
-        let has_dirty = match status {
-            Ok(ref out) => !String::from_utf8_lossy(&out.stdout).trim().is_empty(),
-            Err(_) => return false,
-        };
+        let status = git_ok(copy_path, &["status", "--porcelain"]);
+        let has_dirty = status.as_ref().is_some_and(|s| !s.is_empty());
         if !has_dirty {
             return false;
         }
 
-        // Stage everything and commit.
-        let add = Command::new("git")
-            .args(["add", "-A"])
-            .current_dir(copy_path)
-            .output();
-        if add.is_err() || !add.unwrap().status.success() {
+        // Stage everything.
+        if git(copy_path, &["add", "-A"]).is_err() {
             tracing::warn!(copy = %copy_path.display(), "auto-commit: git add -A failed");
             return false;
         }
 
-        let commit = Command::new("git")
-            .args(["commit", "-m", message, "--no-verify"])
-            .env("GIT_AUTHOR_NAME", "enki")
-            .env("GIT_AUTHOR_EMAIL", "enki@local")
-            .env("GIT_COMMITTER_NAME", "enki")
-            .env("GIT_COMMITTER_EMAIL", "enki@local")
-            .current_dir(copy_path)
-            .output();
-        match commit {
-            Ok(ref out) if out.status.success() => {
+        // Commit with identity.
+        let mut cmd = Command::new("git");
+        cmd.args(["commit", "-m", message, "--no-verify"]);
+        self.git_identity.apply(&mut cmd);
+        match cmd.current_dir(copy_path).output() {
+            Ok(out) if out.status.success() => {
                 tracing::info!(copy = %copy_path.display(), "auto-committed worker changes");
                 true
             }
-            Ok(ref out) => {
+            Ok(out) => {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 tracing::warn!(copy = %copy_path.display(), stderr = %stderr, "auto-commit failed");
                 false
@@ -135,23 +230,15 @@ impl CopyManager {
         }
     }
 
-    /// Check if a copy has any file changes vs the branch point.
+    /// Check if a copy has any file changes vs the base commit.
     ///
-    /// Uses `git diff --stat` between the merge-base (where the branch forked
-    /// from the default branch) and HEAD. If there are any changed files, the
-    /// worker produced output.
-    pub fn has_changes(&self, copy_path: &Path, _branch: &str) -> bool {
-        // Find the default branch to compare against.
-        let default = self.default_branch().unwrap_or_else(|_| "main".into());
-
-        // Use diff --stat to check for file changes between merge-base and HEAD.
-        let output = Command::new("git")
-            .args(["diff", "--stat", &default, "HEAD"])
-            .current_dir(copy_path)
-            .output();
-        match output {
-            Ok(out) => !String::from_utf8_lossy(&out.stdout).trim().is_empty(),
-            Err(_) => false,
+    /// `base_commit` is the HEAD hash from when the copy was created. If `None`
+    /// (unborn repo), any commit on the task branch counts as changes.
+    pub fn has_changes(&self, copy_path: &Path, base_commit: Option<&str>) -> bool {
+        match base_commit {
+            Some(base) => git_ok(copy_path, &["diff", "--stat", base, "HEAD"])
+                .is_some_and(|s| !s.is_empty()),
+            None => git_ok(copy_path, &["rev-parse", "HEAD"]).is_some(),
         }
     }
 
@@ -163,22 +250,14 @@ impl CopyManager {
         Ok(())
     }
 
-    /// Detect the default branch name (main or master) in the source repo.
-    pub fn default_branch(&self) -> Result<String> {
-        for candidate in &["main", "master"] {
-            let output = Command::new("git")
-                .args(["rev-parse", "--verify", candidate])
-                .current_dir(&self.project_root)
-                .output();
-            if let Ok(out) = output {
-                if out.status.success() {
-                    return Ok(candidate.to_string());
-                }
-            }
-        }
-        Err(WorktreeError::Git(
-            "no default branch found (tried main, master)".into(),
-        ))
+    /// Get the current branch name in the source repo.
+    ///
+    /// Returns whatever branch HEAD points to — no assumptions about naming.
+    /// This is the branch workers merge back into.
+    pub fn current_branch(&self) -> Result<String> {
+        git(&self.project_root, &["symbolic-ref", "--short", "HEAD"]).map_err(|_| {
+            CopyError::Git("HEAD is detached or unborn — cannot determine current branch".into())
+        })
     }
 
     /// Fetch a worker's branch from a copy into the source repo.
@@ -187,30 +266,17 @@ impl CopyManager {
     /// making the worker's commits available for merging.
     pub fn fetch_branch(&self, copy_path: &Path, branch: &str) -> Result<()> {
         let copy_str = copy_path.to_string_lossy();
-        let output = Command::new("git")
-            .args(["fetch", &copy_str, &format!("{branch}:{branch}")])
-            .current_dir(&self.project_root)
-            .output()?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(WorktreeError::Git(format!(
-                "fetch from copy failed: {stderr}"
-            )));
-        }
-
+        git(
+            &self.project_root,
+            &["fetch", &copy_str, &format!("{branch}:{branch}")],
+        )?;
         Ok(())
     }
 
     /// Delete a branch from the source repo.
     pub fn delete_branch(&self, branch: &str) -> Result<()> {
-        let output = Command::new("git")
-            .args(["branch", "-D", branch])
-            .current_dir(&self.project_root)
-            .output()?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            tracing::warn!("failed to delete branch {branch}: {stderr}");
+        if let Err(e) = git(&self.project_root, &["branch", "-D", branch]) {
+            tracing::warn!("failed to delete branch {branch}: {e}");
         }
         Ok(())
     }
@@ -218,14 +284,25 @@ impl CopyManager {
     pub fn project_root(&self) -> &Path {
         &self.project_root
     }
+
+    pub fn copies_dir(&self) -> &Path {
+        &self.copies_dir
+    }
+
+    pub fn git_identity(&self) -> &GitIdentity {
+        &self.git_identity
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::Rng;
 
     fn tmp_dir(prefix: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("enki-{prefix}-{}", ulid::Ulid::new()))
+        let bytes: [u8; 4] = rand::rng().random();
+        let hex = format!("{:07x}", u32::from_be_bytes(bytes) >> 4);
+        std::env::temp_dir().join(format!("enki-{prefix}-{hex}"))
     }
 
     fn setup_source(path: &Path) {
@@ -244,7 +321,11 @@ mod tests {
         // Create .enki dir in source (simulates real project)
         std::fs::create_dir_all(source.join(".enki")).unwrap();
         std::fs::write(source.join(".enki/db.sqlite"), "fake db").unwrap();
-        let mgr = CopyManager::new(source.clone(), copies);
+        let identity = GitIdentity {
+            name: "test".into(),
+            email: "test@test.com".into(),
+        };
+        let mgr = CopyManager::new(source.clone(), copies, identity);
         (source, mgr)
     }
 
@@ -300,7 +381,7 @@ mod tests {
         std::fs::create_dir_all(source.join("build")).unwrap();
         std::fs::write(source.join("build/output.bin"), "binary data").unwrap();
 
-        let copy = mgr.create_copy("task-01").unwrap();
+        let (copy, _base, _branch) = mgr.create_copy("task-01").unwrap();
 
         // Copy should have all files including .gitignored ones.
         assert!(copy.join("README.md").exists());
@@ -333,7 +414,7 @@ mod tests {
         let tmp = tmp_dir("copy-commit");
         let (_source, mgr) = setup_copy_manager(&tmp);
 
-        let copy = mgr.create_copy("task-02").unwrap();
+        let (copy, _base, _branch) = mgr.create_copy("task-02").unwrap();
 
         // Worker makes changes.
         std::fs::write(copy.join("feature.rs"), "fn feature() {}").unwrap();
@@ -358,17 +439,16 @@ mod tests {
         let tmp = tmp_dir("copy-changes");
         let (_source, mgr) = setup_copy_manager(&tmp);
 
-        let copy = mgr.create_copy("task-03").unwrap();
-        let branch = "task/task-03";
+        let (copy, base, _branch) = mgr.create_copy("task-03").unwrap();
 
         // No changes yet.
-        assert!(!mgr.has_changes(&copy, branch));
+        assert!(!mgr.has_changes(&copy, base.as_deref()));
 
         // Worker writes and commits.
         std::fs::write(copy.join("output.txt"), "worker output").unwrap();
         mgr.commit_copy(&copy, "worker output");
 
-        assert!(mgr.has_changes(&copy, branch));
+        assert!(mgr.has_changes(&copy, base.as_deref()));
 
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -378,7 +458,7 @@ mod tests {
         let tmp = tmp_dir("copy-remove");
         let (_source, mgr) = setup_copy_manager(&tmp);
 
-        let copy = mgr.create_copy("task-04").unwrap();
+        let (copy, _base, _branch) = mgr.create_copy("task-04").unwrap();
         assert!(copy.exists());
 
         mgr.remove_copy(&copy).unwrap();
@@ -388,11 +468,11 @@ mod tests {
     }
 
     #[test]
-    fn default_branch_detection() {
+    fn current_branch_detection() {
         let tmp = tmp_dir("copy-branch");
         let (_source, mgr) = setup_copy_manager(&tmp);
 
-        let branch = mgr.default_branch().unwrap();
+        let branch = mgr.current_branch().unwrap();
         assert_eq!(branch, "main");
 
         std::fs::remove_dir_all(&tmp).ok();
@@ -403,7 +483,7 @@ mod tests {
         let tmp = tmp_dir("copy-fetch");
         let (source, mgr) = setup_copy_manager(&tmp);
 
-        let copy = mgr.create_copy("task-05").unwrap();
+        let (copy, _base, _branch) = mgr.create_copy("task-05").unwrap();
 
         // Worker makes changes and commits.
         std::fs::write(copy.join("feature.rs"), "fn feature() {}").unwrap();
@@ -451,7 +531,7 @@ mod tests {
         .unwrap();
 
         // Worker 1: create copy, do work, commit.
-        let copy1 = mgr.create_copy("task-w1").unwrap();
+        let (copy1, _base1, _branch1) = mgr.create_copy("task-w1").unwrap();
         assert!(
             copy1.join("node_modules/pkg/index.js").exists(),
             "worker should see node_modules"
@@ -471,7 +551,7 @@ mod tests {
         mgr.delete_branch("task/task-w1").unwrap();
 
         // Worker 2: sees worker 1's merged changes.
-        let copy2 = mgr.create_copy("task-w2").unwrap();
+        let (copy2, _base2, _branch2) = mgr.create_copy("task-w2").unwrap();
         assert!(
             copy2.join("feature_a.rs").exists(),
             "worker 2 should see worker 1's merged changes"
@@ -501,7 +581,7 @@ mod tests {
         std::fs::write(source.join("README.md"), "# modified but not committed").unwrap();
         std::fs::write(source.join("notes.txt"), "user notes").unwrap();
 
-        let copy = mgr.create_copy("task-dirty").unwrap();
+        let (copy, _base, _branch) = mgr.create_copy("task-dirty").unwrap();
 
         // Copy should see the dirty state.
         assert_eq!(

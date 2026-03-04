@@ -27,10 +27,10 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            max_workers: 5,
-            max_heavy: 1,
-            max_standard: 3,
-            max_light: 5,
+            max_workers: 10,
+            max_heavy: 5,
+            max_standard: 5,
+            max_light: 10,
         }
     }
 }
@@ -166,47 +166,6 @@ impl Scheduler {
                 step_tasks,
                 step_sessions: HashMap::new(),
                 step_outputs: HashMap::new(),
-                reported_blocked: std::collections::HashSet::new(),
-                paused: false,
-            },
-        );
-    }
-
-    /// Rebuild an execution from DB state (crash recovery).
-    /// `step_statuses` maps step_id -> NodeStatus derived from task statuses in the DB.
-    /// `step_outputs` maps step_id -> captured output for completed steps.
-    pub fn rebuild_execution(
-        &mut self,
-        execution_id: Id,
-        project_id: Id,
-        mut dag: Dag,
-        step_tasks: HashMap<String, Id>,
-        step_statuses: HashMap<String, NodeStatus>,
-        step_outputs: HashMap<String, String>,
-    ) {
-        // Apply DB-derived statuses to the DAG nodes.
-        // Tasks that were Running when we crashed get reset to Ready.
-        for (step_id, status) in &step_statuses {
-            let effective = if *status == NodeStatus::Running {
-                NodeStatus::Ready
-            } else {
-                *status
-            };
-            dag.set_status(step_id, effective);
-        }
-
-        // Re-evaluate: promote Pending nodes whose deps are all Done.
-        dag.reevaluate();
-
-        self.executions.insert(
-            execution_id.0.clone(),
-            ExecutionState {
-                execution_id,
-                project_id,
-                dag,
-                step_tasks,
-                step_sessions: HashMap::new(),
-                step_outputs,
                 reported_blocked: std::collections::HashSet::new(),
                 paused: false,
             },
@@ -523,6 +482,10 @@ impl Scheduler {
     }
 
     /// Check if an execution is paused.
+    pub fn get_dag(&self, execution_id: &str) -> Option<&Dag> {
+        self.executions.get(execution_id).map(|e| &e.dag)
+    }
+
     pub fn is_execution_paused(&self, execution_id: &str) -> bool {
         self.executions.get(execution_id).map_or(false, |e| e.paused)
     }
@@ -784,62 +747,6 @@ mod tests {
 
         // A tick produces no actions
         assert!(scheduler.tick().is_empty());
-    }
-
-    #[test]
-    fn crash_recovery_rebuild() {
-        let dag = make_dag();
-        let exec_id = Id::new("exec");
-        let project_id = Id::new("proj");
-
-        let step_tasks: StdMap<String, Id> = ["design", "implement", "test", "review", "merge"]
-            .iter()
-            .map(|s| (s.to_string(), Id::new("task")))
-            .collect();
-
-        // Simulate crash mid-execution: design Done, implement was Running (reset to Ready)
-        let mut step_statuses = StdMap::new();
-        step_statuses.insert("design".into(), NodeStatus::Done);
-        step_statuses.insert("implement".into(), NodeStatus::Running); // will be reset to Ready
-        step_statuses.insert("test".into(), NodeStatus::Pending);
-        step_statuses.insert("review".into(), NodeStatus::Pending);
-        step_statuses.insert("merge".into(), NodeStatus::Pending);
-
-        let mut step_outputs = StdMap::new();
-        step_outputs.insert("design".into(), "design output".into());
-
-        let mut scheduler = Scheduler::new(Limits::default());
-        scheduler.rebuild_execution(
-            exec_id.clone(),
-            project_id,
-            dag,
-            step_tasks,
-            step_statuses,
-            step_outputs,
-        );
-
-        let actions = scheduler.tick();
-
-        let mut spawns: Vec<&str> = actions
-            .iter()
-            .filter_map(|a| match a {
-                SchedulerAction::SpawnWorker { title, .. } => Some(title.as_str()),
-                _ => None,
-            })
-            .collect();
-        spawns.sort();
-
-        // implement was Running → reset to Ready
-        // test was Pending but design is Done → reevaluate promotes to Ready
-        // Both should spawn
-        assert_eq!(spawns, vec!["Implement", "Test"]);
-
-        // implement should have upstream output from design
-        let impl_action = actions.iter().find(|a| matches!(a, SchedulerAction::SpawnWorker { title, .. } if title == "Implement")).unwrap();
-        if let SchedulerAction::SpawnWorker { upstream_outputs, .. } = impl_action {
-            assert_eq!(upstream_outputs.len(), 1);
-            assert_eq!(upstream_outputs[0].1, "design output");
-        }
     }
 
     #[test]

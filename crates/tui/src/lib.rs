@@ -78,16 +78,3 @@ pub fn poll_event(timeout: Duration) -> io::Result<Option<TermEvent>> {
     Ok(None)
 }
 
-/// Poll for a key press event.
-///
-/// Returns `None` if the timeout expires or the event is not a key press.
-/// Filters to `Press` kind only (ignoring Release/Repeat).
-pub fn poll_key(timeout: Duration) -> io::Result<Option<KeyEvent>> {
-    if event::poll(timeout)?
-        && let Event::Key(key) = event::read()?
-        && key.kind == KeyEventKind::Press
-    {
-        return Ok(Some(key));
-    }
-    Ok(None)
-}

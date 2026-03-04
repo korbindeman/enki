@@ -9,6 +9,8 @@ pub enum DbError {
     Sqlite(#[from] rusqlite::Error),
     #[error("not found: {0}")]
     NotFound(String),
+    #[error("ambiguous short id '{0}': matches {1}")]
+    Ambiguous(String, String),
     #[error("invalid data: {0}")]
     InvalidData(String),
 }
@@ -38,6 +40,7 @@ impl Db {
     fn init_schema(&self) -> Result<()> {
         self.conn.execute_batch(SCHEMA)?;
         self.auto_migrate()?;
+        self.conn.execute_batch(INDEXES)?;
         Ok(())
     }
 
@@ -68,15 +71,16 @@ impl Db {
 
     pub fn insert_task(&self, task: &Task) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO tasks (id, title, description, status, assigned_to, worktree, branch, tier, current_activity, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO tasks (id, session_id, title, description, status, assigned_to, copy_path, branch, tier, current_activity, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 task.id.as_str(),
+                task.session_id,
                 task.title,
                 task.description,
                 task.status.as_str(),
                 task.assigned_to.as_ref().map(Id::as_str),
-                task.worktree,
+                task.copy_path,
                 task.branch,
                 task.tier.map(|t| t.as_str()),
                 task.current_activity,
@@ -98,7 +102,7 @@ impl Db {
     pub fn get_task(&self, id: &Id) -> Result<Task> {
         self.conn
             .query_row(
-                "SELECT id, title, description, status, assigned_to, worktree, branch, tier, current_activity, created_at, updated_at
+                "SELECT id, session_id, title, description, status, assigned_to, copy_path, branch, base_branch, tier, current_activity, created_at, updated_at
                  FROM tasks WHERE id = ?1",
                 params![id.as_str()],
                 row_to_task,
@@ -111,12 +115,59 @@ impl Db {
             })
     }
 
+    /// Resolve a short ID prefix to a full task ID.
+    /// Accepts full IDs, "task-" prefixed shorts, or bare hex prefixes.
+    pub fn resolve_task_id(&self, input: &str, session_id: Option<&str>) -> Result<Id> {
+        // If it looks like a full ID, try direct lookup first.
+        if input.starts_with("task-") && input.len() > 12 {
+            return Ok(Id(input.to_string()));
+        }
+
+        // Normalize: strip "task-" prefix if present to get the hex prefix.
+        let hex_prefix = input.strip_prefix("task-").unwrap_or(input);
+        let pattern = format!("task-{hex_prefix}%");
+
+        let query = if session_id.is_some() {
+            "SELECT id FROM tasks WHERE id LIKE ?1 AND session_id = ?2"
+        } else {
+            "SELECT id FROM tasks WHERE id LIKE ?1"
+        };
+
+        let mut stmt = self.conn.prepare(query)?;
+        let rows: Vec<String> = if let Some(sid) = session_id {
+            stmt.query_map(params![pattern, sid], |row| row.get(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        } else {
+            stmt.query_map(params![pattern], |row| row.get(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+
+        match rows.len() {
+            0 => Err(DbError::NotFound(format!("task matching '{input}'"))),
+            1 => Ok(Id(rows.into_iter().next().unwrap())),
+            _ => {
+                let shorts: Vec<&str> = rows.iter().map(|id| short_id(id)).collect();
+                Err(DbError::Ambiguous(input.to_string(), shorts.join(", ")))
+            }
+        }
+    }
+
     pub fn list_tasks(&self) -> Result<Vec<Task>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, title, description, status, assigned_to, worktree, branch, tier, current_activity, created_at, updated_at
+            "SELECT id, session_id, title, description, status, assigned_to, copy_path, branch, base_branch, tier, current_activity, created_at, updated_at
              FROM tasks ORDER BY created_at",
         )?;
         let rows = stmt.query_map([], row_to_task)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(DbError::Sqlite)
+    }
+
+    pub fn list_session_tasks(&self, session_id: &str) -> Result<Vec<Task>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, title, description, status, assigned_to, copy_path, branch, base_branch, tier, current_activity, created_at, updated_at
+             FROM tasks WHERE session_id = ?1 ORDER BY created_at",
+        )?;
+        let rows = stmt.query_map(params![session_id], row_to_task)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(DbError::Sqlite)
     }
@@ -132,13 +183,14 @@ impl Db {
         Ok(())
     }
 
-    pub fn assign_task(&self, task_id: &Id, agent_id: &Id, worktree: &str, branch: &str) -> Result<()> {
+    pub fn assign_task(&self, task_id: &Id, agent_id: &Id, copy_path: &str, branch: &str, base_branch: &str) -> Result<()> {
         let updated = self.conn.execute(
-            "UPDATE tasks SET assigned_to = ?1, worktree = ?2, branch = ?3, status = 'running', updated_at = ?4 WHERE id = ?5",
+            "UPDATE tasks SET assigned_to = ?1, copy_path = ?2, branch = ?3, base_branch = ?4, status = 'running', updated_at = ?5 WHERE id = ?6",
             params![
                 agent_id.as_str(),
-                worktree,
+                copy_path,
                 branch,
+                base_branch,
                 Utc::now().to_rfc3339(),
                 task_id.as_str(),
             ],
@@ -183,91 +235,75 @@ impl Db {
             .map_err(DbError::Sqlite)
     }
 
-    // --- Agents ---
+    // --- Sessions ---
 
-    pub fn insert_agent(&self, agent: &Agent) -> Result<()> {
+    pub fn insert_session(&self, session: &Session) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO agents (id, acp_session, pid, status, current_task, started_at, last_seen)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                agent.id.as_str(),
-                agent.acp_session,
-                agent.pid,
-                agent.status.as_str(),
-                agent.current_task.as_ref().map(Id::as_str),
-                agent.started_at.to_rfc3339(),
-                agent.last_seen.map(|t| t.to_rfc3339()),
-            ],
+            "INSERT INTO sessions (id, started_at) VALUES (?1, ?2)",
+            params![session.id.as_str(), session.started_at.to_rfc3339()],
         )?;
         Ok(())
     }
 
-    pub fn get_agent(&self, id: &Id) -> Result<Agent> {
-        self.conn
-            .query_row(
-                "SELECT id, acp_session, pid, status, current_task, started_at, last_seen
-                 FROM agents WHERE id = ?1",
-                params![id.as_str()],
-                row_to_agent,
-            )
-            .map_err(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => {
-                    DbError::NotFound(format!("agent {id}"))
-                }
-                other => DbError::Sqlite(other),
-            })
+    pub fn end_session(&self, session_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET ended_at = ?1 WHERE id = ?2",
+            params![Utc::now().to_rfc3339(), session_id],
+        )?;
+        Ok(())
     }
 
-    pub fn update_agent_status(&self, id: &Id, status: AgentStatus) -> Result<()> {
-        let updated = self.conn.execute(
-            "UPDATE agents SET status = ?1, last_seen = ?2 WHERE id = ?3",
-            params![status.as_str(), Utc::now().to_rfc3339(), id.as_str()],
-        )?;
-        if updated == 0 {
-            return Err(DbError::NotFound(format!("agent {id}")));
+    pub fn get_latest_session(&self) -> Result<Option<Session>> {
+        let result = self.conn.query_row(
+            "SELECT id, started_at, ended_at FROM sessions ORDER BY started_at DESC LIMIT 1",
+            [],
+            row_to_session,
+        );
+        match result {
+            Ok(s) => Ok(Some(s)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(DbError::Sqlite(e)),
         }
-        Ok(())
     }
 
-    pub fn update_agent_last_seen(&self, id: &Id) -> Result<()> {
-        let updated = self.conn.execute(
-            "UPDATE agents SET last_seen = ?1 WHERE id = ?2",
-            params![Utc::now().to_rfc3339(), id.as_str()],
-        )?;
-        if updated == 0 {
-            return Err(DbError::NotFound(format!("agent {id}")));
-        }
-        Ok(())
-    }
-
-    pub fn list_agents(&self) -> Result<Vec<Agent>> {
+    pub fn list_sessions(&self) -> Result<Vec<Session>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, acp_session, pid, status, current_task, started_at, last_seen
-             FROM agents ORDER BY started_at",
+            "SELECT id, started_at, ended_at FROM sessions ORDER BY started_at DESC",
         )?;
-        let rows = stmt.query_map([], row_to_agent)?;
+        let rows = stmt.query_map([], row_to_session)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(DbError::Sqlite)
     }
 
-    pub fn list_active_agents(&self) -> Result<Vec<Agent>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, acp_session, pid, status, current_task, started_at, last_seen
-             FROM agents WHERE status IN ('busy', 'stuck') ORDER BY started_at",
+    /// Mark all in-flight tasks for a session as abandoned.
+    pub fn abandon_session_tasks(&self, session_id: &str) -> Result<u32> {
+        let updated = self.conn.execute(
+            "UPDATE tasks SET status = 'abandoned', updated_at = ?1
+             WHERE session_id = ?2 AND status IN ('pending', 'running', 'paused')",
+            params![Utc::now().to_rfc3339(), session_id],
         )?;
-        let rows = stmt.query_map([], row_to_agent)?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(DbError::Sqlite)
+        Ok(updated as u32)
+    }
+
+    /// Mark all in-flight merge requests for a session as failed.
+    pub fn abandon_session_merges(&self, session_id: &str) -> Result<u32> {
+        let updated = self.conn.execute(
+            "UPDATE merge_requests SET status = 'failed'
+             WHERE session_id = ?1 AND status IN ('queued', 'processing', 'rebasing', 'verifying')",
+            params![session_id],
+        )?;
+        Ok(updated as u32)
     }
 
     // --- Executions ---
 
     pub fn insert_execution(&self, exec: &Execution) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO executions (id, status, created_at)
-             VALUES (?1, ?2, ?3)",
+            "INSERT INTO executions (id, session_id, status, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
             params![
                 exec.id.as_str(),
+                exec.session_id,
                 exec.status.as_str(),
                 exec.created_at.to_rfc3339(),
             ],
@@ -294,6 +330,32 @@ impl Db {
         Ok(())
     }
 
+    pub fn save_dag(&self, execution_id: &Id, dag: &crate::dag::Dag) -> Result<()> {
+        let json = serde_json::to_string(dag)
+            .map_err(|e| DbError::InvalidData(format!("serialize dag: {e}")))?;
+        self.conn.execute(
+            "UPDATE executions SET dag = ?1 WHERE id = ?2",
+            params![json, execution_id.as_str()],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_dag(&self, execution_id: &Id) -> Result<Option<crate::dag::Dag>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT dag FROM executions WHERE id = ?1",
+        )?;
+        let json: Option<String> = stmt.query_row(params![execution_id.as_str()], |row| row.get(0))
+            .map_err(DbError::Sqlite)?;
+        match json {
+            Some(s) => {
+                let dag: crate::dag::Dag = serde_json::from_str(&s)
+                    .map_err(|e| DbError::InvalidData(format!("deserialize dag: {e}")))?;
+                Ok(Some(dag))
+            }
+            None => Ok(None),
+        }
+    }
+
     pub fn get_execution_steps(&self, execution_id: &Id) -> Result<Vec<(String, Id)>> {
         let mut stmt = self.conn.prepare(
             "SELECT step_id, task_id FROM execution_steps WHERE execution_id = ?1",
@@ -305,14 +367,24 @@ impl Db {
             .map_err(DbError::Sqlite)
     }
 
-    pub fn get_running_executions(&self) -> Result<Vec<Execution>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, status, created_at
-             FROM executions WHERE status = 'running'",
-        )?;
-        let rows = stmt.query_map([], row_to_execution)?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(DbError::Sqlite)
+    pub fn get_running_executions(&self, session_id: Option<&str>) -> Result<Vec<Execution>> {
+        if let Some(sid) = session_id {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, session_id, status, created_at
+                 FROM executions WHERE status = 'running' AND session_id = ?1",
+            )?;
+            let rows = stmt.query_map(params![sid], row_to_execution)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(DbError::Sqlite)
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, session_id, status, created_at
+                 FROM executions WHERE status = 'running'",
+            )?;
+            let rows = stmt.query_map([], row_to_execution)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(DbError::Sqlite)
+        }
     }
 
     pub fn get_execution_for_task(&self, task_id: &Id) -> Result<Option<(Id, String)>> {
@@ -352,14 +424,15 @@ impl Db {
         }
     }
 
-    pub fn get_orphan_ready_tasks(&self) -> Result<Vec<Task>> {
+    pub fn get_orphan_ready_tasks(&self, session_id: &str) -> Result<Vec<Task>> {
         let mut stmt = self.conn.prepare(
-            "SELECT t.id, t.title, t.description, t.status, t.assigned_to, t.worktree, t.branch, t.tier, t.current_activity, t.created_at, t.updated_at
+            "SELECT t.id, t.session_id, t.title, t.description, t.status, t.assigned_to, t.copy_path, t.branch, t.base_branch, t.tier, t.current_activity, t.created_at, t.updated_at
              FROM tasks t
-             WHERE t.status = 'ready'
+             WHERE t.status = 'pending'
+             AND t.session_id = ?1
              AND t.id NOT IN (SELECT es.task_id FROM execution_steps es)"
         )?;
-        let tasks = stmt.query_map([], |row| row_to_task(row))?
+        let tasks = stmt.query_map(params![session_id], |row| row_to_task(row))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(tasks)
     }
@@ -468,15 +541,6 @@ impl Db {
         }
     }
 
-    pub fn reset_stuck_merge_requests(&self) -> Result<u32> {
-        let updated = self.conn.execute(
-            "UPDATE merge_requests SET status = 'queued', started_at = NULL
-             WHERE status IN ('processing', 'rebasing', 'verifying')",
-            [],
-        )?;
-        Ok(updated as u32)
-    }
-
     // --- Messages ---
 
     pub fn insert_message(&self, msg: &Message) -> Result<()> {
@@ -514,12 +578,6 @@ impl Db {
         let rows = stmt.query_map(params![to_addr], row_to_message)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(DbError::Sqlite)
-    }
-
-    /// List messages for a broadcast address pattern (e.g., "@workers") by querying all messages
-    /// sent to that address.
-    pub fn list_broadcast_messages(&self, addr: &str, unread_only: bool) -> Result<Vec<Message>> {
-        self.list_messages(addr, unread_only)
     }
 
     pub fn get_message(&self, id: &str) -> Result<Message> {
@@ -588,42 +646,40 @@ fn parse_opt_dt(s: Option<String>) -> Option<DateTime<Utc>> {
 }
 
 fn row_to_task(row: &Row) -> rusqlite::Result<Task> {
-    let status_str: String = row.get(3)?;
-    let tier_str: Option<String> = row.get(7)?;
+    let status_str: String = row.get(4)?;
+    let tier_str: Option<String> = row.get(9)?;
     Ok(Task {
         id: Id(row.get(0)?),
-        title: row.get(1)?,
-        description: row.get(2)?,
-        status: TaskStatus::from_str(&status_str).unwrap_or(TaskStatus::Open),
-        assigned_to: row.get::<_, Option<String>>(4)?.map(Id),
-        worktree: row.get(5)?,
-        branch: row.get(6)?,
+        session_id: row.get(1)?,
+        title: row.get(2)?,
+        description: row.get(3)?,
+        status: TaskStatus::from_str(&status_str).unwrap_or(TaskStatus::Pending),
+        assigned_to: row.get::<_, Option<String>>(5)?.map(Id),
+        copy_path: row.get(6)?,
+        branch: row.get(7)?,
+        base_branch: row.get(8)?,
         tier: tier_str.and_then(|s| Tier::from_str(&s)),
-        current_activity: row.get(8)?,
-        created_at: parse_dt(row.get(9)?),
-        updated_at: parse_dt(row.get(10)?),
+        current_activity: row.get(10)?,
+        created_at: parse_dt(row.get(11)?),
+        updated_at: parse_dt(row.get(12)?),
     })
 }
 
-fn row_to_agent(row: &Row) -> rusqlite::Result<Agent> {
-    let status_str: String = row.get(3)?;
-    Ok(Agent {
+fn row_to_session(row: &Row) -> rusqlite::Result<Session> {
+    Ok(Session {
         id: Id(row.get(0)?),
-        acp_session: row.get(1)?,
-        pid: row.get(2)?,
-        status: AgentStatus::from_str(&status_str).unwrap_or(AgentStatus::Idle),
-        current_task: row.get::<_, Option<String>>(4)?.map(Id),
-        started_at: parse_dt(row.get(5)?),
-        last_seen: parse_opt_dt(row.get(6)?),
+        started_at: parse_dt(row.get(1)?),
+        ended_at: parse_opt_dt(row.get(2)?),
     })
 }
 
 fn row_to_execution(row: &Row) -> rusqlite::Result<Execution> {
-    let status_str: String = row.get(1)?;
+    let status_str: String = row.get(2)?;
     Ok(Execution {
         id: Id(row.get(0)?),
+        session_id: row.get(1)?,
         status: ExecutionStatus::from_str(&status_str).unwrap_or(ExecutionStatus::Running),
-        created_at: parse_dt(row.get(2)?),
+        created_at: parse_dt(row.get(3)?),
     })
 }
 
@@ -780,14 +836,22 @@ fn sanitize_column_def(def: &str) -> String {
 // --- Schema ---
 
 const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS sessions (
+    id          TEXT PRIMARY KEY,
+    started_at  TEXT NOT NULL,
+    ended_at    TEXT
+);
+
 CREATE TABLE IF NOT EXISTS tasks (
     id          TEXT PRIMARY KEY,
+    session_id  TEXT,
     title       TEXT NOT NULL,
     description TEXT,
     status      TEXT NOT NULL DEFAULT 'open',
     assigned_to TEXT,
-    worktree    TEXT,
+    copy_path   TEXT,
     branch      TEXT,
+    base_branch TEXT,
     tier        TEXT,
     current_activity TEXT,
     created_at  TEXT NOT NULL,
@@ -802,7 +866,9 @@ CREATE TABLE IF NOT EXISTS task_dependencies (
 
 CREATE TABLE IF NOT EXISTS executions (
     id          TEXT PRIMARY KEY,
+    session_id  TEXT,
     status      TEXT NOT NULL DEFAULT 'running',
+    dag         TEXT,
     created_at  TEXT NOT NULL
 );
 
@@ -813,18 +879,9 @@ CREATE TABLE IF NOT EXISTS execution_steps (
     PRIMARY KEY (execution_id, step_id)
 );
 
-CREATE TABLE IF NOT EXISTS agents (
-    id          TEXT PRIMARY KEY,
-    acp_session TEXT,
-    pid         INTEGER,
-    status      TEXT NOT NULL DEFAULT 'idle',
-    current_task TEXT REFERENCES tasks(id),
-    started_at  TEXT NOT NULL,
-    last_seen   TEXT
-);
-
 CREATE TABLE IF NOT EXISTS merge_requests (
     id          TEXT PRIMARY KEY,
+    session_id  TEXT,
     task_id     TEXT NOT NULL REFERENCES tasks(id),
     branch      TEXT NOT NULL,
     base_branch TEXT NOT NULL DEFAULT 'main',
@@ -858,9 +915,14 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at  TEXT NOT NULL
 );
 
+";
+
+const INDEXES: &str = "
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
-CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status);
+CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(session_id);
+CREATE INDEX IF NOT EXISTS idx_executions_session ON executions(session_id);
 CREATE INDEX IF NOT EXISTS idx_merge_requests_status ON merge_requests(status);
+CREATE INDEX IF NOT EXISTS idx_merge_requests_session ON merge_requests(session_id);
 CREATE INDEX IF NOT EXISTS idx_messages_to_addr ON messages(to_addr);
 CREATE INDEX IF NOT EXISTS idx_messages_unread ON messages(to_addr, read);
 CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id);
@@ -878,12 +940,14 @@ mod tests {
         let now = Utc::now();
         Task {
             id: Id::new("task"),
+            session_id: None,
             title: title.into(),
             description: None,
-            status: TaskStatus::Open,
+            status: TaskStatus::Pending,
             assigned_to: None,
-            worktree: None,
+            copy_path: None,
             branch: None,
+            base_branch: None,
             tier: None,
             current_activity: None,
             created_at: now,
@@ -902,7 +966,7 @@ mod tests {
 
         let loaded = db.get_task(&task.id).unwrap();
         assert_eq!(loaded.title, "Implement auth");
-        assert_eq!(loaded.status, TaskStatus::Open);
+        assert_eq!(loaded.status, TaskStatus::Pending);
         assert_eq!(loaded.tier, Some(Tier::Standard));
 
         db.update_task_status(&task.id, TaskStatus::Running).unwrap();
@@ -935,29 +999,6 @@ mod tests {
     }
 
     #[test]
-    fn agent_crud() {
-        let db = test_db();
-
-        let agent = Agent {
-            id: Id::new("agent"),
-            acp_session: Some("sess_abc123".into()),
-            pid: Some(12345),
-            status: AgentStatus::Idle,
-            current_task: None,
-            started_at: Utc::now(),
-            last_seen: None,
-        };
-        db.insert_agent(&agent).unwrap();
-
-        let loaded = db.get_agent(&agent.id).unwrap();
-        assert_eq!(loaded.pid, Some(12345));
-
-        db.update_agent_status(&agent.id, AgentStatus::Busy).unwrap();
-        let loaded = db.get_agent(&agent.id).unwrap();
-        assert_eq!(loaded.status, AgentStatus::Busy);
-    }
-
-    #[test]
     fn auto_migrate_adds_missing_columns() {
         let conn = Connection::open_in_memory().unwrap();
 
@@ -968,7 +1009,7 @@ mod tests {
                 description TEXT,
                 status TEXT NOT NULL DEFAULT 'open',
                 assigned_to TEXT,
-                worktree TEXT,
+                copy_path TEXT,
                 branch TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL

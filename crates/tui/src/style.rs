@@ -143,6 +143,21 @@ pub(crate) fn write_span(w: &mut impl Write, span: &Span) -> io::Result<()> {
     Ok(())
 }
 
+/// Truncate a string to at most `max` characters, appending "…" if truncated.
+pub fn truncate_str(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = chars[..max.saturating_sub(1)].iter().collect();
+        out.push('…');
+        out
+    }
+}
+
 /// Write a full line (all spans) followed by \r\n.
 pub(crate) fn write_line(w: &mut impl Write, line: &Line) -> io::Result<()> {
     for span in &line.spans {

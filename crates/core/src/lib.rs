@@ -6,4 +6,5 @@ pub mod orchestrator;
 pub mod refinery;
 pub mod scheduler;
 pub mod types;
-pub mod worktree;
+pub mod copy;
+pub mod hashline;

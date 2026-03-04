@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use enki_acp::{AgentManager, SessionUpdate};
 use enki_core::types::{Id, TaskStatus};
-use enki_core::worktree::CopyManager;
+use enki_core::copy::{CopyManager, GitIdentity};
 
 use super::open_db;
 
@@ -12,9 +12,9 @@ pub async fn run(task_id: &str, agent_cmd: &str, agent_args: &str, keep: bool, e
 
     // Load task
     let task = db.get_task(&task_id)?;
-    if task.status != TaskStatus::Open && task.status != TaskStatus::Ready {
+    if task.status != TaskStatus::Pending {
         anyhow::bail!(
-            "task {} is in state '{}', expected 'open' or 'ready'",
+            "task {} is in state '{}', expected 'pending'",
             task_id,
             task.status.as_str()
         );
@@ -25,11 +25,12 @@ pub async fn run(task_id: &str, agent_cmd: &str, agent_args: &str, keep: bool, e
     // Create APFS copy for worker isolation.
     let project_root = super::project_root()?;
     let copies_dir = super::copies_dir()?;
-    let copy_mgr = CopyManager::new(project_root, copies_dir);
+    let git_identity = GitIdentity::from_git_config(&project_root)?;
+    let copy_mgr = CopyManager::new(project_root, copies_dir, git_identity);
 
     let branch = format!("task/{}", task_id);
     println!("creating copy for branch '{}'...", branch);
-    let copy_path = copy_mgr.create_copy(&task_id.0)?;
+    let (copy_path, _base_commit, base_branch) = copy_mgr.create_copy(&task_id.0)?;
     println!("copy: {}", copy_path.display());
 
     // Update task status
@@ -38,6 +39,7 @@ pub async fn run(task_id: &str, agent_cmd: &str, agent_args: &str, keep: bool, e
         &Id("cli-direct".into()),
         copy_path.to_str().unwrap(),
         &branch,
+        &base_branch,
     )?;
 
     // Build the prompt
@@ -56,6 +58,7 @@ pub async fn run(task_id: &str, agent_cmd: &str, agent_args: &str, keep: bool, e
             copy_path.clone(),
             &prompt,
             &enki_bin,
+            &task_id.0,
         ))
         .await;
 
@@ -92,6 +95,7 @@ async fn run_acp_session(
     cwd: PathBuf,
     prompt: &str,
     enki_bin: &std::path::Path,
+    task_id: &str,
 ) -> anyhow::Result<String> {
     let mut mgr = AgentManager::new();
 
@@ -123,7 +127,8 @@ async fn run_acp_session(
         }
     });
 
-    let session_id = mgr.start_session(agent_cmd, agent_args, cwd).await?;
+    let label = format!("run-{task_id}");
+    let session_id = mgr.start_session(agent_cmd, agent_args, cwd, &label).await?;
     let stop_reason = mgr.prompt(&session_id, prompt).await?;
     mgr.kill_session(&session_id);
 
