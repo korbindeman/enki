@@ -1,15 +1,15 @@
-//! Resolve and cache the claude-code-acp agent binary.
+//! Resolve and cache the claude-agent-acp agent binary.
 //!
-//! On first use, installs `@zed-industries/claude-code-acp` via npm into
-//! `~/.enki/agents/claude-code-acp/`. On subsequent launches, reuses the
+//! On first use, installs `@zed-industries/claude-agent-acp` via npm into
+//! `~/.enki/agents/claude-agent-acp/`. On subsequent launches, reuses the
 //! cached install. Returns the `node` binary path and the entry-point script
 //! so callers can spawn `node <script>` directly — no `bunx` overhead.
 
 use std::path::PathBuf;
 use std::process::Command;
 
-const PACKAGE: &str = "@zed-industries/claude-code-acp";
-const ENTRY_POINT: &str = "node_modules/@zed-industries/claude-code-acp/dist/index.js";
+const PACKAGE: &str = "@zed-industries/claude-agent-acp";
+const ENTRY_POINT: &str = "node_modules/@zed-industries/claude-agent-acp/dist/index.js";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ResolveError {
@@ -35,10 +35,10 @@ fn find_node() -> Result<PathBuf, ResolveError> {
     which::which("node").map_err(|_| ResolveError::NodeNotFound)
 }
 
-/// Directory where enki caches agent packages: `~/.enki/agents/claude-code-acp/`
+/// Directory where enki caches agent packages: `~/.enki/agents/claude-agent-acp/`
 fn cache_dir() -> Result<PathBuf, ResolveError> {
     let home = dirs::home_dir().ok_or(ResolveError::NoHomeDir)?;
-    Ok(home.join(".enki").join("agents").join("claude-code-acp"))
+    Ok(home.join(".enki").join("agents").join("claude-agent-acp"))
 }
 
 /// Install the package into the cache directory using npm.
@@ -58,7 +58,7 @@ fn npm_install(cache: &PathBuf) -> Result<(), ResolveError> {
     Ok(())
 }
 
-/// Resolve the claude-code-acp agent command.
+/// Resolve the claude-agent-acp agent command.
 ///
 /// Returns `node <path-to-index.js>` for direct spawning.
 /// Installs the package on first use.

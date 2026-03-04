@@ -9,13 +9,13 @@
 - `Scheduler` — tier-aware (light/standard/heavy) concurrency with per-tier limits. Manages multiple concurrent DAG executions.
 - `Dag` — dependency graph with parallel execution, failure cascade, pause/resume/cancel with transitive cascade.
 - `MonitorState` — worker health monitoring with stale detection and retry budgets.
-- `Db` — SQLite with WAL mode, auto-migration, simplified schema (tasks, executions, execution_steps, dependencies, agents, merge_requests).
-- `WorktreeManager` — git worktree lifecycle: bare repo init, create/remove worktrees, sync, merge (fast-forward + merge commit for diverged histories).
-- `Refinery` — merge queue processor.
+- `Db` — SQLite with WAL mode, auto-migration, simplified schema (sessions, tasks, executions, execution_steps, dependencies, merge_requests, messages).
+- `CopyManager` — copy-on-write filesystem cloning for worker isolation (APFS clonefile on macOS, reflink on Linux).
+- `Refinery` — merge queue processor (fetch branch from copy, fast-forward or merge commit).
 
 **CLI:**
-- `enki init` — creates `.enki/` directory with db, bare repo
-- `enki run <task-id>` — manually runs one task via ACP in a worktree
+- `enki init` — creates `.enki/` directory with db
+- `enki run <task-id>` — manually runs one task via ACP in an isolated copy
 - `enki stop` — stops all running workers
 - `enki mcp` — MCP stdio server with full tool set (status, task CRUD, execution create, pause, cancel, retry, stop)
 - `enki doctor` — health checks
@@ -46,14 +46,14 @@ Orchestration logic was extracted from the 1,782-line coordinator into a testabl
 | # | What | Why |
 |---|------|-----|
 | 1.1 | **Per-worker status in TUI** — sidebar showing each worker's current tool call and latest output | Workers are currently a black box during execution |
-| 1.2 | **Merge conflict recovery** — on conflict, leave worktree intact, allow retry with rebase | Conflicts are currently permanent failures |
+| 1.2 | **Merge conflict recovery** — on conflict, leave copy intact, allow retry with rebase | Conflicts are currently permanent failures |
 | 1.3 | **Worker cancellation from TUI** — kill individual workers via keyboard shortcut | Long-running workers can't be stopped individually |
 
 ### Phase 2 — Reliability
 
 | # | What | Why |
 |---|------|-----|
-| 2.1 | **End-to-end integration tests** — spawn real ACP sessions in test worktrees, verify full lifecycle | Core is well-tested but the async glue layer isn't |
+| 2.1 | **End-to-end integration tests** — spawn real ACP sessions in test copies, verify full lifecycle | Core is well-tested but the async glue layer isn't |
 | 2.2 | **Graceful shutdown** — on SIGINT, finish in-progress merges, kill workers cleanly, persist state | Currently just drops everything |
 | 2.3 | **Rate limit backoff** — detect ACP rate limit errors and queue tasks instead of failing | Running 5+ workers hits Claude Max limits |
 

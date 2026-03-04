@@ -1,11 +1,37 @@
 use std::time::Instant;
 
+use crate::dag::EdgeCondition;
 use crate::refinery::MergeOutcome;
 use crate::types::*;
 
 // ---------------------------------------------------------------------------
 // Input types
 // ---------------------------------------------------------------------------
+
+/// A dependency reference with an edge condition.
+#[derive(Debug, Clone)]
+pub struct StepDep {
+    pub step_id: String,
+    pub condition: EdgeCondition,
+}
+
+impl From<String> for StepDep {
+    fn from(s: String) -> Self {
+        StepDep {
+            step_id: s,
+            condition: EdgeCondition::Merged,
+        }
+    }
+}
+
+impl From<&str> for StepDep {
+    fn from(s: &str) -> Self {
+        StepDep {
+            step_id: s.to_string(),
+            condition: EdgeCondition::Merged,
+        }
+    }
+}
 
 /// A step definition for creating a multi-step execution.
 #[derive(Debug, Clone)]
@@ -14,7 +40,8 @@ pub struct StepDef {
     pub title: String,
     pub description: String,
     pub tier: Tier,
-    pub needs: Vec<String>,
+    pub needs: Vec<StepDep>,
+    pub checkpoint: bool,
 }
 
 /// Result reported by the CLI layer after a worker finishes.
@@ -83,6 +110,11 @@ pub enum Command {
     },
     /// Discover new executions/tasks in DB created by external processes (MCP).
     DiscoverFromDb,
+    /// Add steps to a running execution.
+    AddSteps {
+        execution_id: Id,
+        steps: Vec<StepDef>,
+    },
     /// Check for signal files in the events directory.
     CheckSignals,
 }
@@ -147,6 +179,13 @@ pub enum Event {
         title: String,
         attempt: u32,
         max: u32,
+    },
+    /// A checkpoint node completed — coordinator should review.
+    CheckpointReached {
+        execution_id: String,
+        step_id: String,
+        title: String,
+        output: Option<String>,
     },
     /// Informational status message for the coordinator agent.
     StatusMessage(String),

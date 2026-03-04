@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::Utc;
-use enki_core::orchestrator::StepDef;
+use enki_core::dag::EdgeCondition;
+use enki_core::orchestrator::{StepDef, StepDep};
 use enki_core::types::{
     Execution, ExecutionStatus, Id, Message, MessagePriority, MessageType, Task, TaskStatus, Tier,
 };
@@ -100,6 +101,25 @@ pub(super) fn tool_task_list() -> Result<String, String> {
     Ok(lines.join("\n"))
 }
 
+/// Parse a step dependency from JSON — accepts bare string or {"step": "...", "condition": "..."}.
+fn parse_step_dep(v: &Value) -> Option<StepDep> {
+    if let Some(s) = v.as_str() {
+        Some(StepDep::from(s.to_string()))
+    } else if let Some(step_id) = v.get("step").and_then(|s| s.as_str()) {
+        let condition = match v.get("condition").and_then(|c| c.as_str()) {
+            Some("completed") => EdgeCondition::Completed,
+            Some("started") => EdgeCondition::Started,
+            _ => EdgeCondition::Merged,
+        };
+        Some(StepDep {
+            step_id: step_id.to_string(),
+            condition,
+        })
+    } else {
+        None
+    }
+}
+
 pub(super) fn tool_execution_create(args: &Value) -> Result<String, String> {
     let steps = args["steps"]
         .as_array()
@@ -129,14 +149,15 @@ pub(super) fn tool_execution_create(args: &Value) -> Result<String, String> {
         let tier_str = step["tier"].as_str().unwrap_or("heavy");
         let tier =
             Tier::from_str(tier_str).ok_or_else(|| format!("invalid tier: {tier_str}"))?;
-        let needs: Vec<String> = step["needs"]
+        let needs: Vec<StepDep> = step["needs"]
             .as_array()
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
+                    .filter_map(|v| parse_step_dep(v))
                     .collect()
             })
             .unwrap_or_default();
+        let checkpoint = step["checkpoint"].as_bool().unwrap_or(false);
 
         if !step_ids.insert(id.clone()) {
             return Err(format!("duplicate step id: {id}"));
@@ -147,19 +168,20 @@ pub(super) fn tool_execution_create(args: &Value) -> Result<String, String> {
             description,
             tier,
             needs,
+            checkpoint,
         });
     }
 
     // Validate dependency references.
     for def in &defs {
         for dep in &def.needs {
-            if !step_ids.contains(dep) {
+            if !step_ids.contains(&dep.step_id) {
                 return Err(format!(
                     "step '{}' depends on unknown step '{}'",
-                    def.id, dep
+                    def.id, dep.step_id
                 ));
             }
-            if dep == &def.id {
+            if dep.step_id == def.id {
                 return Err(format!("step '{}' cannot depend on itself", def.id));
             }
         }
@@ -207,8 +229,8 @@ pub(super) fn tool_execution_create(args: &Value) -> Result<String, String> {
     // Wire up dependencies (task-level).
     for def in &defs {
         let task_id = &step_task_ids[&def.id];
-        for dep_step_id in &def.needs {
-            let dep_task_id = &step_task_ids[dep_step_id];
+        for dep in &def.needs {
+            let dep_task_id = &step_task_ids[&dep.step_id];
             db.insert_dependency(task_id, dep_task_id)
                 .map_err(|e| e.to_string())?;
         }
@@ -224,7 +246,8 @@ pub(super) fn tool_execution_create(args: &Value) -> Result<String, String> {
         let deps = if def.needs.is_empty() {
             String::new()
         } else {
-            format!(" (needs: {})", def.needs.join(", "))
+            let dep_strs: Vec<String> = def.needs.iter().map(|d| d.step_id.clone()).collect();
+            format!(" (needs: {})", dep_strs.join(", "))
         };
         lines.push(format!(
             "  {} → {} | {} | {}{}",
@@ -232,6 +255,176 @@ pub(super) fn tool_execution_create(args: &Value) -> Result<String, String> {
         ));
     }
     Ok(lines.join("\n"))
+}
+
+pub(super) fn tool_execution_add_steps(args: &Value) -> Result<String, String> {
+    let exec_id_str = args["execution_id"]
+        .as_str()
+        .ok_or("missing required parameter: execution_id")?;
+    let steps = args["steps"]
+        .as_array()
+        .ok_or("missing required parameter: steps")?;
+
+    if steps.is_empty() {
+        return Err("steps array must not be empty".into());
+    }
+
+    let db = open_db().map_err(|e| e.to_string())?;
+    let exec_id = Id(exec_id_str.to_string());
+
+    // Load existing step IDs to validate deps.
+    let existing_steps = db
+        .get_execution_steps(&exec_id)
+        .map_err(|e| e.to_string())?;
+    let existing_step_ids: HashSet<String> = existing_steps.iter().map(|(sid, _)| sid.clone()).collect();
+
+    // Parse new steps.
+    let mut defs: Vec<StepDef> = Vec::new();
+    let mut new_step_ids: HashSet<String> = HashSet::new();
+
+    for step in steps {
+        let id = step["id"]
+            .as_str()
+            .ok_or("each step must have an 'id'")?
+            .to_string();
+        let title = step["title"]
+            .as_str()
+            .ok_or("each step must have a 'title'")?
+            .to_string();
+        let description = step["description"]
+            .as_str()
+            .ok_or("each step must have a 'description'")?
+            .to_string();
+        let tier_str = step["tier"].as_str().unwrap_or("heavy");
+        let tier =
+            Tier::from_str(tier_str).ok_or_else(|| format!("invalid tier: {tier_str}"))?;
+        let needs: Vec<StepDep> = step["needs"]
+            .as_array()
+            .map(|arr| arr.iter().filter_map(|v| parse_step_dep(v)).collect())
+            .unwrap_or_default();
+        let checkpoint = step["checkpoint"].as_bool().unwrap_or(false);
+
+        if existing_step_ids.contains(&id) {
+            return Err(format!("step id '{id}' already exists in this execution"));
+        }
+        if !new_step_ids.insert(id.clone()) {
+            return Err(format!("duplicate step id: {id}"));
+        }
+        defs.push(StepDef {
+            id,
+            title,
+            description,
+            tier,
+            needs,
+            checkpoint,
+        });
+    }
+
+    // Validate deps reference existing or new steps.
+    let all_ids: HashSet<String> = existing_step_ids.union(&new_step_ids).cloned().collect();
+    for def in &defs {
+        for dep in &def.needs {
+            if !all_ids.contains(&dep.step_id) {
+                return Err(format!(
+                    "step '{}' depends on unknown step '{}'",
+                    def.id, dep.step_id
+                ));
+            }
+            if dep.step_id == def.id {
+                return Err(format!("step '{}' cannot depend on itself", def.id));
+            }
+        }
+    }
+
+    // Write tasks + steps + deps to DB.
+    let session_id = std::env::var("ENKI_SESSION_ID").ok();
+    let now = Utc::now();
+    let mut step_task_ids: HashMap<String, Id> = HashMap::new();
+
+    // Map existing step_id → task_id for dep wiring.
+    let existing_task_map: HashMap<String, Id> = existing_steps.into_iter().collect();
+
+    for def in &defs {
+        let task_id = Id::new("task");
+        let task = Task {
+            id: task_id.clone(),
+            session_id: session_id.clone(),
+            title: def.title.clone(),
+            description: Some(def.description.clone()),
+            status: TaskStatus::Pending,
+            assigned_to: None,
+            copy_path: None,
+            branch: None,
+            base_branch: None,
+            tier: Some(def.tier),
+            current_activity: None,
+            created_at: now,
+            updated_at: now,
+        };
+        db.insert_task(&task).map_err(|e| e.to_string())?;
+        db.insert_execution_step(&exec_id, &def.id, &task_id)
+            .map_err(|e| e.to_string())?;
+        step_task_ids.insert(def.id.clone(), task_id);
+    }
+
+    // Wire dependencies.
+    let all_task_map: HashMap<String, Id> = existing_task_map
+        .into_iter()
+        .chain(step_task_ids.iter().map(|(k, v)| (k.clone(), v.clone())))
+        .collect();
+
+    for def in &defs {
+        let task_id = &step_task_ids[&def.id];
+        for dep in &def.needs {
+            if let Some(dep_task_id) = all_task_map.get(&dep.step_id) {
+                db.insert_dependency(task_id, dep_task_id)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+    }
+
+    write_signal_file(&json!({
+        "type": "steps_added",
+        "execution_id": exec_id.as_str()
+    }))?;
+
+    let mut lines = vec![format!("added {} steps to execution {}", defs.len(), exec_id.short())];
+    for def in &defs {
+        let task_id = &step_task_ids[&def.id];
+        let deps = if def.needs.is_empty() {
+            String::new()
+        } else {
+            let dep_strs: Vec<String> = def.needs.iter().map(|d| d.step_id.clone()).collect();
+            format!(" (needs: {})", dep_strs.join(", "))
+        };
+        lines.push(format!(
+            "  {} → {} | pending | {}{}",
+            def.id, task_id.short(), def.title, deps
+        ));
+    }
+    Ok(lines.join("\n"))
+}
+
+pub(super) fn tool_resume(args: &Value) -> Result<String, String> {
+    let exec_id_str = args["execution_id"]
+        .as_str()
+        .ok_or("missing required parameter: execution_id")?;
+    let step_id = args["step_id"].as_str();
+
+    let mut signal = json!({
+        "type": "resume",
+        "execution_id": exec_id_str
+    });
+    if let Some(sid) = step_id {
+        signal["step_id"] = json!(sid);
+    }
+    write_signal_file(&signal)?;
+
+    if let Some(sid) = step_id {
+        Ok(format!("Resume signal sent for step '{sid}' in execution {exec_id_str}."))
+    } else {
+        Ok(format!("Resume signal sent for execution {exec_id_str}."))
+    }
 }
 
 pub(super) fn tool_task_retry(args: &Value) -> Result<String, String> {
@@ -356,7 +549,7 @@ pub(super) fn tool_edit_file(args: &Value) -> Result<String, String> {
     std::fs::write(path, &result)
         .map_err(|e| format!("failed to write {path}: {e}"))?;
 
-    Ok(format!("ok"))
+    Ok("ok".to_string())
 }
 
 // --- Mail helpers ---

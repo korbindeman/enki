@@ -27,7 +27,7 @@ enum Cmd {
         #[arg(long, default_value = "bunx")]
         agent: String,
         /// Additional agent args.
-        #[arg(long, default_value = "@zed-industries/claude-code-acp")]
+        #[arg(long, default_value = "@zed-industries/claude-agent-acp")]
         agent_args: String,
         /// Keep the copy after the run instead of cleaning it up.
         #[arg(long)]

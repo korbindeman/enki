@@ -55,12 +55,11 @@ pub async fn doctor() -> anyhow::Result<()> {
                     .args(["rev-parse", "--verify", candidate])
                     .current_dir(&project_root)
                     .output();
-                if let Ok(o) = out {
-                    if o.status.success() {
+                if let Ok(o) = out
+                    && o.status.success() {
                         check_pass(&format!("default branch: {candidate}"));
                         break;
                     }
-                }
             }
         }
         _ => {

@@ -31,6 +31,12 @@ pub struct AgentManager {
     extra_env: Rc<HashMap<String, String>>,
 }
 
+impl Default for AgentManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AgentManager {
     pub fn new() -> Self {
         Self {
@@ -56,7 +62,7 @@ impl AgentManager {
     /// Spawn a new agent process, create a session, and return the session ID.
     ///
     /// `agent_cmd` is the command to run (e.g., "claude" or "npx").
-    /// `agent_args` are additional arguments (e.g., ["--acp"] or ["@zed-industries/claude-code-acp"]).
+    /// `agent_args` are additional arguments (e.g., ["--acp"] or ["@zed-industries/claude-agent-acp"]).
     /// `cwd` is the working directory for the session (typically a copy path).
     pub async fn start_session(
         &self,

@@ -40,7 +40,7 @@ pub async fn init() -> anyhow::Result<()> {
             .current_dir(&cwd)
             .output();
         let mut cmd = Command::new("git");
-        cmd.args(["commit", "--allow-empty", "-m", "enki: initialize project", "--no-verify"]);
+        cmd.args(["commit", "--allow-empty", "-m", "initialize project\n\ncreated by enki", "--no-verify"]);
         git_identity.apply(&mut cmd);
         let result = cmd.current_dir(&cwd).output();
         match result {

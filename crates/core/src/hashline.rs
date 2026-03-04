@@ -99,15 +99,14 @@ pub fn strip_hashlines(tagged: &str) -> String {
         if let Some(pos) = line.find('|') {
             let prefix = &line[..pos];
             // Verify it looks like a hashline prefix (digits:hex)
-            if let Some((num_part, hash_part)) = prefix.trim_start().split_once(':') {
-                if num_part.chars().all(|c| c.is_ascii_digit())
+            if let Some((num_part, hash_part)) = prefix.trim_start().split_once(':')
+                && num_part.chars().all(|c| c.is_ascii_digit())
                     && hash_part.len() == 2
                     && hash_part.chars().all(|c| c.is_ascii_hexdigit())
                 {
                     output.push_str(&line[pos + 1..]);
                     continue;
                 }
-            }
         }
         output.push_str(line);
     }
@@ -137,8 +136,8 @@ pub fn verify_hashlines(tagged: &str, current_content: &str) -> Result<(), Strin
                 } else {
                     None
                 }
-            }) {
-                if let Some((line_num, expected_hash)) = parse_hashline(&ref_str) {
+            })
+                && let Some((line_num, expected_hash)) = parse_hashline(&ref_str) {
                     if line_num == 0 || line_num as usize > current_hashlines.len() {
                         return Err(format!(
                             "line {} out of range (file has {} lines)",
@@ -156,7 +155,6 @@ pub fn verify_hashlines(tagged: &str, current_content: &str) -> Result<(), Strin
                         ));
                     }
                 }
-            }
         }
     }
     Ok(())

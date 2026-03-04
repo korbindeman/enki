@@ -56,6 +56,12 @@ pub struct WorkerPanel {
     visible: bool,
 }
 
+impl Default for WorkerPanel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WorkerPanel {
     pub fn new() -> Self {
         Self {

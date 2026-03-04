@@ -257,7 +257,7 @@ impl acp::Client for EnkiClient {
         cmd.stdin(std::process::Stdio::null());
 
         let child = cmd.spawn().map_err(|e| {
-            acp::Error::into_internal_error(std::io::Error::new(std::io::ErrorKind::Other, format!("failed to spawn terminal: {e}")))
+            acp::Error::into_internal_error(std::io::Error::other(format!("failed to spawn terminal: {e}")))
         })?;
 
         let id_num = self.next_terminal_id.get();
@@ -338,6 +338,7 @@ impl acp::Client for EnkiClient {
         Ok(acp::WaitForTerminalExitResponse::new(exit_status))
     }
 
+    #[allow(clippy::await_holding_refcell_ref)]
     async fn kill_terminal_command(
         &self,
         args: acp::KillTerminalCommandRequest,

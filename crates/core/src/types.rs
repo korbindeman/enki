@@ -34,7 +34,7 @@ impl std::fmt::Display for Id {
 
 /// Extract short display form from an ID string: "task-a1b2c3d4" → "a1b2"
 pub fn short_id(id: &str) -> &str {
-    if let Some(hex) = id.split('-').last() {
+    if let Some(hex) = id.split('-').next_back() {
         &hex[..4.min(hex.len())]
     } else {
         id
@@ -70,6 +70,7 @@ impl TaskStatus {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "pending" => Some(Self::Pending),
@@ -104,6 +105,7 @@ impl Tier {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "light" => Some(Self::Light),
@@ -139,6 +141,7 @@ impl MergeStatus {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "queued" => Some(Self::Queued),
@@ -174,6 +177,7 @@ impl ExecutionStatus {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "running" => Some(Self::Running),
@@ -205,6 +209,7 @@ impl MessagePriority {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "low" => Some(Self::Low),
@@ -245,6 +250,7 @@ impl MessageType {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "info" => Some(Self::Info),

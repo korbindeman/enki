@@ -100,7 +100,7 @@ fn handle_tools_list(id: Option<Value>, role: &str) -> Value {
     let tools: Vec<Value> = all_tool_definitions()
         .into_iter()
         .filter(|t| {
-            t["name"].as_str().map_or(false, |n| allowed.contains(&n))
+            t["name"].as_str().is_some_and(|n| allowed.contains(&n))
         })
         .collect();
 
@@ -133,6 +133,8 @@ fn handle_tools_call(id: Option<Value>, params: &Value, role: &str, task_id: Opt
         "enki_task_create" => tool_task_create(args),
         "enki_task_list" => tool_task_list(),
         "enki_execution_create" => tool_execution_create(args),
+        "enki_execution_add_steps" => tool_execution_add_steps(args),
+        "enki_resume" => tool_resume(args),
         "enki_stop_all" => tool_stop_all(),
         "enki_task_retry" => tool_task_retry(args),
         "enki_pause" => tool_pause(args),
@@ -150,12 +152,11 @@ fn handle_tools_call(id: Option<Value>, params: &Value, role: &str, task_id: Opt
     let result = if tool_name == "enki_worker_report" {
         match result {
             Ok(mut text) => {
-                if let Ok(notice) = mail_notice(&my_addr) {
-                    if !notice.is_empty() {
+                if let Ok(notice) = mail_notice(&my_addr)
+                    && !notice.is_empty() {
                         text.push_str("\n\n---\n");
                         text.push_str(&notice);
                     }
-                }
                 Ok(text)
             }
             err => err,

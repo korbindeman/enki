@@ -71,8 +71,24 @@ pub(super) fn all_tool_definitions() -> Vec<Value> {
                                 },
                                 "needs": {
                                     "type": "array",
-                                    "items": { "type": "string" },
-                                    "description": "Step IDs this step depends on. Those steps must complete before this one starts."
+                                    "items": {
+                                        "oneOf": [
+                                            { "type": "string" },
+                                            {
+                                                "type": "object",
+                                                "properties": {
+                                                    "step": { "type": "string", "description": "Step ID to depend on." },
+                                                    "condition": { "type": "string", "enum": ["merged", "completed", "started"], "description": "When to unblock: 'merged' (default, merge landed), 'completed' (worker finished), 'started' (worker began running)." }
+                                                },
+                                                "required": ["step"]
+                                            }
+                                        ]
+                                    },
+                                    "description": "Dependencies. Bare string = wait for merge. Object with 'condition' for finer control."
+                                },
+                                "checkpoint": {
+                                    "type": "boolean",
+                                    "description": "If true, the execution pauses after this step's merge lands so the coordinator can review output and optionally add follow-up steps."
                                 }
                             },
                             "required": ["id", "title", "description"]
@@ -81,6 +97,86 @@ pub(super) fn all_tool_definitions() -> Vec<Value> {
                     }
                 },
                 "required": ["steps"]
+            }
+        }),
+        json!({
+            "name": "enki_execution_add_steps",
+            "description": "Add new steps to a running execution. New steps can depend on existing steps or other new steps. The execution must exist and not be completed/aborted. If the execution is paused (e.g. at a checkpoint), add steps first then call enki_resume.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "execution_id": {
+                        "type": "string",
+                        "description": "ID of the execution to add steps to."
+                    },
+                    "steps": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {
+                                    "type": "string",
+                                    "description": "Unique step identifier (must not conflict with existing steps)."
+                                },
+                                "title": {
+                                    "type": "string",
+                                    "description": "Short task title."
+                                },
+                                "description": {
+                                    "type": "string",
+                                    "description": "Detailed task description."
+                                },
+                                "tier": {
+                                    "type": "string",
+                                    "enum": ["light", "standard", "heavy"],
+                                    "description": "Complexity tier. Defaults to 'standard'."
+                                },
+                                "needs": {
+                                    "type": "array",
+                                    "items": {
+                                        "oneOf": [
+                                            { "type": "string" },
+                                            {
+                                                "type": "object",
+                                                "properties": {
+                                                    "step": { "type": "string" },
+                                                    "condition": { "type": "string", "enum": ["merged", "completed", "started"] }
+                                                },
+                                                "required": ["step"]
+                                            }
+                                        ]
+                                    },
+                                    "description": "Dependencies on existing or new steps."
+                                },
+                                "checkpoint": {
+                                    "type": "boolean",
+                                    "description": "If true, pause execution after this step completes for review."
+                                }
+                            },
+                            "required": ["id", "title", "description"]
+                        },
+                        "minItems": 1
+                    }
+                },
+                "required": ["execution_id", "steps"]
+            }
+        }),
+        json!({
+            "name": "enki_resume",
+            "description": "Resume a paused execution. Use after a checkpoint pause, optionally after adding new steps with enki_execution_add_steps.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "execution_id": {
+                        "type": "string",
+                        "description": "ID of the paused execution to resume."
+                    },
+                    "step_id": {
+                        "type": "string",
+                        "description": "Optional step ID. If provided, only that step is resumed."
+                    }
+                },
+                "required": ["execution_id"]
             }
         }),
         json!({

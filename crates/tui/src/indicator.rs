@@ -51,6 +51,12 @@ pub struct Indicator {
     frame: usize,
 }
 
+impl Default for Indicator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Indicator {
     pub fn new() -> Self {
         Self {

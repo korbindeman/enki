@@ -425,8 +425,8 @@ impl Chat {
                         }
                     }
                     TermEvent::MouseDrag { row, .. } => {
-                        if let Some(anchor) = drag_anchor {
-                            if let Some(msg_id) = cx.canvas.message_at_viewport_row(row) {
+                        if let Some(anchor) = drag_anchor
+                            && let Some(msg_id) = cx.canvas.message_at_viewport_row(row) {
                                 let (from, to) = if anchor <= msg_id {
                                     (anchor, msg_id)
                                 } else {
@@ -434,7 +434,6 @@ impl Chat {
                                 };
                                 cx.canvas.select_range(from, to);
                             }
-                        }
                     }
                     TermEvent::MouseUp { .. } => {
                         drag_anchor = None;
@@ -473,6 +472,7 @@ impl Chat {
                             .map(|ac| ac.matches.len())
                             .unwrap_or(0);
 
+                        #[allow(clippy::type_complexity)]
                         let resolve: Option<&dyn Fn(&str) -> Vec<String>> =
                             if self.autocomplete_trigger.is_some() {
                                 Some(&|query| handler.autocomplete(query))

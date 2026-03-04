@@ -435,7 +435,7 @@ impl Db {
              AND t.session_id = ?1
              AND t.id NOT IN (SELECT es.task_id FROM execution_steps es)"
         )?;
-        let tasks = stmt.query_map(params![session_id], |row| row_to_task(row))?
+        let tasks = stmt.query_map(params![session_id], row_to_task)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(tasks)
     }

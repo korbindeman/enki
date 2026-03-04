@@ -111,7 +111,7 @@ pub fn process_merge(
         return MergeOutcome::Failed(format!("checkout temp-merge from {branch}: {e}"));
     }
 
-    if let Err(_) = git(&tmp_dir, &["rebase", default_branch]) {
+    if git(&tmp_dir, &["rebase", default_branch]).is_err() {
         let _ = git(&tmp_dir, &["rebase", "--abort"]);
         return MergeOutcome::Conflicted(format!(
             "rebase of {branch} onto {default_branch} had conflicts"

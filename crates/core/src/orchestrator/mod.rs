@@ -67,6 +67,10 @@ impl Orchestrator {
             Command::Cancel(target) => self.cancel(target),
             Command::StopAll => self.stop_all(),
             Command::MonitorTick { workers } => self.monitor_tick(workers),
+            Command::AddSteps {
+                execution_id,
+                steps,
+            } => self.add_steps(execution_id, steps),
             Command::DiscoverFromDb => self.discover_from_db(),
             Command::CheckSignals => self.check_signals(),
         };
@@ -77,11 +81,10 @@ impl Orchestrator {
     /// Save all active execution DAGs to the database.
     fn persist_dags(&self) {
         for exec_id in self.scheduler.active_executions() {
-            if let Some(dag) = self.scheduler.get_dag(exec_id) {
-                if let Err(e) = self.db.save_dag(&Id(exec_id.to_string()), dag) {
+            if let Some(dag) = self.scheduler.get_dag(exec_id)
+                && let Err(e) = self.db.save_dag(&Id(exec_id.to_string()), dag) {
                     tracing::warn!(execution_id = %exec_id, error = %e, "failed to persist dag");
                 }
-            }
         }
     }
 
@@ -144,8 +147,8 @@ impl Orchestrator {
             let Some(task_id) = task_ids.get(&step.id) else {
                 continue;
             };
-            for dep_step_id in &step.needs {
-                if let Some(dep_task_id) = task_ids.get(dep_step_id) {
+            for dep in &step.needs {
+                if let Some(dep_task_id) = task_ids.get(&dep.step_id) {
                     let _ = self.db.insert_dependency(task_id, dep_task_id);
                 }
             }
@@ -160,11 +163,15 @@ impl Orchestrator {
                     s.title.clone(),
                     s.description.clone(),
                     Some(s.tier),
-                    s.needs.clone(),
+                    s.checkpoint,
+                    s.needs
+                        .iter()
+                        .map(|d| (d.step_id.clone(), d.condition))
+                        .collect::<Vec<_>>(),
                 )
             })
             .collect();
-        let dag = Dag::from_steps(&step_data);
+        let dag = Dag::from_steps_with_edges(&step_data);
 
         // Register with scheduler and tick.
         self.scheduler
@@ -228,6 +235,109 @@ impl Orchestrator {
         self.tick_scheduler()
     }
 
+    fn add_steps(&mut self, execution_id: Id, steps: Vec<StepDef>) -> Vec<Event> {
+        let now = chrono::Utc::now();
+
+        // Look up existing step→task mappings for cross-dep wiring.
+        let existing_steps = match self.db.get_execution_steps(&execution_id) {
+            Ok(s) => s,
+            Err(e) => {
+                return vec![Event::StatusMessage(format!(
+                    "failed to load existing steps: {e}"
+                ))];
+            }
+        };
+        let mut existing_task_ids: HashMap<String, Id> = HashMap::new();
+        for (step_id, task_id) in &existing_steps {
+            existing_task_ids.insert(step_id.clone(), task_id.clone());
+        }
+
+        // Create tasks and execution_steps for new steps.
+        let mut new_step_tasks: HashMap<String, Id> = HashMap::new();
+        let mut new_task_ids: HashMap<String, Id> = HashMap::new();
+
+        for step in &steps {
+            let task_id = Id::new("task");
+            let task = Task {
+                id: task_id.clone(),
+                session_id: Some(self.session_id.clone()),
+                title: step.title.clone(),
+                description: Some(step.description.clone()),
+                status: TaskStatus::Pending,
+                assigned_to: None,
+                copy_path: None,
+                branch: None,
+                base_branch: None,
+                tier: Some(step.tier),
+                current_activity: None,
+                created_at: now,
+                updated_at: now,
+            };
+            if let Err(e) = self.db.insert_task(&task) {
+                tracing::error!(step_id = %step.id, error = %e, "failed to insert task for new step");
+                continue;
+            }
+            if let Err(e) = self.db.insert_execution_step(&execution_id, &step.id, &task_id) {
+                tracing::error!(step_id = %step.id, error = %e, "failed to insert execution step");
+                continue;
+            }
+            new_step_tasks.insert(step.id.clone(), task_id.clone());
+            new_task_ids.insert(step.id.clone(), task_id);
+        }
+
+        // Create task dependencies (referencing both new and existing steps).
+        let all_task_ids: HashMap<String, Id> = existing_task_ids
+            .into_iter()
+            .chain(new_task_ids.iter().map(|(k, v)| (k.clone(), v.clone())))
+            .collect();
+
+        for step in &steps {
+            let Some(task_id) = new_task_ids.get(&step.id) else {
+                continue;
+            };
+            for dep in &step.needs {
+                if let Some(dep_task_id) = all_task_ids.get(&dep.step_id) {
+                    let _ = self.db.insert_dependency(task_id, dep_task_id);
+                }
+            }
+        }
+
+        // Build step data for DAG add_steps.
+        let step_data: Vec<_> = steps
+            .iter()
+            .map(|s| {
+                (
+                    s.id.clone(),
+                    s.title.clone(),
+                    s.description.clone(),
+                    Some(s.tier),
+                    s.checkpoint,
+                    s.needs
+                        .iter()
+                        .map(|d| (d.step_id.clone(), d.condition))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+
+        if let Err(e) =
+            self.scheduler
+                .add_steps_to_execution(&execution_id.0, &step_data, new_step_tasks)
+        {
+            return vec![Event::StatusMessage(format!(
+                "failed to add steps to execution: {e}"
+            ))];
+        }
+
+        tracing::info!(
+            execution_id = %execution_id,
+            new_steps = steps.len(),
+            "added steps to running execution"
+        );
+
+        self.tick_scheduler()
+    }
+
     fn worker_done(&mut self, result: WorkerResult) -> Vec<Event> {
         let mut events = Vec::new();
 
@@ -265,7 +375,11 @@ impl Orchestrator {
                 let _ = self.db.insert_merge_request(&mr);
                 let _ = self.db.update_task_status(&result.task_id, TaskStatus::Done);
 
-                // DON'T call scheduler.step_completed — that waits for merge.
+                // Mark worker done in the DAG — enables Completed/Started edges.
+                // step_completed() is called later in merge_done() when the merge lands.
+                if let (Some(eid), Some(sid)) = (&result.execution_id, &result.step_id) {
+                    self.scheduler.step_worker_done(&eid.0, sid, output.clone());
+                }
 
                 events.push(Event::WorkerCompleted {
                     task_id: result.task_id.0.clone(),
@@ -328,16 +442,41 @@ impl Orchestrator {
 
         match result.outcome {
             MergeOutcome::Merged => {
-                // Advance the DAG.
-                if let (Some(eid), Some(sid)) = (&mr.execution_id, &mr.step_id) {
+                // Check checkpoint BEFORE step_completed (in case execution completes).
+                let is_checkpoint = if let (Some(eid), Some(sid)) = (&mr.execution_id, &mr.step_id)
+                {
+                    self.scheduler.is_checkpoint(&eid.0, sid)
+                } else {
+                    false
+                };
+
+                // Advance the DAG (WorkerDone → Done, fires Merged edges).
+                let output = if let (Some(eid), Some(sid)) = (&mr.execution_id, &mr.step_id) {
                     let output = self.db.get_task_output(&mr.task_id).ok().flatten();
-                    self.scheduler.step_completed(&eid.0, sid, output);
-                }
+                    self.scheduler.step_completed(&eid.0, sid, output.clone());
+                    output
+                } else {
+                    None
+                };
+
                 events.push(Event::MergeLanded {
                     mr_id: mr.id.0.clone(),
                     task_id: mr.task_id.0.clone(),
                     branch: mr.branch.clone(),
                 });
+
+                // If checkpoint: pause execution and notify coordinator.
+                if is_checkpoint {
+                    if let (Some(eid), Some(sid)) = (&mr.execution_id, &mr.step_id) {
+                        self.scheduler.pause_execution(&eid.0);
+                        events.push(Event::CheckpointReached {
+                            execution_id: eid.0.clone(),
+                            step_id: sid.clone(),
+                            title: mr.branch.clone(),
+                            output,
+                        });
+                    }
+                }
             }
             MergeOutcome::Conflicted(ref detail) => {
                 let _ = self.db.update_merge_status(&mr.id, MergeStatus::Conflicted);
@@ -607,8 +746,14 @@ impl Orchestrator {
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
                     match signal_type {
-                        "execution_created" | "task_created" => {
+                        "execution_created" | "task_created" | "steps_added" => {
                             found = true;
+                        }
+                        "resume" => {
+                            let target = parse_signal_target(&signal);
+                            if let Some(t) = target {
+                                events.extend(self.resume(t));
+                            }
                         }
                         "stop_all" => {
                             return self.stop_all();
@@ -741,35 +886,41 @@ impl Orchestrator {
             }
         };
 
-        // Build a mapping from task_id → step_id.
-        let mut task_to_step: HashMap<Id, String> = HashMap::new();
-        for (step_id, task_id) in &steps {
-            task_to_step.insert(task_id.clone(), step_id.clone());
-        }
-
-        // Build step data for DAG construction.
-        let mut step_data = Vec::new();
         let mut step_tasks = HashMap::new();
         for (step_id, task_id) in &steps {
-            let task = match self.db.get_task(task_id) {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
-            let dep_task_ids = self.db.get_dependencies(task_id).unwrap_or_default();
-            let dep_step_ids: Vec<String> = dep_task_ids
-                .iter()
-                .filter_map(|dep_tid| task_to_step.get(dep_tid).cloned())
-                .collect();
-            step_data.push((
-                step_id.clone(),
-                task.title,
-                task.description.unwrap_or_default(),
-                task.tier,
-                dep_step_ids,
-            ));
             step_tasks.insert(step_id.clone(), task_id.clone());
         }
-        let dag = Dag::from_steps(&step_data);
+
+        // Prefer saved DAG (preserves edge conditions, checkpoint flags, WorkerDone status).
+        let dag = if let Ok(Some(saved_dag)) = self.db.load_dag(execution_id) {
+            saved_dag
+        } else {
+            // Fall back to rebuilding from steps for old executions.
+            let mut task_to_step: HashMap<Id, String> = HashMap::new();
+            for (step_id, task_id) in &steps {
+                task_to_step.insert(task_id.clone(), step_id.clone());
+            }
+            let mut step_data = Vec::new();
+            for (step_id, task_id) in &steps {
+                let task = match self.db.get_task(task_id) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                let dep_task_ids = self.db.get_dependencies(task_id).unwrap_or_default();
+                let dep_step_ids: Vec<String> = dep_task_ids
+                    .iter()
+                    .filter_map(|dep_tid| task_to_step.get(dep_tid).cloned())
+                    .collect();
+                step_data.push((
+                    step_id.clone(),
+                    task.title,
+                    task.description.unwrap_or_default(),
+                    task.tier,
+                    dep_step_ids,
+                ));
+            }
+            Dag::from_steps(&step_data)
+        };
 
         self.scheduler.add_execution(
             execution_id.clone(),
@@ -890,6 +1041,7 @@ mod tests {
                     description: "Design the feature".into(),
                     tier: Tier::Heavy,
                     needs: vec![],
+                    checkpoint: false,
                 },
                 StepDef {
                     id: "implement".into(),
@@ -897,6 +1049,7 @@ mod tests {
                     description: "Implement the feature".into(),
                     tier: Tier::Standard,
                     needs: vec!["design".into()],
+                    checkpoint: false,
                 },
                 StepDef {
                     id: "test".into(),
@@ -904,6 +1057,7 @@ mod tests {
                     description: "Write tests".into(),
                     tier: Tier::Light,
                     needs: vec!["design".into()],
+                    checkpoint: false,
                 },
             ],
         });
@@ -1006,6 +1160,7 @@ mod tests {
                     description: "First".into(),
                     tier: Tier::Standard,
                     needs: vec![],
+                    checkpoint: false,
                 },
                 StepDef {
                     id: "b".into(),
@@ -1013,6 +1168,7 @@ mod tests {
                     description: "Second".into(),
                     tier: Tier::Standard,
                     needs: vec!["a".into()],
+                    checkpoint: false,
                 },
             ],
         });
@@ -1265,6 +1421,7 @@ mod tests {
                     description: "first".into(),
                     tier: Tier::Standard,
                     needs: vec![],
+                    checkpoint: false,
                 },
                 StepDef {
                     id: "b".into(),
@@ -1272,6 +1429,7 @@ mod tests {
                     description: "second".into(),
                     tier: Tier::Standard,
                     needs: vec!["a".into()],
+                    checkpoint: false,
                 },
             ],
         });

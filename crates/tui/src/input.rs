@@ -73,12 +73,11 @@ impl InputLine {
     ///
     /// Call this in the event loop tick to clear stale hints.
     pub fn check_exit_expired(&mut self) -> bool {
-        if let Some(t) = self.ctrl_c_time {
-            if t.elapsed() >= self.exit_confirm_timeout {
+        if let Some(t) = self.ctrl_c_time
+            && t.elapsed() >= self.exit_confirm_timeout {
                 self.ctrl_c_time = None;
                 return true;
             }
-        }
         false
     }
 

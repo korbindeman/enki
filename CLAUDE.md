@@ -14,4 +14,4 @@ Each TUI session is separated by a `══════════════�
 
 For targeted reading: `tail -n 200 ~/.enki/logs/enki.log` gets the end of the most recent session. Use `grep "ERROR\|WARN" ~/.enki/logs/enki.log` to find problems quickly.
 
-Log levels: `ERROR` = failures, `INFO` = lifecycle events (worker spawned/merged/failed, sessions), `DEBUG` = ACP subprocess args, worktree paths, prompt sizes, session kills.
+Log levels: `ERROR` = failures, `INFO` = lifecycle events (worker spawned/merged/failed, sessions), `DEBUG` = ACP subprocess args, copy paths, prompt sizes, session kills.

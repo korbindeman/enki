@@ -97,8 +97,7 @@ fn clone_entry(src: &Path, dst: &Path) -> Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(CopyError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(CopyError::Io(std::io::Error::other(
             format!("cp failed for {}: {stderr}", src.display()),
         )));
     }

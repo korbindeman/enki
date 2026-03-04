@@ -46,6 +46,12 @@ pub struct MonitorState {
     cancelled: HashSet<String>,
 }
 
+impl Default for MonitorState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MonitorState {
     pub fn new() -> Self {
         Self {

@@ -369,11 +369,10 @@ impl Canvas {
         }
 
         // Draw content lines.
-        for i in 0..draw_count {
+        for (i, &selected) in selected_rows.iter().enumerate().take(draw_count) {
             let buf_idx = draw_start + i;
             if buf_idx < total {
                 let row = sr_top + i as u16;
-                let selected = selected_rows[i];
 
                 write!(self.out, "\x1b[{row};1H").ok();
                 if selected {
