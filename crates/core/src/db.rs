@@ -476,6 +476,103 @@ impl Db {
         )?;
         Ok(updated as u32)
     }
+
+    // --- Messages ---
+
+    pub fn insert_message(&self, msg: &Message) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO messages (id, from_addr, to_addr, subject, body, priority, msg_type, thread_id, reply_to, read, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                msg.id.as_str(),
+                msg.from_addr,
+                msg.to_addr,
+                msg.subject,
+                msg.body,
+                msg.priority.as_str(),
+                msg.msg_type.as_str(),
+                msg.thread_id,
+                msg.reply_to,
+                msg.read as i32,
+                msg.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_messages(&self, to_addr: &str, unread_only: bool) -> Result<Vec<Message>> {
+        let sql = if unread_only {
+            "SELECT id, from_addr, to_addr, subject, body, priority, msg_type, thread_id, reply_to, read, created_at
+             FROM messages WHERE to_addr = ?1 AND read = 0
+             ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, created_at DESC"
+        } else {
+            "SELECT id, from_addr, to_addr, subject, body, priority, msg_type, thread_id, reply_to, read, created_at
+             FROM messages WHERE to_addr = ?1
+             ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, created_at DESC"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(params![to_addr], row_to_message)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(DbError::Sqlite)
+    }
+
+    /// List messages for a broadcast address pattern (e.g., "@workers") by querying all messages
+    /// sent to that address.
+    pub fn list_broadcast_messages(&self, addr: &str, unread_only: bool) -> Result<Vec<Message>> {
+        self.list_messages(addr, unread_only)
+    }
+
+    pub fn get_message(&self, id: &str) -> Result<Message> {
+        self.conn
+            .query_row(
+                "SELECT id, from_addr, to_addr, subject, body, priority, msg_type, thread_id, reply_to, read, created_at
+                 FROM messages WHERE id = ?1",
+                params![id],
+                row_to_message,
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    DbError::NotFound(format!("message {id}"))
+                }
+                other => DbError::Sqlite(other),
+            })
+    }
+
+    pub fn mark_message_read(&self, id: &str) -> Result<()> {
+        let updated = self.conn.execute(
+            "UPDATE messages SET read = 1 WHERE id = ?1",
+            params![id],
+        )?;
+        if updated == 0 {
+            return Err(DbError::NotFound(format!("message {id}")));
+        }
+        Ok(())
+    }
+
+    pub fn count_unread(&self, to_addr: &str) -> Result<(i64, i64)> {
+        let total: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE to_addr = ?1 AND read = 0",
+            params![to_addr],
+            |row| row.get(0),
+        )?;
+        let urgent: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE to_addr = ?1 AND read = 0 AND priority IN ('urgent', 'high')",
+            params![to_addr],
+            |row| row.get(0),
+        )?;
+        Ok((total, urgent))
+    }
+
+    pub fn list_thread(&self, thread_id: &str) -> Result<Vec<Message>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, from_addr, to_addr, subject, body, priority, msg_type, thread_id, reply_to, read, created_at
+             FROM messages WHERE thread_id = ?1
+             ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map(params![thread_id], row_to_message)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(DbError::Sqlite)
+    }
 }
 
 // --- Row mapping functions ---
@@ -547,6 +644,25 @@ fn row_to_merge_request(row: &Row) -> rusqlite::Result<MergeRequest> {
         queued_at: parse_dt(row.get(10)?),
         started_at: parse_opt_dt(row.get(11)?),
         merged_at: parse_opt_dt(row.get(12)?),
+    })
+}
+
+fn row_to_message(row: &Row) -> rusqlite::Result<Message> {
+    let priority_str: String = row.get(5)?;
+    let msg_type_str: String = row.get(6)?;
+    let read_int: i32 = row.get(9)?;
+    Ok(Message {
+        id: Id(row.get(0)?),
+        from_addr: row.get(1)?,
+        to_addr: row.get(2)?,
+        subject: row.get(3)?,
+        body: row.get(4)?,
+        priority: MessagePriority::from_str(&priority_str).unwrap_or(MessagePriority::Normal),
+        msg_type: MessageType::from_str(&msg_type_str).unwrap_or(MessageType::Info),
+        thread_id: row.get(7)?,
+        reply_to: row.get(8)?,
+        read: read_int != 0,
+        created_at: parse_dt(row.get(10)?),
     })
 }
 
@@ -728,9 +844,26 @@ CREATE TABLE IF NOT EXISTS task_outputs (
     output      TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS messages (
+    id          TEXT PRIMARY KEY,
+    from_addr   TEXT NOT NULL,
+    to_addr     TEXT NOT NULL,
+    subject     TEXT NOT NULL,
+    body        TEXT NOT NULL DEFAULT '',
+    priority    TEXT NOT NULL DEFAULT 'normal',
+    msg_type    TEXT NOT NULL DEFAULT 'info',
+    thread_id   TEXT,
+    reply_to    TEXT,
+    read        INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status);
 CREATE INDEX IF NOT EXISTS idx_merge_requests_status ON merge_requests(status);
+CREATE INDEX IF NOT EXISTS idx_messages_to_addr ON messages(to_addr);
+CREATE INDEX IF NOT EXISTS idx_messages_unread ON messages(to_addr, read);
+CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id);
 ";
 
 #[cfg(test)]

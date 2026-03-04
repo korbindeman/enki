@@ -3,7 +3,7 @@ use std::io::{self, BufRead, Write};
 
 use chrono::Utc;
 use enki_core::types::{
-    Execution, ExecutionStatus, Id, Task, TaskStatus, Tier,
+    Execution, ExecutionStatus, Id, Message, MessagePriority, MessageType, Task, TaskStatus, Tier,
 };
 use serde_json::{Value, json};
 
@@ -20,18 +20,28 @@ fn tools_for_role(role: &str) -> &'static [&'static str] {
             "enki_pause",
             "enki_cancel",
             "enki_stop_all",
+            "enki_mail_send",
+            "enki_mail_check",
+            "enki_mail_read",
+            "enki_mail_inbox",
         ],
         "worker" => &[
             "enki_status",
             "enki_task_list",
+            "enki_worker_report",
+            "enki_mail_send",
+            "enki_mail_check",
+            "enki_mail_read",
+            "enki_mail_inbox",
         ],
         _ => &[],
     }
 }
 
 /// Run the MCP stdio server. Reads JSON-RPC messages from stdin, writes responses to stdout.
-pub fn run(role: &str) -> anyhow::Result<()> {
+pub fn run(role: &str, task_id: Option<&str>) -> anyhow::Result<()> {
     let role = role.to_string();
+    let task_id = task_id.map(|s| s.to_string());
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
@@ -53,7 +63,7 @@ pub fn run(role: &str) -> anyhow::Result<()> {
             "initialize" => Some(handle_initialize(id)),
             "notifications/initialized" => None,
             "tools/list" => Some(handle_tools_list(id, &role)),
-            "tools/call" => Some(handle_tools_call(id, &req["params"], &role)),
+            "tools/call" => Some(handle_tools_call(id, &req["params"], &role, task_id.as_deref())),
             _ => id.map(|id| error_response(id, -32601, "method not found")),
         };
 
@@ -226,6 +236,85 @@ fn all_tool_definitions() -> Vec<Value> {
                 "required": ["execution_id"]
             }
         }),
+        json!({
+            "name": "enki_worker_report",
+            "description": "Report your current high-level activity. Call this periodically to let the user see what you're working on.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "description": "Brief description of what you're doing (e.g. 'analyzing codebase', 'running tests', 'implementing auth middleware')."
+                    }
+                },
+                "required": ["status"]
+            }
+        }),
+        json!({
+            "name": "enki_mail_send",
+            "description": "Send a message to another worker, the coordinator, or the user. Addresses: 'coordinator', 'worker/<task_id>', '@workers' (broadcast), 'user'.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "to": {
+                        "type": "string",
+                        "description": "Recipient address (e.g. 'coordinator', 'worker/task-01JXX...', '@workers', 'user')."
+                    },
+                    "subject": {
+                        "type": "string",
+                        "description": "Brief subject line."
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Message body."
+                    },
+                    "priority": {
+                        "type": "string",
+                        "enum": ["low", "normal", "high", "urgent"],
+                        "description": "Message priority. Defaults to 'normal'."
+                    },
+                    "thread_id": {
+                        "type": "string",
+                        "description": "Optional thread ID to group related messages."
+                    },
+                    "reply_to": {
+                        "type": "string",
+                        "description": "Optional message ID this is a reply to."
+                    }
+                },
+                "required": ["to", "subject", "body"]
+            }
+        }),
+        json!({
+            "name": "enki_mail_check",
+            "description": "Check your inbox for unread messages. Returns count and summary of unread messages.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
+        json!({
+            "name": "enki_mail_read",
+            "description": "Read a specific message by ID and mark it as read.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "message_id": {
+                        "type": "string",
+                        "description": "ID of the message to read."
+                    }
+                },
+                "required": ["message_id"]
+            }
+        }),
+        json!({
+            "name": "enki_mail_inbox",
+            "description": "List all messages in your inbox (read and unread).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
     ]
 }
 
@@ -245,7 +334,7 @@ fn handle_tools_list(id: Option<Value>, role: &str) -> Value {
     })
 }
 
-fn handle_tools_call(id: Option<Value>, params: &Value, role: &str) -> Value {
+fn handle_tools_call(id: Option<Value>, params: &Value, role: &str, task_id: Option<&str>) -> Value {
     let tool_name = params["name"].as_str().unwrap_or("");
     let args = &params["arguments"];
 
@@ -261,6 +350,7 @@ fn handle_tools_call(id: Option<Value>, params: &Value, role: &str) -> Value {
         });
     }
 
+    let my_addr = caller_addr(role, task_id);
     let result = match tool_name {
         "enki_status" => tool_status(),
         "enki_task_create" => tool_task_create(args),
@@ -270,7 +360,30 @@ fn handle_tools_call(id: Option<Value>, params: &Value, role: &str) -> Value {
         "enki_task_retry" => tool_task_retry(args),
         "enki_pause" => tool_pause(args),
         "enki_cancel" => tool_cancel(args),
+        "enki_worker_report" => tool_worker_report(args, task_id),
+        "enki_mail_send" => tool_mail_send(args, &my_addr),
+        "enki_mail_check" => tool_mail_check(&my_addr),
+        "enki_mail_read" => tool_mail_read(args),
+        "enki_mail_inbox" => tool_mail_inbox(&my_addr),
         _ => Err(format!("unknown tool: {tool_name}")),
+    };
+
+    // Piggyback: only attach mail notice on worker_report (the periodic heartbeat tool).
+    let result = if tool_name == "enki_worker_report" {
+        match result {
+            Ok(mut text) => {
+                if let Ok(notice) = mail_notice(&my_addr) {
+                    if !notice.is_empty() {
+                        text.push_str("\n\n---\n");
+                        text.push_str(&notice);
+                    }
+                }
+                Ok(text)
+            }
+            err => err,
+        }
+    } else {
+        result
     };
 
     match result {
@@ -617,4 +730,175 @@ fn tool_stop_all() -> Result<String, String> {
     // Also write a signal file for the orchestrator path.
     write_signal_file(&json!({"type": "stop_all"}))?;
     Ok("Stop signal sent. All workers will be killed on the next coordinator poll.".into())
+}
+
+fn tool_worker_report(args: &Value, task_id: Option<&str>) -> Result<String, String> {
+    let status = args["status"]
+        .as_str()
+        .ok_or("missing required parameter: status")?;
+    let task_id = task_id.ok_or("worker report requires --task-id (not available outside worker context)")?;
+
+    write_signal_file(&json!({
+        "type": "worker_report",
+        "task_id": task_id,
+        "status": status
+    }))?;
+
+    Ok(format!("Status reported: {status}"))
+}
+
+// --- Mail helpers ---
+
+/// Derive the caller's mail address from their role and task_id.
+fn caller_addr(role: &str, task_id: Option<&str>) -> String {
+    match role {
+        "worker" => {
+            if let Some(tid) = task_id {
+                format!("worker/{tid}")
+            } else {
+                "worker/unknown".to_string()
+            }
+        }
+        "planner" => "coordinator".to_string(),
+        _ => "unknown".to_string(),
+    }
+}
+
+/// Build a piggyback notice string if the caller has unread mail.
+fn mail_notice(my_addr: &str) -> Result<String, String> {
+    let db = open_db().map_err(|e| e.to_string())?;
+    let (total, urgent) = db.count_unread(my_addr).map_err(|e| e.to_string())?;
+    // Also check broadcast messages
+    let (bc_total, bc_urgent) = db.count_unread("@workers").map_err(|e| e.to_string())?;
+    let total = total + bc_total;
+    let urgent = urgent + bc_urgent;
+    if total == 0 {
+        return Ok(String::new());
+    }
+    if urgent > 0 {
+        Ok(format!("MAIL: You have {total} unread message(s) ({urgent} urgent). Use enki_mail_check to read them."))
+    } else {
+        Ok(format!("MAIL: You have {total} unread message(s). Use enki_mail_check to read them."))
+    }
+}
+
+// --- Mail tool implementations ---
+
+fn tool_mail_send(args: &Value, from_addr: &str) -> Result<String, String> {
+    let to = args["to"].as_str().ok_or("missing required parameter: to")?;
+    let subject = args["subject"].as_str().ok_or("missing required parameter: subject")?;
+    let body = args["body"].as_str().ok_or("missing required parameter: body")?;
+    let priority_str = args["priority"].as_str().unwrap_or("normal");
+    let priority = MessagePriority::from_str(priority_str)
+        .ok_or_else(|| format!("invalid priority: {priority_str}"))?;
+    let thread_id = args["thread_id"].as_str().map(String::from);
+    let reply_to = args["reply_to"].as_str().map(String::from);
+
+    let db = open_db().map_err(|e| e.to_string())?;
+    let now = Utc::now();
+    let msg = Message {
+        id: Id::new("msg"),
+        from_addr: from_addr.to_string(),
+        to_addr: to.to_string(),
+        subject: subject.to_string(),
+        body: body.to_string(),
+        priority,
+        msg_type: MessageType::Info,
+        thread_id,
+        reply_to,
+        read: false,
+        created_at: now,
+    };
+
+    db.insert_message(&msg).map_err(|e| e.to_string())?;
+
+    // Signal the coordinator so it can surface in TUI.
+    write_signal_file(&json!({
+        "type": "mail",
+        "message_id": msg.id.as_str(),
+        "from": from_addr,
+        "to": to,
+        "subject": subject,
+        "priority": priority_str,
+    }))?;
+
+    Ok(format!("Message sent to {to}: \"{subject}\" ({})", msg.id))
+}
+
+fn tool_mail_check(my_addr: &str) -> Result<String, String> {
+    let db = open_db().map_err(|e| e.to_string())?;
+    let mut messages = db.list_messages(my_addr, true).map_err(|e| e.to_string())?;
+    // Also include broadcast messages.
+    let broadcast = db.list_broadcast_messages("@workers", true).map_err(|e| e.to_string())?;
+    messages.extend(broadcast);
+    // Sort by priority desc, then by time desc.
+    messages.sort_by(|a, b| {
+        b.priority.sort_key().cmp(&a.priority.sort_key())
+            .then_with(|| b.created_at.cmp(&a.created_at))
+    });
+
+    if messages.is_empty() {
+        return Ok("No unread messages.".into());
+    }
+
+    let mut lines = vec![format!("{} unread message(s):", messages.len())];
+    for msg in &messages {
+        let ts = msg.created_at.format("%H:%M:%S");
+        lines.push(format!(
+            "  {} | [{}] {} | from: {} | {}",
+            msg.id, msg.priority.as_str(), msg.subject, msg.from_addr, ts
+        ));
+    }
+    Ok(lines.join("\n"))
+}
+
+fn tool_mail_read(args: &Value) -> Result<String, String> {
+    let message_id = args["message_id"].as_str().ok_or("missing required parameter: message_id")?;
+    let db = open_db().map_err(|e| e.to_string())?;
+    let msg = db.get_message(message_id).map_err(|e| e.to_string())?;
+    db.mark_message_read(message_id).map_err(|e| e.to_string())?;
+
+    let mut lines = vec![
+        format!("From: {}", msg.from_addr),
+        format!("To: {}", msg.to_addr),
+        format!("Subject: {}", msg.subject),
+        format!("Priority: {}", msg.priority.as_str()),
+        format!("Time: {}", msg.created_at.to_rfc3339()),
+    ];
+    if let Some(ref tid) = msg.thread_id {
+        lines.push(format!("Thread: {tid}"));
+    }
+    if let Some(ref rid) = msg.reply_to {
+        lines.push(format!("Reply-To: {rid}"));
+    }
+    lines.push(String::new());
+    lines.push(msg.body.clone());
+
+    Ok(lines.join("\n"))
+}
+
+fn tool_mail_inbox(my_addr: &str) -> Result<String, String> {
+    let db = open_db().map_err(|e| e.to_string())?;
+    let mut messages = db.list_messages(my_addr, false).map_err(|e| e.to_string())?;
+    let broadcast = db.list_broadcast_messages("@workers", false).map_err(|e| e.to_string())?;
+    messages.extend(broadcast);
+    messages.sort_by(|a, b| {
+        b.priority.sort_key().cmp(&a.priority.sort_key())
+            .then_with(|| b.created_at.cmp(&a.created_at))
+    });
+
+    if messages.is_empty() {
+        return Ok("Inbox empty.".into());
+    }
+
+    let mut lines = vec![format!("{} message(s):", messages.len())];
+    for msg in &messages {
+        let ts = msg.created_at.format("%H:%M:%S");
+        let read_marker = if msg.read { " " } else { "*" };
+        lines.push(format!(
+            "  {}{} | [{}] {} | from: {} | {}",
+            read_marker, msg.id, msg.priority.as_str(), msg.subject, msg.from_addr, ts
+        ));
+    }
+    Ok(lines.join("\n"))
 }

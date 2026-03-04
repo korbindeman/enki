@@ -40,6 +40,7 @@ use crate::input::{InputAction, InputLine};
 use crate::lines;
 use crate::notify;
 use crate::style::{Line, Span, Style};
+use crate::workers::WorkerPanel;
 use crate::{poll_event, KeyCode, KeyModifiers, TermEvent};
 
 /// Trait implemented by chat consumers to handle messages and user input.
@@ -71,6 +72,14 @@ pub trait Handler<M> {
     /// exits after this returns.
     fn on_quit(&mut self) {}
 
+    /// Called for key events before input processing.
+    ///
+    /// Return `true` to consume the key (skip input handling).
+    /// Default: returns `false` (all keys pass through to input).
+    fn on_key(&mut self, _code: KeyCode, _modifiers: KeyModifiers, _cx: &mut ChatContext) -> bool {
+        false
+    }
+
     /// Provide autocomplete matches for a query string.
     ///
     /// Called when the user types the autocomplete trigger character (if set).
@@ -89,6 +98,8 @@ pub struct ChatContext {
     canvas: Canvas,
     stream: StreamBuffer,
     indicator: Indicator,
+    panel: WorkerPanel,
+    title_lines: Vec<Line>,
     streaming: bool,
 }
 
@@ -98,6 +109,8 @@ impl ChatContext {
             canvas,
             stream: StreamBuffer::new(),
             indicator: Indicator::new(),
+            panel: WorkerPanel::new(),
+            title_lines: Vec::new(),
             streaming: false,
         }
     }
@@ -172,6 +185,11 @@ impl ChatContext {
         self.canvas.print_lines(lines);
     }
 
+    /// Print a styled line, or replace a previously tagged line in-place.
+    pub fn print_or_update(&mut self, tag: &str, line: &Line) {
+        self.canvas.print_tagged_line(tag, line);
+    }
+
     /// Print an empty line for spacing.
     pub fn blank_line(&mut self) {
         self.canvas.blank_line();
@@ -209,6 +227,37 @@ impl ChatContext {
         self.sync_status_bar();
     }
 
+    // ─── Worker Panel ──────────────────────────────────────────
+
+    /// Add a worker to the activity panel.
+    pub fn panel_add(&mut self, task_id: &str, title: &str, tier: &str) {
+        self.panel.add(task_id, title, tier);
+        self.sync_banner();
+    }
+
+    /// Remove a worker from the activity panel.
+    pub fn panel_remove(&mut self, task_id: &str) {
+        self.panel.remove(task_id);
+        self.sync_banner();
+    }
+
+    /// Update a worker's current activity in the panel.
+    pub fn panel_set_activity(&mut self, task_id: &str, activity: &str) {
+        self.panel.set_activity(task_id, activity);
+        self.sync_banner();
+    }
+
+    /// Toggle the worker panel visibility.
+    pub fn panel_toggle(&mut self) {
+        self.panel.toggle();
+        self.sync_banner();
+    }
+
+    /// Whether the worker panel is currently showing.
+    pub fn panel_visible(&self) -> bool {
+        self.panel.is_visible()
+    }
+
     // ─── Queries ─────────────────────────────────────────────
 
     /// Usable content width (terminal width minus scrollbar).
@@ -228,6 +277,14 @@ impl ChatContext {
     fn sync_status_bar(&mut self) {
         let rendered = self.indicator.render(self.canvas.width());
         self.canvas.set_status_bar(&rendered);
+    }
+
+    fn sync_banner(&mut self) {
+        let mut banner = self.title_lines.clone();
+        if self.panel.is_visible() {
+            banner.extend(self.panel.render(self.canvas.content_width()));
+        }
+        self.canvas.set_banner(&banner);
     }
 }
 
@@ -318,10 +375,11 @@ impl Chat {
                 ));
             }
             let w = cx.canvas.content_width();
-            cx.canvas.set_banner(&[
+            cx.title_lines = vec![
                 Line::new(spans),
                 lines::separator(w),
-            ]);
+            ];
+            cx.canvas.set_banner(&cx.title_lines);
         }
 
         cx.canvas.update_bubble(&input);
@@ -402,7 +460,11 @@ impl Chat {
                                 cx.canvas.scroll_down(cx.canvas.viewport_height());
                                 continue;
                             }
-                            _ => {}
+                            _ => {
+                                if handler.on_key(key.code, key.modifiers, &mut cx) {
+                                    continue;
+                                }
+                            }
                         }
 
                         let old_ac_count = input

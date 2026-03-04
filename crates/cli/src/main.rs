@@ -44,6 +44,9 @@ enum Cmd {
         /// Agent role: planner, merger, or worker. Controls which tools are exposed.
         #[arg(long, default_value = "planner")]
         role: String,
+        /// Task ID for worker-role processes (used by enki_worker_report).
+        #[arg(long)]
+        task_id: Option<String>,
     },
 }
 
@@ -96,7 +99,7 @@ async fn main() {
         Some(Cmd::Status) => commands::status().await,
         Some(Cmd::Doctor) => commands::doctor().await,
         Some(Cmd::Stop) => commands::stop().await,
-        Some(Cmd::Mcp { role }) => commands::mcp::run(&role),
+        Some(Cmd::Mcp { role, task_id }) => commands::mcp::run(&role, task_id.as_deref()),
     };
 
     if let Err(e) = result {

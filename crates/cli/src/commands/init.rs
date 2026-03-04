@@ -1,38 +1,26 @@
 use enki_core::db::Db;
-use enki_core::worktree::WorktreeManager;
 
 pub async fn init() -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
     let enki_dir = cwd.join(".enki");
     let db_path = enki_dir.join("db.sqlite");
-    let bare_path = enki_dir.join("bare.git");
+    let copies_dir = enki_dir.join("copies");
 
-    let has_db = db_path.exists();
-    let has_bare = bare_path.exists();
-
-    if has_db && has_bare {
+    if db_path.exists() {
         println!("already initialized at {}", enki_dir.display());
         return Ok(());
     }
 
     std::fs::create_dir_all(&enki_dir)?;
+    std::fs::create_dir_all(&copies_dir)?;
 
-    // Create .gitignore so DB and git artifacts aren't tracked
+    // Create .gitignore so DB and worker copies aren't tracked
     std::fs::write(
         enki_dir.join(".gitignore"),
-        "db.sqlite*\nbare.git/\nworktrees/\n",
+        "db.sqlite*\ncopies/\nevents/\nlogs/\n",
     )?;
 
-    if !has_db {
-        Db::open(db_path.to_str().unwrap())?;
-    }
-
-    if !has_bare {
-        if has_db {
-            eprintln!("detected partial initialization (missing bare.git), repairing...");
-        }
-        WorktreeManager::init_bare(&cwd, &bare_path)?;
-    }
+    Db::open(db_path.to_str().unwrap())?;
 
     println!("Initialized enki at {}", enki_dir.display());
     Ok(())

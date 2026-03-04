@@ -5,9 +5,9 @@ use std::time::Duration;
 
 use enki_tui::chat::{Chat, ChatContext, Handler};
 use enki_tui::lines;
-use enki_tui::Color;
+use enki_tui::{Color, KeyCode, KeyModifiers};
 
-use coordinator::{FromCoordinator, ToCoordinator};
+use coordinator::{FromCoordinator, ToCoordinator, WorkerActivity};
 
 const PROMPT: &str = "› ";
 
@@ -67,13 +67,14 @@ impl Handler<FromCoordinator> for CoordinatorHandler<'_> {
                 cx.clear_activity();
                 cx.notify("Enki is waiting for input");
             }
-            FromCoordinator::WorkerSpawned { task_id, title } => {
+            FromCoordinator::WorkerSpawned { task_id, title, tier } => {
                 cx.print(&lines::event(
                     "▶",
                     &format!("Worker spawned: {title} ({task_id})"),
                     Color::DarkCyan,
                 ));
                 cx.add_worker();
+                cx.panel_add(&task_id, &title, &tier);
             }
             FromCoordinator::WorkerCompleted { task_id, title } => {
                 cx.print(&lines::event(
@@ -82,6 +83,7 @@ impl Handler<FromCoordinator> for CoordinatorHandler<'_> {
                     Color::Green,
                 ));
                 cx.remove_worker();
+                cx.panel_remove(&task_id);
             }
             FromCoordinator::WorkerFailed {
                 task_id,
@@ -94,38 +96,44 @@ impl Handler<FromCoordinator> for CoordinatorHandler<'_> {
                     Color::Red,
                 ));
                 cx.remove_worker();
+                cx.panel_remove(&task_id);
             }
             FromCoordinator::MergeQueued { mr_id: _, task_id: _, branch } => {
-                cx.print(&lines::event(
+                let tag = format!("merge:{branch}");
+                cx.print_or_update(&tag, &lines::event(
                     "⊕",
                     &format!("Merge queued: {branch}"),
                     Color::DarkCyan,
                 ));
             }
-            FromCoordinator::MergeLanded { mr_id: _, task_id } => {
-                cx.print(&lines::event(
+            FromCoordinator::MergeLanded { mr_id: _, task_id: _, branch } => {
+                let tag = format!("merge:{branch}");
+                cx.print_or_update(&tag, &lines::event(
                     "✓",
-                    &format!("Merge landed ({task_id})"),
+                    &format!("Merge landed: {branch}"),
                     Color::Green,
                 ));
             }
-            FromCoordinator::MergeConflicted { mr_id: _, task_id } => {
-                cx.print(&lines::event_bold(
+            FromCoordinator::MergeConflicted { mr_id: _, task_id: _, branch } => {
+                let tag = format!("merge:{branch}");
+                cx.print_or_update(&tag, &lines::event_bold(
                     "⚠",
-                    &format!("Merge conflict ({task_id})"),
+                    &format!("Merge conflict: {branch}"),
                     Color::Yellow,
                 ));
-                cx.notify(&format!("Merge conflict: {task_id}"));
+                cx.notify(&format!("Merge conflict: {branch}"));
             }
-            FromCoordinator::MergeFailed { mr_id: _, task_id, reason } => {
-                cx.print(&lines::event(
+            FromCoordinator::MergeFailed { mr_id: _, task_id: _, branch, reason } => {
+                let tag = format!("merge:{branch}");
+                cx.print_or_update(&tag, &lines::event(
                     "✗",
-                    &format!("Merge failed ({task_id}): {reason}"),
+                    &format!("Merge failed: {branch}: {reason}"),
                     Color::Red,
                 ));
             }
             FromCoordinator::MergeProgress { mr_id: _, task_id: _, branch, status } => {
-                cx.print(&lines::event(
+                let tag = format!("merge:{branch}");
+                cx.print_or_update(&tag, &lines::event(
                     "⊕",
                     &format!("Merge {status}: {branch}"),
                     Color::DarkCyan,
@@ -144,8 +152,28 @@ impl Handler<FromCoordinator> for CoordinatorHandler<'_> {
             FromCoordinator::WorkerCount(count) => {
                 cx.set_worker_count(count);
             }
-            FromCoordinator::WorkerUpdate { .. } => {
-                // Activity updates are subsumed by the worker count indicator.
+            FromCoordinator::WorkerUpdate { task_id, activity } => {
+                let text = match activity {
+                    WorkerActivity::ToolStarted(name) => name,
+                    WorkerActivity::ToolDone => "Thinking".to_string(),
+                    WorkerActivity::Thinking => "Thinking".to_string(),
+                };
+                cx.panel_set_activity(&task_id, &text);
+            }
+            FromCoordinator::WorkerReport { task_id, status } => {
+                cx.panel_set_activity(&task_id, &status);
+            }
+            FromCoordinator::Mail { from, to, subject, priority } => {
+                let prio_tag = if priority == "urgent" || priority == "high" {
+                    format!(" [{}]", priority)
+                } else {
+                    String::new()
+                };
+                cx.print(&lines::event(
+                    "✉",
+                    &format!("{from} → {to}: {subject}{prio_tag}"),
+                    Color::Cyan,
+                ));
             }
             FromCoordinator::Interrupted => {
                 cx.finish();
@@ -158,6 +186,14 @@ impl Handler<FromCoordinator> for CoordinatorHandler<'_> {
                 cx.notify(&format!("Enki error: {e}"));
             }
         }
+    }
+
+    fn on_key(&mut self, code: KeyCode, modifiers: KeyModifiers, cx: &mut ChatContext) -> bool {
+        if code == KeyCode::Char('w') && modifiers.contains(KeyModifiers::CONTROL) {
+            cx.panel_toggle();
+            return true;
+        }
+        false
     }
 
     fn on_submit(&mut self, text: String, _cx: &mut ChatContext) {

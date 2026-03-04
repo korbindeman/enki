@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io::{self, Stdout, Write};
 
 use crossterm::cursor::{Hide, Show};
@@ -124,6 +124,11 @@ pub struct Canvas {
     // ─── Selection ───────────────────────────────────────────
     /// Indices of selected messages.
     selected_messages: BTreeSet<usize>,
+
+    // ─── Tagged lines ───────────────────────────────────────
+    /// Map from tag string to the message_id of a tagged line, used for
+    /// in-place line replacement (e.g. merge status updates).
+    tag_to_message_id: HashMap<String, usize>,
 }
 
 impl Canvas {
@@ -169,6 +174,7 @@ impl Canvas {
             message_count: 0,
             current_message: None,
             selected_messages: BTreeSet::new(),
+            tag_to_message_id: HashMap::new(),
         };
 
         canvas.apply_scroll_region();
@@ -446,6 +452,79 @@ impl Canvas {
             }
             self.out.flush().ok();
             self.draw_scrollbar();
+        }
+    }
+
+    /// Print a styled line, or replace a previously tagged line in-place.
+    ///
+    /// If `tag` has not been seen before, this behaves like `print_line` and
+    /// records the mapping. If `tag` already exists, the logical and buffer
+    /// entries for that message are replaced with the new content and the
+    /// viewport is redrawn.
+    pub fn print_tagged_line(&mut self, tag: &str, line: &Line) {
+        if let Some(&msg_id) = self.tag_to_message_id.get(tag) {
+            // ── Replace existing tagged line ──
+            let width = self.content_width() as usize;
+
+            // Find the logical index for this message_id.
+            if let Some(logical_idx) = self
+                .logical_message_id
+                .iter()
+                .position(|id| *id == Some(msg_id))
+            {
+                // Replace logical entry.
+                self.logical[logical_idx] = LogicalEntry::Styled(line.clone());
+
+                // Find buffer span for this message_id and replace.
+                let buf_start = self
+                    .buffer_message_id
+                    .iter()
+                    .position(|id| *id == Some(msg_id));
+                let buf_end = self
+                    .buffer_message_id
+                    .iter()
+                    .rposition(|id| *id == Some(msg_id));
+
+                if let (Some(start), Some(end)) = (buf_start, buf_end) {
+                    let new_rows = wrap_styled_line(line, width);
+
+                    // Remove old buffer rows.
+                    let old_count = end - start + 1;
+                    for _ in 0..old_count {
+                        self.buffer.remove(start);
+                        self.buffer_message_id.remove(start);
+                    }
+
+                    // Insert new buffer rows at the same position.
+                    for (i, row) in new_rows.into_iter().enumerate() {
+                        self.buffer.insert(start + i, BufferedLine::Styled(row));
+                        self.buffer_message_id.insert(start + i, Some(msg_id));
+                    }
+
+                    self.redraw_viewport();
+                }
+            }
+        } else {
+            // ── New tagged line ──
+            let msg_id = self.next_message_id();
+            self.tag_to_message_id.insert(tag.to_string(), msg_id);
+
+            let width = self.content_width() as usize;
+            let rows = wrap_styled_line(line, width);
+
+            self.logical.push_back(LogicalEntry::Styled(line.clone()));
+            self.logical_message_id.push_back(Some(msg_id));
+            for row in &rows {
+                self.buffer.push_back(BufferedLine::Styled(row.clone()));
+                self.buffer_message_id.push_back(Some(msg_id));
+            }
+            if self.follow {
+                for row in &rows {
+                    style::write_line(&mut self.out, row).ok();
+                }
+                self.out.flush().ok();
+                self.draw_scrollbar();
+            }
         }
     }
 

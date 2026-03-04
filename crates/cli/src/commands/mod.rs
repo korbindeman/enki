@@ -40,14 +40,9 @@ pub fn db_path() -> anyhow::Result<PathBuf> {
     Ok(enki_dir()?.join("db.sqlite"))
 }
 
-/// Path to the bare git clone.
-pub fn bare_path() -> anyhow::Result<PathBuf> {
-    Ok(enki_dir()?.join("bare.git"))
-}
-
-/// Base directory for task worktrees.
-pub fn worktree_base() -> anyhow::Result<PathBuf> {
-    Ok(enki_dir()?.join("worktrees"))
+/// Base directory for worker copies.
+pub fn copies_dir() -> anyhow::Result<PathBuf> {
+    Ok(enki_dir()?.join("copies"))
 }
 
 /// Project root (parent of `.enki/`).

@@ -198,6 +198,76 @@ impl ExecutionStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessagePriority {
+    Low,
+    Normal,
+    High,
+    Urgent,
+}
+
+impl MessagePriority {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Normal => "normal",
+            Self::High => "high",
+            Self::Urgent => "urgent",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "low" => Some(Self::Low),
+            "normal" => Some(Self::Normal),
+            "high" => Some(Self::High),
+            "urgent" => Some(Self::Urgent),
+            _ => None,
+        }
+    }
+
+    /// Ordering value for sorting (higher = more important).
+    pub fn sort_key(self) -> u8 {
+        match self {
+            Self::Low => 0,
+            Self::Normal => 1,
+            Self::High => 2,
+            Self::Urgent => 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageType {
+    Info,
+    Request,
+    Response,
+    Protocol,
+}
+
+impl MessageType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Request => "request",
+            Self::Response => "response",
+            Self::Protocol => "protocol",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "info" => Some(Self::Info),
+            "request" => Some(Self::Request),
+            "response" => Some(Self::Response),
+            "protocol" => Some(Self::Protocol),
+            _ => None,
+        }
+    }
+}
+
 // --- Domain structs ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -248,4 +318,19 @@ pub struct MergeRequest {
     pub queued_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub merged_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Message {
+    pub id: Id,
+    pub from_addr: String,
+    pub to_addr: String,
+    pub subject: String,
+    pub body: String,
+    pub priority: MessagePriority,
+    pub msg_type: MessageType,
+    pub thread_id: Option<String>,
+    pub reply_to: Option<String>,
+    pub read: bool,
+    pub created_at: DateTime<Utc>,
 }

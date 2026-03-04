@@ -125,13 +125,14 @@ pub enum Event {
         error: String,
     },
     /// A merge was successfully landed.
-    MergeLanded { mr_id: String, task_id: String },
+    MergeLanded { mr_id: String, task_id: String, branch: String },
     /// A merge had a conflict.
-    MergeConflicted { mr_id: String, task_id: String },
+    MergeConflicted { mr_id: String, task_id: String, branch: String },
     /// A merge failed verification or rebasing.
     MergeFailed {
         mr_id: String,
         task_id: String,
+        branch: String,
         reason: String,
     },
     /// An execution completed (all steps done).
@@ -157,6 +158,16 @@ pub enum Event {
     },
     /// Informational status message for the coordinator agent.
     StatusMessage(String),
+    /// A worker reported its current activity.
+    WorkerReport { task_id: String, status: String },
+    /// A mail message was sent (for TUI visibility).
+    Mail {
+        message_id: String,
+        from: String,
+        to: String,
+        subject: String,
+        priority: String,
+    },
 }
 
 /// Parse a pause/cancel signal file into a Target.
@@ -470,6 +481,7 @@ impl Orchestrator {
                 events.push(Event::MergeLanded {
                     mr_id: mr.id.0.clone(),
                     task_id: mr.task_id.0.clone(),
+                    branch: mr.branch.clone(),
                 });
             }
             MergeOutcome::Conflicted(ref detail) => {
@@ -484,6 +496,7 @@ impl Orchestrator {
                 events.push(Event::MergeConflicted {
                     mr_id: mr.id.0.clone(),
                     task_id: mr.task_id.0.clone(),
+                    branch: mr.branch.clone(),
                 });
             }
             MergeOutcome::VerifyFailed(ref detail) => {
@@ -498,6 +511,7 @@ impl Orchestrator {
                 events.push(Event::MergeFailed {
                     mr_id: mr.id.0.clone(),
                     task_id: mr.task_id.0.clone(),
+                    branch: mr.branch.clone(),
                     reason: format!("verify.sh failed: {detail}"),
                 });
             }
@@ -513,6 +527,7 @@ impl Orchestrator {
                 events.push(Event::MergeFailed {
                     mr_id: mr.id.0.clone(),
                     task_id: mr.task_id.0.clone(),
+                    branch: mr.branch.clone(),
                     reason: detail.clone(),
                 });
             }
@@ -778,6 +793,34 @@ impl Orchestrator {
                             let target = parse_signal_target(&signal);
                             if let Some(t) = target {
                                 events.extend(self.cancel(t));
+                            }
+                        }
+                        "worker_report" => {
+                            if let (Some(tid), Some(status)) = (
+                                signal.get("task_id").and_then(|v| v.as_str()),
+                                signal.get("status").and_then(|v| v.as_str()),
+                            ) {
+                                events.push(Event::WorkerReport {
+                                    task_id: tid.to_string(),
+                                    status: status.to_string(),
+                                });
+                            }
+                        }
+                        "mail" => {
+                            if let (Some(from), Some(to), Some(subject)) = (
+                                signal.get("from").and_then(|v| v.as_str()),
+                                signal.get("to").and_then(|v| v.as_str()),
+                                signal.get("subject").and_then(|v| v.as_str()),
+                            ) {
+                                let msg_id = signal.get("message_id").and_then(|v| v.as_str()).unwrap_or("");
+                                let priority = signal.get("priority").and_then(|v| v.as_str()).unwrap_or("normal");
+                                events.push(Event::Mail {
+                                    message_id: msg_id.to_string(),
+                                    from: from.to_string(),
+                                    to: to.to_string(),
+                                    subject: subject.to_string(),
+                                    priority: priority.to_string(),
+                                });
                             }
                         }
                         _ => {

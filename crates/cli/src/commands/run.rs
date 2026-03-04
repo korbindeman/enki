@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use enki_acp::{AgentManager, SessionUpdate};
 use enki_core::types::{Id, TaskStatus};
-use enki_core::worktree::WorktreeManager;
+use enki_core::worktree::CopyManager;
 
 use super::open_db;
 
@@ -22,30 +22,21 @@ pub async fn run(task_id: &str, agent_cmd: &str, agent_args: &str, keep: bool, e
 
     println!("task: {} — {}", task.title, task.description.as_deref().unwrap_or(""));
 
-    // Create worktree
+    // Create APFS copy for worker isolation.
+    let project_root = super::project_root()?;
+    let copies_dir = super::copies_dir()?;
+    let copy_mgr = CopyManager::new(project_root, copies_dir);
+
     let branch = format!("task/{}", task_id);
-    let bare_path = super::bare_path()?;
-    let worktree_dir = super::worktree_base()?;
-    std::fs::create_dir_all(&worktree_dir)?;
-
-    let wt_mgr = WorktreeManager::new(&bare_path)?;
-
-    // Sync bare repo before branching so the worker starts from current code
-    // (including uncommitted/untracked files).
-    if let Err(e) = wt_mgr.sync() {
-        eprintln!("warning: bare repo sync failed: {e}");
-    }
-
-    let start_ref = wt_mgr.default_start_ref()?;
-    println!("creating worktree on branch '{}' from '{}'...", branch, start_ref);
-    let worktree_path = wt_mgr.create(&branch, &start_ref, &worktree_dir)?;
-    println!("worktree: {}", worktree_path.display());
+    println!("creating copy for branch '{}'...", branch);
+    let copy_path = copy_mgr.create_copy(&task_id.0)?;
+    println!("copy: {}", copy_path.display());
 
     // Update task status
     db.assign_task(
         &task_id,
         &Id("cli-direct".into()),
-        worktree_path.to_str().unwrap(),
+        copy_path.to_str().unwrap(),
         &branch,
     )?;
 
@@ -62,7 +53,7 @@ pub async fn run(task_id: &str, agent_cmd: &str, agent_args: &str, keep: bool, e
         .run_until(run_acp_session(
             agent_cmd,
             &args,
-            worktree_path.clone(),
+            copy_path.clone(),
             &prompt,
             &enki_bin,
         ))
@@ -75,12 +66,12 @@ pub async fn run(task_id: &str, agent_cmd: &str, agent_args: &str, keep: bool, e
             println!("task marked as done.");
 
             if keep {
-                println!("worktree kept at: {}", worktree_path.display());
+                println!("copy kept at: {}", copy_path.display());
             } else {
-                print!("cleaning up worktree... ");
-                match wt_mgr.remove(&worktree_path, false) {
+                print!("cleaning up copy... ");
+                match copy_mgr.remove_copy(&copy_path) {
                     Ok(()) => println!("done."),
-                    Err(e) => println!("failed: {e}\nworktree left at: {}", worktree_path.display()),
+                    Err(e) => println!("failed: {e}\ncopy left at: {}", copy_path.display()),
                 }
             }
         }
@@ -88,7 +79,7 @@ pub async fn run(task_id: &str, agent_cmd: &str, agent_args: &str, keep: bool, e
             eprintln!("\nagent error: {e}");
             db.update_task_status(&task_id, TaskStatus::Failed)?;
             println!("task marked as failed.");
-            println!("worktree left at: {} (inspect and clean up manually)", worktree_path.display());
+            println!("copy left at: {} (inspect and clean up manually)", copy_path.display());
         }
     }
 

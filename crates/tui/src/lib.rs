@@ -5,6 +5,7 @@ pub mod input;
 pub mod lines;
 pub mod notify;
 pub mod style;
+pub mod workers;
 
 #[cfg(feature = "markdown")]
 pub mod markdown;

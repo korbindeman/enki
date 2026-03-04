@@ -1,9 +1,10 @@
 use std::path::PathBuf;
+use std::process::Command;
 
 use chrono::Utc;
 use clap::Subcommand;
 use enki_core::types::{Id, Task, TaskStatus, Tier};
-use enki_core::worktree::{WorktreeError, WorktreeManager};
+use enki_core::worktree::CopyManager;
 
 use super::open_db;
 
@@ -31,8 +32,7 @@ pub enum TaskCmd {
     },
     /// Retry a blocked task after a merge conflict.
     ///
-    /// Rebases the task's branch onto main and re-merges. The worktree must still
-    /// exist (it is preserved automatically when a conflict is detected).
+    /// Re-fetches the task's branch from its copy and rebases onto main.
     Retry {
         /// Task ID.
         task_id: String,
@@ -128,60 +128,88 @@ async fn retry_task(task_id_str: String) -> anyhow::Result<()> {
         );
     }
 
-    let worktree_str = task
+    let copy_str = task
         .worktree
         .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("task {} has no worktree path recorded", task_id))?;
+        .ok_or_else(|| anyhow::anyhow!("task {} has no copy path recorded", task_id))?;
     let branch = task
         .branch
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("task {} has no branch recorded", task_id))?
         .to_string();
 
-    let worktree_path = PathBuf::from(worktree_str);
-    if !worktree_path.exists() {
+    let copy_path = PathBuf::from(copy_str);
+    if !copy_path.exists() {
         anyhow::bail!(
-            "worktree no longer exists at '{}'. Cannot retry.",
-            worktree_path.display()
+            "copy no longer exists at '{}'. Cannot retry.",
+            copy_path.display()
         );
     }
 
-    let bare_path = super::bare_path()?;
-    let wt_mgr = WorktreeManager::new(&bare_path)?;
+    let project_root = super::project_root()?;
+    let copies_dir = super::copies_dir()?;
+    let copy_mgr = CopyManager::new(project_root.clone(), copies_dir);
 
-    // Sync bare repo so we rebase onto the latest main.
-    if let Err(e) = wt_mgr.sync() {
-        eprintln!("warning: bare repo sync failed: {e}");
-    }
+    // Fetch the branch from the copy into source repo.
+    println!("fetching '{}' from copy...", branch);
+    copy_mgr.fetch_branch(&copy_path, &branch)?;
 
+    // Rebase in source repo.
     println!("rebasing '{}' onto main...", branch);
-    match wt_mgr.rebase_onto(&worktree_path, "main") {
-        Ok(()) => println!("rebase succeeded."),
-        Err(WorktreeError::Conflict(msg)) => {
-            anyhow::bail!(
-                "rebase conflict: {msg}\n\
-                 The worktree is still at: {}\n\
-                 Resolve conflicts manually, then run:\n  \
-                 git rebase --continue\n\
-                 Once clean, re-run `enki task retry {task_id}` to merge.",
-                worktree_path.display()
-            );
-        }
-        Err(e) => return Err(e.into()),
+    let output = Command::new("git")
+        .args(["checkout", &branch])
+        .current_dir(&project_root)
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("checkout {branch} failed: {stderr}");
     }
 
-    println!("merging '{}' into main...", branch);
-    wt_mgr.merge_branch(&branch, "main")?;
+    let output = Command::new("git")
+        .args(["rebase", "main"])
+        .current_dir(&project_root)
+        .output()?;
+    if !output.status.success() {
+        let _ = Command::new("git")
+            .args(["rebase", "--abort"])
+            .current_dir(&project_root)
+            .output();
+        let _ = Command::new("git")
+            .args(["checkout", "main"])
+            .current_dir(&project_root)
+            .output();
+        anyhow::bail!(
+            "rebase conflict. Resolve manually:\n  \
+             cd {} && git checkout {branch} && git rebase main\n  \
+             Then re-run `enki task retry {task_id}`",
+            project_root.display()
+        );
+    }
 
-    println!("cleaning up worktree...");
-    wt_mgr.remove(&worktree_path, true)?;
+    // Merge into main.
+    println!("merging '{}' into main...", branch);
+    let _ = Command::new("git")
+        .args(["checkout", "main"])
+        .current_dir(&project_root)
+        .output()?;
+    let output = Command::new("git")
+        .args(["merge", "--ff-only", &branch])
+        .current_dir(&project_root)
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("ff-only merge failed: {stderr}");
+    }
+
+    // Clean up.
+    println!("cleaning up...");
+    let _ = copy_mgr.delete_branch(&branch);
+    let _ = copy_mgr.remove_copy(&copy_path);
 
     db.update_task_status(&task_id, TaskStatus::Done)?;
     println!("task {} marked done.", task_id);
 
     // Promote dependents whose all deps are now done.
-    // For scheduler-managed executions this is redundant (the scheduler handles it),
-    // but it ensures correctness for tasks with DB-level dependencies.
     let dependents = db.get_dependents(&task_id).unwrap_or_default();
     for dep_id in &dependents {
         let Ok(dep_task) = db.get_task(dep_id) else { continue };
