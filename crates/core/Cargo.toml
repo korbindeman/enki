@@ -14,4 +14,4 @@ rand = "0.10"
 which = "8"
 dirs = "6"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
-toml = "0.8"
+toml = "1"
