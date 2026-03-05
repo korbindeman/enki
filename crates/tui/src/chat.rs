@@ -281,7 +281,7 @@ impl ChatContext {
 
     fn sync_banner(&mut self) {
         let mut banner = self.title_lines.clone();
-        let w = self.canvas.content_width();
+        let w = self.canvas.width();
         if self.panel.is_visible() {
             // Replace the plain separator with a labeled one
             if let Some(last) = banner.last_mut() {
@@ -384,7 +384,7 @@ impl Chat {
                     Style::new().fg(Color::DarkGrey),
                 ));
             }
-            let w = cx.canvas.content_width();
+            let w = cx.canvas.width();
             // Right-aligned hint
             let hint = "[ctrl+w] toggle workers panel";
             let left_len: usize = spans.iter().map(|s| s.text.chars().count()).sum();
