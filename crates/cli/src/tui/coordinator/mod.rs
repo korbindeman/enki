@@ -1,7 +1,10 @@
 mod prompts;
+mod session;
+mod tracker;
+mod workers;
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
 
 use enki_acp::{AgentManager, SessionUpdate};
@@ -13,7 +16,14 @@ use enki_core::types::{Id, MergeStatus, short_id};
 use enki_core::copy::{CopyManager, GitIdentity};
 use tokio::sync::mpsc;
 
-use prompts::{build_merger_prompt, build_system_prompt, build_worker_prompt, extract_output};
+use prompts::{build_merger_prompt, build_system_prompt, build_worker_prompt};
+use session::CoordinatorSession;
+pub use tracker::WorkerActivity;
+use tracker::WorkerTracker;
+use workers::{
+    WorkerDone, MergerDone, MergerAgentDone,
+    discover_artifact_files, process_worker_done, try_dispatch_merge,
+};
 
 /// Messages sent from the TUI to the coordinator thread.
 #[allow(dead_code)]
@@ -23,14 +33,6 @@ pub enum ToCoordinator {
     Shutdown,
     /// Stop all running workers immediately.
     StopAll,
-}
-
-/// Activity update from a running worker agent.
-#[derive(Debug, Clone)]
-pub enum WorkerActivity {
-    ToolStarted(String),
-    ToolDone,
-    Thinking,
 }
 
 /// Messages sent from the coordinator thread back to the TUI.
@@ -143,6 +145,7 @@ struct Runtime {
     orch: Orchestrator,
     infra_broken: bool,
     db_path: String,
+    roles: std::collections::HashMap<String, enki_core::roles::RoleConfig>,
 }
 
 impl Runtime {
@@ -265,7 +268,7 @@ impl Runtime {
                 match event {
                     Event::SpawnWorker {
                         task_id, title, description, tier,
-                        execution_id, step_id, upstream_outputs,
+                        execution_id, step_id, upstream_outputs, role,
                     } => {
                         if self.infra_broken {
                             let more = self.orch.handle(Command::WorkerDone(WorkerResult {
@@ -284,6 +287,7 @@ impl Runtime {
                         match self.spawn_worker(
                             &task_id, &title, &description,
                             &execution_id, &step_id, &upstream_outputs,
+                            role.as_deref(),
                         ).await {
                             Ok(()) => {
                                 let _ = self.tx.send(FromCoordinator::WorkerSpawned {
@@ -470,6 +474,7 @@ impl Runtime {
         execution_id: &Id,
         step_id: &str,
         upstream_outputs: &[(String, String)],
+        role: Option<&str>,
     ) -> anyhow::Result<()> {
         let branch = format!("task/{}", task_id);
         let (copy_path, base_commit, base_branch) = self.copy_mgr.create_copy(&task_id.0)?;
@@ -479,12 +484,24 @@ impl Runtime {
             task_id, &agent_id, copy_path.to_str().unwrap(), &branch, &base_branch,
         )?;
 
+        // Look up role config to determine tool access and output mode.
+        let role_config = role.and_then(|r| self.roles.get(r));
+        let can_edit = role_config.map(|r| r.can_edit).unwrap_or(true);
+        let artifact = role_config
+            .map(|r| r.output == enki_core::roles::OutputMode::Artifact)
+            .unwrap_or(false);
+
+        let mut mcp_args = vec![
+            "mcp".into(), "--role".into(), "worker".into(),
+            "--task-id".into(), task_id.0.clone(),
+        ];
+        if !can_edit {
+            mcp_args.push("--no-edit".into());
+        }
+
         let worker_mcp = vec![enki_acp::acp_schema::McpServer::Stdio(
             enki_acp::acp_schema::McpServerStdio::new("enki", &self.enki_bin)
-                .args(vec![
-                    "mcp".into(), "--role".into(), "worker".into(),
-                    "--task-id".into(), task_id.0.clone(),
-                ]),
+                .args(mcp_args),
         )];
 
         let agent_cmd =
@@ -500,7 +517,27 @@ impl Runtime {
         self.tracker.borrow_mut().register(session_id.clone(), task_id.0.clone());
         self.orch.set_step_session(&execution_id.0, step_id, session_id.clone());
 
-        let prompt = build_worker_prompt(title, description, upstream_outputs);
+        // Compute artifact path if this is an artifact worker.
+        let artifact_path = if artifact {
+            let artifacts_dir = self.copy_mgr.project_root().join(".enki").join("artifacts").join(&execution_id.0);
+            let _ = std::fs::create_dir_all(&artifacts_dir);
+            Some(artifacts_dir.join(format!("{step_id}.md")))
+        } else {
+            None
+        };
+
+        // Discover artifact files from completed upstream steps in this execution.
+        let artifact_files = discover_artifact_files(
+            self.copy_mgr.project_root(),
+            &execution_id.0,
+            upstream_outputs,
+        );
+
+        let role_prompt = role_config.map(|r| r.system_prompt.as_str());
+        let prompt = build_worker_prompt(
+            title, description, upstream_outputs, &artifact_files,
+            role_prompt, artifact_path.as_deref(),
+        );
         let mgr_clone = self.mgr.clone();
         let tracker_clone = self.tracker.clone();
         let task_id = task_id.clone();
@@ -526,6 +563,7 @@ impl Runtime {
                 result: result.map_err(|e| e.to_string()),
                 execution_id: exec_id_owned,
                 step_id: step_id_owned,
+                artifact,
             });
         });
 
@@ -536,7 +574,7 @@ impl Runtime {
         &mut self,
         mr_id: &str,
         task_id: &Id,
-        temp_dir: &Path,
+        temp_dir: &std::path::Path,
         default_branch: &str,
         conflict_files: &[String],
         conflict_diff: &str,
@@ -594,195 +632,6 @@ impl Runtime {
         });
 
         Ok(())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Internal channel types
-// ---------------------------------------------------------------------------
-
-struct WorkerDone {
-    task_id: Id,
-    session_id: Option<String>,
-    title: String,
-    branch: String,
-    copy_path: PathBuf,
-    base_commit: Option<String>,
-    result: Result<String, String>,
-    execution_id: Option<Id>,
-    step_id: Option<String>,
-}
-
-struct MergerDone {
-    merge_request_id: Id,
-    outcome: enki_core::refinery::MergeOutcome,
-}
-
-struct MergerAgentDone {
-    mr_id: Id,
-    temp_dir: PathBuf,
-    default_branch: String,
-    session_id: String,
-}
-
-// ---------------------------------------------------------------------------
-// Worker tracker (replaces 4 Rc<RefCell<HashMap>>)
-// ---------------------------------------------------------------------------
-
-struct WorkerTracker {
-    session_to_task: HashMap<String, String>,
-    last_activity: HashMap<String, Instant>,
-    current_tool: HashMap<String, String>,
-    thinking: HashSet<String>,
-}
-
-impl WorkerTracker {
-    fn new() -> Self {
-        Self {
-            session_to_task: HashMap::new(),
-            last_activity: HashMap::new(),
-            current_tool: HashMap::new(),
-            thinking: HashSet::new(),
-        }
-    }
-
-    fn register(&mut self, session_id: String, task_id: String) {
-        self.session_to_task
-            .insert(session_id.clone(), task_id);
-        self.last_activity.insert(session_id, Instant::now());
-    }
-
-    fn remove(&mut self, session_id: &str) {
-        self.session_to_task.remove(session_id);
-        self.last_activity.remove(session_id);
-        self.current_tool.remove(session_id);
-        self.thinking.remove(session_id);
-    }
-
-    /// Build the worker list for MonitorTick: (session_id, task_id, last_activity).
-    fn worker_list(&self) -> Vec<(String, String, Instant)> {
-        self.last_activity
-            .iter()
-            .filter_map(|(sid, last)| {
-                let tid = self.session_to_task.get(sid)?.clone();
-                Some((sid.clone(), tid, *last))
-            })
-            .collect()
-    }
-
-    fn worker_count(&self) -> usize {
-        self.session_to_task.len()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// CoordinatorSession — the coordinator agent's session state
-// ---------------------------------------------------------------------------
-
-type PromptResult = (u64, Result<String, String>);
-
-struct CoordinatorSession {
-    session_id: String,
-    pending_events: Vec<String>,
-    prompt_generation: u64,
-    active_prompt: Option<tokio::task::JoinHandle<()>>,
-    prompt_done_tx: mpsc::UnboundedSender<PromptResult>,
-    forward_updates: std::rc::Rc<std::cell::Cell<bool>>,
-}
-
-impl CoordinatorSession {
-    fn new(session_id: String) -> (Self, mpsc::UnboundedReceiver<PromptResult>) {
-        let (prompt_done_tx, prompt_done_rx) = mpsc::unbounded_channel();
-        let session = Self {
-            session_id,
-            pending_events: Vec::new(),
-            prompt_generation: 0,
-            active_prompt: None,
-            prompt_done_tx,
-            forward_updates: std::rc::Rc::new(std::cell::Cell::new(false)),
-        };
-        (session, prompt_done_rx)
-    }
-
-    fn queue_event(&mut self, msg: String) {
-        self.pending_events.push(msg);
-    }
-
-    async fn deliver_prompt(
-        &mut self,
-        mgr: &AgentManager,
-        tx: &mpsc::UnboundedSender<FromCoordinator>,
-        text: String,
-    ) {
-        if let Some(handle) = self.active_prompt.take() {
-            let _ = mgr.cancel(&self.session_id).await;
-            handle.abort();
-            let _ = tx.send(FromCoordinator::Interrupted);
-        }
-
-        let full_text = if self.pending_events.is_empty() {
-            text
-        } else {
-            let events_text = std::mem::take(&mut self.pending_events).join("\n");
-            format!("[worker status updates]\n{events_text}\n\n[user message]\n{text}")
-        };
-
-        self.spawn_prompt(mgr, full_text);
-    }
-
-    fn handle_prompt_done(
-        &mut self,
-        generation: u64,
-        result: Result<String, String>,
-    ) -> Option<FromCoordinator> {
-        if generation != self.prompt_generation {
-            return None;
-        }
-        self.active_prompt = None;
-        Some(match result {
-            Ok(stop_reason) => FromCoordinator::Done(stop_reason),
-            Err(e) => FromCoordinator::Error(format!("prompt error: {e}")),
-        })
-    }
-
-    async fn interrupt(
-        &mut self,
-        mgr: &AgentManager,
-        tx: &mpsc::UnboundedSender<FromCoordinator>,
-    ) {
-        if let Some(handle) = self.active_prompt.take() {
-            let _ = mgr.cancel(&self.session_id).await;
-            handle.abort();
-            let _ = tx.send(FromCoordinator::Interrupted);
-        }
-    }
-
-    fn shutdown(&mut self, mgr: &AgentManager) {
-        if let Some(handle) = self.active_prompt.take() {
-            handle.abort();
-        }
-        mgr.kill_session(&self.session_id);
-    }
-
-    fn flush_if_idle(&mut self, mgr: &AgentManager) {
-        if self.active_prompt.is_some() || self.pending_events.is_empty() {
-            return;
-        }
-        let events_text = std::mem::take(&mut self.pending_events).join("\n");
-        let msg = format!("[worker status updates]\n{events_text}");
-        self.spawn_prompt(mgr, msg);
-    }
-
-    fn spawn_prompt(&mut self, mgr: &AgentManager, text: String) {
-        self.prompt_generation += 1;
-        let generation = self.prompt_generation;
-        let mgr = mgr.clone();
-        let sid = self.session_id.clone();
-        let done_tx = self.prompt_done_tx.clone();
-        self.active_prompt = Some(tokio::task::spawn_local(async move {
-            let result = mgr.prompt(&sid, &text).await;
-            let _ = done_tx.send((generation, result.map_err(|e| e.to_string())));
-        }));
     }
 }
 
@@ -943,8 +792,12 @@ async fn coordinator_loop(
         });
     }
 
+    // Load agent roles.
+    let roles = enki_core::roles::load_roles(&cwd);
+    tracing::info!(role_count = roles.len(), "loaded agent roles");
+
     // Send system prompt (updates suppressed during this phase).
-    let system_prompt = build_system_prompt(&cwd);
+    let system_prompt = build_system_prompt(&cwd, &roles);
     match mgr.prompt(&coord.session_id, &system_prompt).await {
         Ok(_) => {
             coord.forward_updates.set(true);
@@ -989,6 +842,7 @@ async fn coordinator_loop(
         orch,
         infra_broken: false,
         db_path,
+        roles,
     };
 
     // Stateless session: no crash recovery. Fresh start every time.
@@ -1037,7 +891,7 @@ async fn coordinator_loop(
                 }
                 let _ = rt.orch.db().update_task_activity(&done.task_id, None);
 
-                let worker_result = process_worker_done(done, &rt.copy_mgr);
+                let worker_result = process_worker_done(done, &rt.copy_mgr, &enki_dir);
                 rt.handle_command(Command::WorkerDone(worker_result), &mut coord).await;
             }
 
@@ -1119,131 +973,4 @@ async fn coordinator_loop(
         }
     let _ = rt.orch.db().end_session(&enki_session_id);
     tracing::info!(session_id = %enki_session_id, "session ended");
-}
-
-// ---------------------------------------------------------------------------
-// Worker done processing (infrastructure layer)
-// ---------------------------------------------------------------------------
-
-/// Convert a raw WorkerDone (from the channel) into an orchestrator WorkerResult.
-/// Handles auto-commit, change detection, and copy cleanup.
-fn process_worker_done(done: WorkerDone, copy_mgr: &CopyManager) -> WorkerResult {
-    match done.result {
-        Ok(ref stop_reason) => {
-            // Auto-commit uncommitted changes in the copy.
-            let msg = format!("{}\n\ncreated by enki", done.title);
-            let committed = copy_mgr.commit_copy(&done.copy_path, &msg);
-
-            // Check for actual changes vs the base commit.
-            // Fast path: if commit_copy found nothing dirty, check if the
-            // worker committed anything by comparing HEAD to the base commit.
-            // This avoids spawning a `git diff --stat` process in the common
-            // no-changes case.
-            let has_changes = if committed {
-                true
-            } else {
-                match &done.base_commit {
-                    Some(base) => {
-                        enki_core::copy::head_sha(&done.copy_path)
-                            .as_deref() != Some(base.as_str())
-                    }
-                    None => enki_core::copy::head_sha(&done.copy_path).is_some(),
-                }
-            };
-
-            if !has_changes {
-                tracing::warn!(
-                    task_id = %done.task_id, title = %done.title,
-                    "worker completed but copy has no changes"
-                );
-                let _ = copy_mgr.remove_copy(&done.copy_path);
-                return WorkerResult {
-                    task_id: done.task_id,
-                    execution_id: done.execution_id,
-                    step_id: done.step_id,
-                    title: done.title,
-                    branch: done.branch,
-                    outcome: WorkerOutcome::NoChanges,
-                };
-            }
-
-            // Keep copy for refinery to fetch from.
-            let output = extract_output(stop_reason);
-            WorkerResult {
-                task_id: done.task_id,
-                execution_id: done.execution_id,
-                step_id: done.step_id,
-                title: done.title,
-                branch: done.branch,
-                outcome: WorkerOutcome::Success { output },
-            }
-        }
-        Err(ref error) => {
-            tracing::error!(
-                task_id = %done.task_id, title = %done.title,
-                error, "worker failed"
-            );
-            let _ = copy_mgr.remove_copy(&done.copy_path);
-            WorkerResult {
-                task_id: done.task_id,
-                execution_id: done.execution_id,
-                step_id: done.step_id,
-                title: done.title,
-                branch: done.branch,
-                outcome: WorkerOutcome::Failed {
-                    error: error.clone(),
-                },
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Refinery dispatch
-// ---------------------------------------------------------------------------
-
-fn try_dispatch_merge(
-    db: &enki_core::db::Db,
-    db_path: &str,
-    copy_mgr: &CopyManager,
-    merger_done_tx: &mpsc::UnboundedSender<MergerDone>,
-    merge_in_progress: &mut bool,
-) {
-    let queued = match db.get_queued_merge_requests() {
-        Ok(q) => q,
-        Err(_) => return,
-    };
-    let Some(mr) = queued.first() else { return };
-
-    *merge_in_progress = true;
-    let mr_id = mr.id.clone();
-    let branch = mr.branch.clone();
-    let base_branch = mr.base_branch.clone();
-    tracing::info!(mr_id = %mr_id, task_id = %mr.task_id, branch = %mr.branch, "dispatching merge");
-
-    let _ = db.update_merge_status(&mr_id, MergeStatus::Processing);
-
-    let done_tx = merger_done_tx.clone();
-    let project_root_owned = copy_mgr.project_root().to_path_buf();
-    let copies_dir_owned = copy_mgr.copies_dir().to_path_buf();
-    let db_path_clone = db_path.to_string();
-    let git_identity_owned = copy_mgr.git_identity().clone();
-    let is_git = copy_mgr.is_git();
-
-    // Determine copy path from branch name (task/<task_id> → copies/<task_id>).
-    let copy_path = copy_mgr.copies_dir().join(
-        branch.strip_prefix("task/").unwrap_or(&branch),
-    );
-
-    tokio::task::spawn_blocking(move || {
-        let db =
-            enki_core::db::Db::open(&db_path_clone).expect("refinery: failed to open db");
-        let copy_mgr = CopyManager::new(project_root_owned, copies_dir_owned, git_identity_owned, is_git);
-        let outcome =
-            enki_core::refinery::process_merge(&copy_mgr, &copy_path, &branch, &base_branch, &db, &mr_id);
-        let _ = done_tx.send(MergerDone {
-            merge_request_id: mr_id,
-            outcome,
-        });
-    });
 }

@@ -89,6 +89,10 @@ pub(super) fn all_tool_definitions() -> Vec<Value> {
                                 "checkpoint": {
                                     "type": "boolean",
                                     "description": "If true, the execution pauses after this step's merge lands so the coordinator can review output and optionally add follow-up steps."
+                                },
+                                "role": {
+                                    "type": "string",
+                                    "description": "Agent role for this step (e.g. 'feature_developer', 'bug_fixer', 'researcher', 'code_referencer'). Omit for default worker behavior."
                                 }
                             },
                             "required": ["id", "title", "description"]
@@ -151,6 +155,10 @@ pub(super) fn all_tool_definitions() -> Vec<Value> {
                                 "checkpoint": {
                                     "type": "boolean",
                                     "description": "If true, pause execution after this step completes for review."
+                                },
+                                "role": {
+                                    "type": "string",
+                                    "description": "Agent role for this step (e.g. 'feature_developer', 'bug_fixer', 'researcher', 'code_referencer'). Omit for default worker behavior."
                                 }
                             },
                             "required": ["id", "title", "description"]

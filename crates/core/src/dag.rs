@@ -46,6 +46,9 @@ pub struct Node {
     pub tier: Option<Tier>,
     pub status: NodeStatus,
     pub checkpoint: bool,
+    /// Agent role for this step (e.g. "researcher", "feature_developer").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
     /// Edges to nodes this one depends on.
     pub deps: Vec<Edge>,
     /// Indices of nodes that depend on this one.
@@ -72,6 +75,7 @@ impl Dag {
                 tier,
                 status: NodeStatus::Ready,
                 checkpoint: false,
+                role: None,
                 deps: Vec::new(),
                 dependents: Vec::new(),
             }],
@@ -96,6 +100,7 @@ impl Dag {
                 tier: *tier,
                 status: NodeStatus::Pending,
                 checkpoint: false,
+                role: None,
                 deps: Vec::new(),
                 dependents: Vec::new(),
             });
@@ -120,7 +125,7 @@ impl Dag {
     }
 
     /// Build a DAG from step data with explicit edge conditions.
-    /// Each tuple is (step_id, title, description, tier, checkpoint, deps).
+    /// Each tuple is (step_id, title, description, tier, checkpoint, role, deps).
     #[allow(clippy::type_complexity)]
     pub fn from_steps_with_edges(
         steps: &[(
@@ -129,13 +134,16 @@ impl Dag {
             String,
             Option<Tier>,
             bool,
+            Option<String>,
             Vec<(String, EdgeCondition)>,
         )],
     ) -> Self {
         let mut nodes = Vec::with_capacity(steps.len());
         let mut index = HashMap::new();
 
-        for (i, (step_id, title, description, tier, checkpoint, _)) in steps.iter().enumerate() {
+        for (i, (step_id, title, description, tier, checkpoint, role, _)) in
+            steps.iter().enumerate()
+        {
             index.insert(step_id.clone(), i);
             nodes.push(Node {
                 id: step_id.clone(),
@@ -144,12 +152,13 @@ impl Dag {
                 tier: *tier,
                 status: NodeStatus::Pending,
                 checkpoint: *checkpoint,
+                role: role.clone(),
                 deps: Vec::new(),
                 dependents: Vec::new(),
             });
         }
 
-        for (step_id, _, _, _, _, dep_list) in steps {
+        for (step_id, _, _, _, _, _, dep_list) in steps {
             let node_idx = index[step_id];
             for (dep_id, condition) in dep_list {
                 if let Some(&dep_idx) = index.get(dep_id) {
@@ -178,6 +187,7 @@ impl Dag {
             String,
             Option<Tier>,
             bool,
+            Option<String>,
             Vec<(String, EdgeCondition)>,
         )],
     ) -> Result<(), String> {
@@ -193,7 +203,7 @@ impl Dag {
         }
 
         // Validate dep references exist (in existing DAG or new steps).
-        for (id, _, _, _, _, deps) in steps {
+        for (id, _, _, _, _, _, deps) in steps {
             for (dep_id, _) in deps {
                 if !self.index.contains_key(dep_id) && !new_ids.contains(dep_id.as_str()) {
                     return Err(format!(
@@ -207,7 +217,7 @@ impl Dag {
         let base_idx = self.nodes.len();
 
         // Append nodes.
-        for (i, (id, title, description, tier, checkpoint, _)) in steps.iter().enumerate() {
+        for (i, (id, title, description, tier, checkpoint, role, _)) in steps.iter().enumerate() {
             let idx = base_idx + i;
             self.index.insert(id.clone(), idx);
             self.nodes.push(Node {
@@ -217,13 +227,14 @@ impl Dag {
                 tier: *tier,
                 status: NodeStatus::Pending,
                 checkpoint: *checkpoint,
+                role: role.clone(),
                 deps: Vec::new(),
                 dependents: Vec::new(),
             });
         }
 
         // Wire up deps.
-        for (id, _, _, _, _, dep_list) in steps {
+        for (id, _, _, _, _, _, dep_list) in steps {
             let node_idx = self.index[id];
             for (dep_id, condition) in dep_list {
                 let dep_idx = self.index[dep_id];
@@ -877,6 +888,7 @@ mod tests {
                 "first".into(),
                 None,
                 false,
+                None,
                 vec![],
             ),
             (
@@ -885,6 +897,7 @@ mod tests {
                 "second".into(),
                 None,
                 false,
+                None,
                 vec![("a".into(), EdgeCondition::Completed)],
             ),
         ]);
@@ -907,6 +920,7 @@ mod tests {
                 "first".into(),
                 None,
                 false,
+                None,
                 vec![],
             ),
             (
@@ -915,6 +929,7 @@ mod tests {
                 "second".into(),
                 None,
                 false,
+                None,
                 vec![("a".into(), EdgeCondition::Started)],
             ),
         ]);
@@ -935,6 +950,7 @@ mod tests {
                 "first".into(),
                 None,
                 false,
+                None,
                 vec![],
             ),
             (
@@ -943,6 +959,7 @@ mod tests {
                 "second".into(),
                 None,
                 false,
+                None,
                 vec![("a".into(), EdgeCondition::Merged)],
             ),
         ]);
@@ -967,6 +984,7 @@ mod tests {
                 "first".into(),
                 None,
                 false,
+                None,
                 vec![],
             ),
             (
@@ -975,6 +993,7 @@ mod tests {
                 "second".into(),
                 None,
                 false,
+                None,
                 vec![],
             ),
             (
@@ -983,6 +1002,7 @@ mod tests {
                 "third".into(),
                 None,
                 false,
+                None,
                 vec![
                     ("a".into(), EdgeCondition::Started),
                     ("b".into(), EdgeCondition::Merged),
@@ -1033,6 +1053,7 @@ mod tests {
             "third".into(),
             None,
             false,
+            None,
             vec![("b".into(), EdgeCondition::Merged)],
         )]);
         assert!(result.is_ok());
@@ -1054,6 +1075,7 @@ mod tests {
             "second".into(),
             None,
             false,
+            None,
             vec![("a".into(), EdgeCondition::Merged)],
         )]);
         assert!(result.is_ok());
@@ -1070,6 +1092,7 @@ mod tests {
             "duplicate".into(),
             None,
             false,
+            None,
             vec![],
         )]);
         assert!(result.is_err());
@@ -1086,6 +1109,7 @@ mod tests {
             "second".into(),
             None,
             false,
+            None,
             vec![("nonexistent".into(), EdgeCondition::Merged)],
         )]);
         assert!(result.is_err());
@@ -1114,6 +1138,7 @@ mod tests {
             "third".into(),
             None,
             false,
+            None,
             vec![("b".into(), EdgeCondition::Merged)],
         )]);
         assert!(result.is_ok()); // no cycle: a→b→c is fine
@@ -1128,6 +1153,7 @@ mod tests {
                 "".into(),
                 None,
                 false,
+                None,
                 vec![("y".into(), EdgeCondition::Merged)],
             ),
             (
@@ -1136,6 +1162,7 @@ mod tests {
                 "".into(),
                 None,
                 false,
+                None,
                 vec![("x".into(), EdgeCondition::Merged)],
             ),
         ]);
@@ -1162,6 +1189,7 @@ mod tests {
                 "second".into(),
                 None,
                 false,
+                None,
                 vec![("a".into(), EdgeCondition::Merged)],
             ),
             (
@@ -1170,6 +1198,7 @@ mod tests {
                 "third".into(),
                 None,
                 false,
+                None,
                 vec![("b".into(), EdgeCondition::Merged)],
             ),
         ]);
@@ -1253,6 +1282,7 @@ mod tests {
             "Look at the problem".into(),
             Some(Tier::Light),
             true, // checkpoint
+            None,
             vec![],
         )]);
 

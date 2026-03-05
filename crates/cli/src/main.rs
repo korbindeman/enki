@@ -21,6 +21,9 @@ enum Cmd {
         /// Task ID for worker-role processes (used by enki_worker_report).
         #[arg(long)]
         task_id: Option<String>,
+        /// Disable file editing tools for this worker (used for read-only roles like researcher).
+        #[arg(long)]
+        no_edit: bool,
     },
 }
 
@@ -62,7 +65,7 @@ async fn main() {
                 }
             }
         }
-        Some(Cmd::Mcp { role, task_id }) => commands::mcp::run(&role, task_id.as_deref()),
+        Some(Cmd::Mcp { role, task_id, no_edit }) => commands::mcp::run(&role, task_id.as_deref(), no_edit),
     };
 
     if let Err(e) = result {

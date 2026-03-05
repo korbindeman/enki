@@ -164,6 +164,7 @@ impl Orchestrator {
                     s.description.clone(),
                     Some(s.tier),
                     s.checkpoint,
+                    s.role.clone(),
                     s.needs
                         .iter()
                         .map(|d| (d.step_id.clone(), d.condition))
@@ -312,6 +313,7 @@ impl Orchestrator {
                     s.description.clone(),
                     Some(s.tier),
                     s.checkpoint,
+                    s.role.clone(),
                     s.needs
                         .iter()
                         .map(|d| (d.step_id.clone(), d.condition))
@@ -386,6 +388,45 @@ impl Orchestrator {
                     title: result.title.clone(),
                 });
                 events.push(Event::QueueMerge(mr));
+            }
+            WorkerOutcome::Artifact { output } => {
+                // Store output.
+                if let Some(ref out) = output {
+                    let _ = self.db.insert_task_output(&result.task_id, out);
+                }
+                self.monitor.clear_retries(&result.task_id.0);
+                let _ = self.db.update_task_status(&result.task_id, TaskStatus::Done);
+
+                // Artifact steps skip the merge — mark both worker_done and
+                // step_completed immediately so dependents can proceed.
+                let is_checkpoint = if let (Some(eid), Some(sid)) = (&result.execution_id, &result.step_id) {
+                    let cp = self.scheduler.is_checkpoint(&eid.0, sid);
+                    self.scheduler.step_worker_done(&eid.0, sid, output.clone());
+                    self.scheduler.step_completed(&eid.0, sid, None);
+                    cp
+                } else {
+                    false
+                };
+
+                events.push(Event::WorkerCompleted {
+                    task_id: result.task_id.0.clone(),
+                    title: result.title.clone(),
+                });
+
+                if is_checkpoint {
+                    if let (Some(eid), Some(sid)) = (&result.execution_id, &result.step_id) {
+                        self.scheduler.pause_execution(&eid.0);
+                        events.push(Event::CheckpointReached {
+                            execution_id: eid.0.clone(),
+                            step_id: sid.clone(),
+                            title: result.title.clone(),
+                            output,
+                        });
+                    }
+                }
+
+                // No merge step — tick scheduler now to dispatch dependents.
+                events.extend(self.tick_scheduler());
             }
             WorkerOutcome::NoChanges => {
                 let _ = self
@@ -860,6 +901,7 @@ impl Orchestrator {
                     execution_id,
                     step_id,
                     upstream_outputs,
+                    role,
                     ..
                 } => {
                     // Update task status in DB.
@@ -873,6 +915,7 @@ impl Orchestrator {
                         execution_id: execution_id.clone(),
                         step_id: step_id.clone(),
                         upstream_outputs: upstream_outputs.clone(),
+                        role: role.clone(),
                     });
                 }
                 SchedulerAction::TaskBlocked {
@@ -1084,6 +1127,7 @@ mod tests {
                     tier: Tier::Heavy,
                     needs: vec![],
                     checkpoint: false,
+                    role: None,
                 },
                 StepDef {
                     id: "implement".into(),
@@ -1092,6 +1136,7 @@ mod tests {
                     tier: Tier::Standard,
                     needs: vec!["design".into()],
                     checkpoint: false,
+                    role: None,
                 },
                 StepDef {
                     id: "test".into(),
@@ -1100,6 +1145,7 @@ mod tests {
                     tier: Tier::Light,
                     needs: vec!["design".into()],
                     checkpoint: false,
+                    role: None,
                 },
             ],
         });
@@ -1203,6 +1249,7 @@ mod tests {
                     tier: Tier::Standard,
                     needs: vec![],
                     checkpoint: false,
+                    role: None,
                 },
                 StepDef {
                     id: "b".into(),
@@ -1211,6 +1258,7 @@ mod tests {
                     tier: Tier::Standard,
                     needs: vec!["a".into()],
                     checkpoint: false,
+                    role: None,
                 },
             ],
         });
@@ -1467,6 +1515,7 @@ mod tests {
                     tier: Tier::Standard,
                     needs: vec![],
                     checkpoint: false,
+                    role: None,
                 },
                 StepDef {
                     id: "b".into(),
@@ -1475,6 +1524,7 @@ mod tests {
                     tier: Tier::Standard,
                     needs: vec!["a".into()],
                     checkpoint: false,
+                    role: None,
                 },
             ],
         });

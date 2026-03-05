@@ -43,6 +43,8 @@ pub struct StepDef {
     pub tier: Tier,
     pub needs: Vec<StepDep>,
     pub checkpoint: bool,
+    /// Agent role for this step (e.g. "researcher", "feature_developer").
+    pub role: Option<String>,
 }
 
 /// Result reported by the CLI layer after a worker finishes.
@@ -60,6 +62,8 @@ pub struct WorkerResult {
 pub enum WorkerOutcome {
     /// Worker succeeded and has committed changes.
     Success { output: Option<String> },
+    /// Worker produced a markdown artifact (no code changes, skip merge).
+    Artifact { output: Option<String> },
     /// Worker completed but produced no changes on branch.
     NoChanges,
     /// Worker errored out.
@@ -136,6 +140,7 @@ pub enum Event {
         execution_id: Id,
         step_id: String,
         upstream_outputs: Vec<(String, String)>,
+        role: Option<String>,
     },
     /// Kill an ACP session.
     KillSession { session_id: String },

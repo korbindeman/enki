@@ -50,6 +50,7 @@ pub enum SchedulerAction {
         step_id: String,
         /// Outputs from completed upstream steps: (step_title, output_text).
         upstream_outputs: Vec<(String, String)>,
+        role: Option<String>,
     },
     /// A task was blocked because a dependency failed.
     TaskBlocked {
@@ -213,7 +214,7 @@ impl Scheduler {
                 .collect();
 
             for step_id in ready {
-                let (title, description, tier, upstream_outputs) = {
+                let (title, description, tier, role, upstream_outputs) = {
                     let node = exec.dag.get(&step_id).unwrap();
                     let tier = node.tier.unwrap_or(Tier::Standard);
 
@@ -229,7 +230,7 @@ impl Scheduler {
                         })
                         .collect();
 
-                    (node.title.clone(), node.description.clone(), tier, upstream)
+                    (node.title.clone(), node.description.clone(), tier, node.role.clone(), upstream)
                 };
 
                 if !self.running.can_run(tier, &self.limits) {
@@ -254,6 +255,7 @@ impl Scheduler {
                     execution_id: exec.execution_id.clone(),
                     step_id: step_id.clone(),
                     upstream_outputs,
+                    role,
                 });
             }
 
@@ -357,6 +359,7 @@ impl Scheduler {
             String,
             Option<Tier>,
             bool,
+            Option<String>,
             Vec<(String, EdgeCondition)>,
         )],
         new_step_tasks: HashMap<String, Id>,

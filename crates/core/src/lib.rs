@@ -8,3 +8,4 @@ pub mod scheduler;
 pub mod types;
 pub mod copy;
 pub mod hashline;
+pub mod roles;

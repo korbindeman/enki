@@ -8,46 +8,70 @@ use serde_json::{Value, json};
 use handlers::*;
 use tools::all_tool_definitions;
 
-fn tools_for_role(role: &str) -> &'static [&'static str] {
+const PLANNER_TOOLS: &[&str] = &[
+    "enki_status",
+    "enki_task_create",
+    "enki_task_list",
+    "enki_task_retry",
+    "enki_execution_create",
+    "enki_pause",
+    "enki_cancel",
+    "enki_stop_all",
+    "enki_mail_send",
+    "enki_mail_check",
+    "enki_mail_read",
+    "enki_mail_inbox",
+    "enki_mail_reply",
+    "enki_mail_thread",
+];
+
+const WORKER_TOOLS: &[&str] = &[
+    "enki_status",
+    "enki_task_list",
+    "enki_worker_report",
+    "enki_edit_file",
+    "enki_mail_send",
+    "enki_mail_check",
+    "enki_mail_read",
+    "enki_mail_inbox",
+    "enki_mail_reply",
+    "enki_mail_thread",
+];
+
+const WORKER_TOOLS_NO_EDIT: &[&str] = &[
+    "enki_status",
+    "enki_task_list",
+    "enki_worker_report",
+    "enki_mail_send",
+    "enki_mail_check",
+    "enki_mail_read",
+    "enki_mail_inbox",
+    "enki_mail_reply",
+    "enki_mail_thread",
+];
+
+const MERGER_TOOLS: &[&str] = &[
+    "enki_status",
+    "enki_task_list",
+];
+
+fn tools_for_role(role: &str, no_edit: bool) -> &'static [&'static str] {
     match role {
-        "planner" => &[
-            "enki_status",
-            "enki_task_create",
-            "enki_task_list",
-            "enki_task_retry",
-            "enki_execution_create",
-            "enki_pause",
-            "enki_cancel",
-            "enki_stop_all",
-            "enki_mail_send",
-            "enki_mail_check",
-            "enki_mail_read",
-            "enki_mail_inbox",
-            "enki_mail_reply",
-            "enki_mail_thread",
-        ],
-        "worker" => &[
-            "enki_status",
-            "enki_task_list",
-            "enki_worker_report",
-            "enki_edit_file",
-            "enki_mail_send",
-            "enki_mail_check",
-            "enki_mail_read",
-            "enki_mail_inbox",
-            "enki_mail_reply",
-            "enki_mail_thread",
-        ],
-        "merger" => &[
-            "enki_status",
-            "enki_task_list",
-        ],
+        "planner" => PLANNER_TOOLS,
+        "worker" => {
+            if no_edit {
+                WORKER_TOOLS_NO_EDIT
+            } else {
+                WORKER_TOOLS
+            }
+        }
+        "merger" => MERGER_TOOLS,
         _ => &[],
     }
 }
 
 /// Run the MCP stdio server. Reads JSON-RPC messages from stdin, writes responses to stdout.
-pub fn run(role: &str, task_id: Option<&str>) -> anyhow::Result<()> {
+pub fn run(role: &str, task_id: Option<&str>, no_edit: bool) -> anyhow::Result<()> {
     let role = role.to_string();
     let task_id = task_id.map(|s| s.to_string());
     let stdin = io::stdin();
@@ -70,8 +94,8 @@ pub fn run(role: &str, task_id: Option<&str>) -> anyhow::Result<()> {
         let response = match method {
             "initialize" => Some(handle_initialize(id)),
             "notifications/initialized" => None,
-            "tools/list" => Some(handle_tools_list(id, &role)),
-            "tools/call" => Some(handle_tools_call(id, &req["params"], &role, task_id.as_deref())),
+            "tools/list" => Some(handle_tools_list(id, &role, no_edit)),
+            "tools/call" => Some(handle_tools_call(id, &req["params"], &role, task_id.as_deref(), no_edit)),
             _ => id.map(|id| error_response(id, -32601, "method not found")),
         };
 
@@ -103,8 +127,8 @@ fn handle_initialize(id: Option<Value>) -> Value {
     })
 }
 
-fn handle_tools_list(id: Option<Value>, role: &str) -> Value {
-    let allowed = tools_for_role(role);
+fn handle_tools_list(id: Option<Value>, role: &str, no_edit: bool) -> Value {
+    let allowed = tools_for_role(role, no_edit);
     let tools: Vec<Value> = all_tool_definitions()
         .into_iter()
         .filter(|t| {
@@ -119,11 +143,11 @@ fn handle_tools_list(id: Option<Value>, role: &str) -> Value {
     })
 }
 
-fn handle_tools_call(id: Option<Value>, params: &Value, role: &str, task_id: Option<&str>) -> Value {
+fn handle_tools_call(id: Option<Value>, params: &Value, role: &str, task_id: Option<&str>, no_edit: bool) -> Value {
     let tool_name = params["name"].as_str().unwrap_or("");
     let args = &params["arguments"];
 
-    let allowed = tools_for_role(role);
+    let allowed = tools_for_role(role, no_edit);
     if !allowed.contains(&tool_name) {
         return json!({
             "jsonrpc": "2.0",

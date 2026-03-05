@@ -339,10 +339,10 @@ impl acp::Client for EnkiClient {
     }
 
     #[allow(clippy::await_holding_refcell_ref)]
-    async fn kill_terminal_command(
+    async fn kill_terminal(
         &self,
-        args: acp::KillTerminalCommandRequest,
-    ) -> acp::Result<acp::KillTerminalCommandResponse> {
+        args: acp::KillTerminalRequest,
+    ) -> acp::Result<acp::KillTerminalResponse> {
         let tid = args.terminal_id.to_string();
         let mut terminals = self.terminals.borrow_mut();
         let state = terminals
@@ -353,7 +353,7 @@ impl acp::Client for EnkiClient {
             let _ = child.kill().await;
         }
 
-        Ok(acp::KillTerminalCommandResponse::default())
+        Ok(acp::KillTerminalResponse::default())
     }
 
     async fn release_terminal(

@@ -158,6 +158,7 @@ pub(super) fn tool_execution_create(args: &Value) -> Result<String, String> {
             })
             .unwrap_or_default();
         let checkpoint = step["checkpoint"].as_bool().unwrap_or(false);
+        let role = step["role"].as_str().map(|s| s.to_string());
 
         if !step_ids.insert(id.clone()) {
             return Err(format!("duplicate step id: {id}"));
@@ -169,6 +170,7 @@ pub(super) fn tool_execution_create(args: &Value) -> Result<String, String> {
             tier,
             needs,
             checkpoint,
+            role,
         });
     }
 
@@ -303,6 +305,7 @@ pub(super) fn tool_execution_add_steps(args: &Value) -> Result<String, String> {
             .map(|arr| arr.iter().filter_map(parse_step_dep).collect())
             .unwrap_or_default();
         let checkpoint = step["checkpoint"].as_bool().unwrap_or(false);
+        let role = step["role"].as_str().map(|s| s.to_string());
 
         if existing_step_ids.contains(&id) {
             return Err(format!("step id '{id}' already exists in this execution"));
@@ -317,6 +320,7 @@ pub(super) fn tool_execution_add_steps(args: &Value) -> Result<String, String> {
             tier,
             needs,
             checkpoint,
+            role,
         });
     }
 

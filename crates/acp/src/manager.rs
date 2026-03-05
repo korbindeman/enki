@@ -207,7 +207,7 @@ impl AgentManager {
                 .client_capabilities(
                     acp::ClientCapabilities::new()
                         .fs(
-                            acp::FileSystemCapability::new()
+                            acp::FileSystemCapabilities::new()
                                 .read_text_file(true)
                                 .write_text_file(true),
                         )

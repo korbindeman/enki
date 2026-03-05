@@ -1,6 +1,33 @@
 /// Build the system prompt for the coordinator agent.
-pub(super) fn build_system_prompt(cwd: &std::path::Path) -> String {
+pub(super) fn build_system_prompt(
+    cwd: &std::path::Path,
+    roles: &std::collections::HashMap<String, enki_core::roles::RoleConfig>,
+) -> String {
     let cwd_display = cwd.display();
+
+    // Build the roles section dynamically.
+    let mut roles_section = String::from("\n## Available Worker Roles\n\nWhen creating steps, you can assign a `role` to specialize the worker agent:\n\n");
+    let mut role_names: Vec<&String> = roles.keys().collect();
+    role_names.sort();
+    for name in role_names {
+        let role = &roles[name];
+        let output_note = if role.output == enki_core::roles::OutputMode::Artifact {
+            " → produces markdown artifact"
+        } else {
+            " → produces code changes"
+        };
+        let edit_note = if role.can_edit { "" } else { " (read-only)" };
+        roles_section.push_str(&format!("- **{}** — {}{}{}\n", name, role.description, edit_note, output_note));
+    }
+    roles_section.push_str(r#"
+Omit `role` for default worker behavior (general-purpose, can edit files, produces code changes).
+
+### Output Types
+
+Workers produce two types of output:
+- **Code changes (branch)**: The worker modifies files on a branch that gets merged back to main. Used by `feature_developer`, `bug_fixer`, and the default worker.
+- **Markdown artifact**: The worker produces a research report saved to `.enki/artifacts/<execution_id>/<step_id>.md`. No code is modified, no merge happens. Used by `researcher`, `code_referencer`. Artifacts are available as context to downstream steps.
+"#);
 
     format!(
         r#"You are the **coordinator** for enki, a multi-agent coding orchestrator.
@@ -8,6 +35,8 @@ pub(super) fn build_system_prompt(cwd: &std::path::Path) -> String {
 ## Your Role
 
 You plan work, decompose user requests into tasks, assign complexity tiers, and track progress. You are the user's primary interface for managing a codebase with multiple AI worker agents.
+
+**Before creating any execution**, align with the user on scope. Ask clarifying questions when the request is ambiguous. Confirm what's in scope and what's not. The user should understand and agree with the plan before workers start running.
 
 ## Current Workspace
 
@@ -119,7 +148,8 @@ A programmatic refinery rebases and merges completed task branches. If a merge f
 - When asked about status, use `enki_status` or `enki_task_list` and report
 - You can also read files, explore the codebase, and answer questions directly
 
-Wait for the user's first message before taking any action."#
+Wait for the user's first message before taking any action.
+{roles_section}"#
     )
 }
 
@@ -128,9 +158,13 @@ pub(super) fn build_worker_prompt(
     title: &str,
     description: &str,
     upstream_outputs: &[(String, String)],
+    artifact_files: &[(String, std::path::PathBuf)],
+    role_prompt: Option<&str>,
+    artifact_path: Option<&std::path::Path>,
 ) -> String {
+    let persona = role_prompt.unwrap_or("You are a focused coding agent working on a single task.");
     let mut prompt = format!(
-        r#"You are a focused coding agent working on a single task.
+        r#"{persona}
 
 TASK: {title}
 {description}"#
@@ -143,8 +177,37 @@ TASK: {title}
         }
     }
 
-    prompt.push_str(
-        r#"
+    if !artifact_files.is_empty() {
+        prompt.push_str("\n\n## Research artifacts\n\nThe following research reports were produced by earlier steps. Read them if they are relevant to your task:\n\n");
+        for (step_title, path) in artifact_files {
+            prompt.push_str(&format!("- **{}**: `{}`\n", step_title, path.display()));
+        }
+    }
+
+    if let Some(path) = artifact_path {
+        let path_display = path.display();
+        prompt.push_str(&format!(
+            r#"
+
+You are producing a **research artifact**. Do NOT edit project source files.
+
+Write your complete findings as a markdown report to this file:
+
+    {path_display}
+
+Create the file and write your report directly to it. Structure it with clear headings, file paths, line numbers, and code snippets where relevant.
+
+Use the enki_worker_report tool to report what you're doing at each major phase of your work (e.g. "investigating auth module", "tracing data flow", "reviewing external repo").
+
+When you finish, put a brief summary (2-5 sentences) between [OUTPUT] and [/OUTPUT] tags. This summary will be visible to downstream steps as context:
+
+[OUTPUT]
+Brief summary of your findings and key conclusions.
+[/OUTPUT]"#
+        ));
+    } else {
+        prompt.push_str(
+            r#"
 
 Make focused changes. Only modify files relevant to your task. Do NOT commit, merge, or manage git branches — your changes are automatically committed and merged when you finish.
 
@@ -155,7 +218,8 @@ When you finish, output a summary between [OUTPUT] and [/OUTPUT] tags:
 [OUTPUT]
 Brief summary of changes made, files modified, decisions taken.
 [/OUTPUT]"#,
-    );
+        );
+    }
 
     prompt
 }

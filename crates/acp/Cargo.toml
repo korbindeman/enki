@@ -5,7 +5,7 @@ edition.workspace = true
 
 [dependencies]
 enki-core = { path = "../core" }
-agent-client-protocol = "0.9"
+agent-client-protocol = "0.10"
 tokio = { workspace = true }
 tokio-util = { version = "0.7", features = ["compat"] }
 async-trait = "0.1"
