@@ -281,8 +281,18 @@ impl ChatContext {
 
     fn sync_banner(&mut self) {
         let mut banner = self.title_lines.clone();
+        let w = self.canvas.content_width();
         if self.panel.is_visible() {
-            banner.extend(self.panel.render(self.canvas.content_width()));
+            // Replace the plain separator with a labeled one
+            if let Some(last) = banner.last_mut() {
+                let label = " workers ";
+                let rule_len = (w as usize).saturating_sub(label.len() + 3);
+                *last = Line::new(vec![Span::styled(
+                    format!("─── {label}{}", "─".repeat(rule_len)),
+                    Style::new().fg(Color::DarkGrey),
+                )]);
+            }
+            banner.extend(self.panel.render(w));
         }
         self.canvas.set_banner(&banner);
     }
@@ -375,6 +385,12 @@ impl Chat {
                 ));
             }
             let w = cx.canvas.content_width();
+            // Right-aligned hint
+            let hint = "[ctrl+w] toggle workers panel";
+            let left_len: usize = spans.iter().map(|s| s.text.chars().count()).sum();
+            let pad = (w as usize).saturating_sub(left_len + hint.len());
+            spans.push(Span::plain(" ".repeat(pad)));
+            spans.push(Span::styled(hint, Style::new().fg(Color::DarkGrey)));
             cx.title_lines = vec![
                 Line::new(spans),
                 lines::separator(w),

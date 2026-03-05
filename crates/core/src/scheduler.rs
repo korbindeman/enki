@@ -506,6 +506,29 @@ impl Scheduler {
         None
     }
 
+    /// Retry a failed/blocked node within an execution.
+    /// Resets the node and its blocked dependents so they can be re-dispatched.
+    pub fn retry_node(&mut self, execution_id: &str, step_id: &str) -> bool {
+        if let Some(exec) = self.executions.get_mut(execution_id) {
+            if exec.dag.retry_node(step_id) {
+                // Clear reported_blocked for any nodes that were just unblocked,
+                // so they can be re-reported if they fail again.
+                let unblocked: Vec<String> = exec
+                    .dag
+                    .nodes()
+                    .iter()
+                    .filter(|n| matches!(n.status, NodeStatus::Pending | NodeStatus::Ready))
+                    .map(|n| n.id.clone())
+                    .collect();
+                for id in unblocked {
+                    exec.reported_blocked.remove(&id);
+                }
+                return true;
+            }
+        }
+        false
+    }
+
     /// Resume a paused node within an execution.
     pub fn resume_node(&mut self, execution_id: &str, step_id: &str) -> bool {
         if let Some(exec) = self.executions.get_mut(execution_id) {

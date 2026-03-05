@@ -400,7 +400,16 @@ impl Orchestrator {
                 });
             }
             WorkerOutcome::Failed { ref error } => {
-                let retried = self.maybe_retry(&result.task_id, &result.title, error);
+                // Always mark the DAG node as failed first (consistent state machine).
+                self.notify_scheduler_failed(&result.execution_id, &result.step_id);
+
+                let retried = self.maybe_retry(
+                    &result.task_id,
+                    &result.title,
+                    error,
+                    &result.execution_id,
+                    &result.step_id,
+                );
 
                 if retried {
                     events.push(Event::WorkerFailed {
@@ -412,7 +421,6 @@ impl Orchestrator {
                     let _ = self
                         .db
                         .update_task_status(&result.task_id, TaskStatus::Failed);
-                    self.notify_scheduler_failed(&result.execution_id, &result.step_id);
 
                     events.push(Event::WorkerFailed {
                         task_id: result.task_id.0.clone(),
@@ -466,16 +474,16 @@ impl Orchestrator {
                 });
 
                 // If checkpoint: pause execution and notify coordinator.
-                if is_checkpoint {
-                    if let (Some(eid), Some(sid)) = (&mr.execution_id, &mr.step_id) {
-                        self.scheduler.pause_execution(&eid.0);
-                        events.push(Event::CheckpointReached {
-                            execution_id: eid.0.clone(),
-                            step_id: sid.clone(),
-                            title: mr.branch.clone(),
-                            output,
-                        });
-                    }
+                if is_checkpoint
+                    && let (Some(eid), Some(sid)) = (&mr.execution_id, &mr.step_id)
+                {
+                    self.scheduler.pause_execution(&eid.0);
+                    events.push(Event::CheckpointReached {
+                        execution_id: eid.0.clone(),
+                        step_id: sid.clone(),
+                        title: mr.branch.clone(),
+                        output,
+                    });
                 }
             }
             MergeOutcome::Conflicted(ref detail) => {
@@ -491,6 +499,27 @@ impl Orchestrator {
                     mr_id: mr.id.0.clone(),
                     task_id: mr.task_id.0.clone(),
                     branch: mr.branch.clone(),
+                });
+            }
+            MergeOutcome::NeedsResolution {
+                ref temp_dir,
+                ref conflict_files,
+                ref conflict_diff,
+            } => {
+                let _ = self.db.update_merge_status(&mr.id, MergeStatus::Resolving);
+                let detail = format!(
+                    "merge conflict in {} file(s): {}",
+                    conflict_files.len(),
+                    conflict_files.join(", ")
+                );
+                let _ = self.db.update_merge_review_note(&mr.id, &detail);
+                events.push(Event::MergeNeedsResolution {
+                    mr_id: mr.id.0.clone(),
+                    task_id: mr.task_id.clone(),
+                    temp_dir: temp_dir.clone(),
+                    default_branch: mr.base_branch.clone(),
+                    conflict_files: conflict_files.clone(),
+                    conflict_diff: conflict_diff.clone(),
                 });
             }
             MergeOutcome::VerifyFailed(ref detail) => {
@@ -533,17 +562,16 @@ impl Orchestrator {
     }
 
     fn retry_task(&mut self, task_id: Id) -> Vec<Event> {
-        // Reset the task to Ready.
+        // Reset the task to Pending in the DB.
         let _ = self.db.update_task_status(&task_id, TaskStatus::Pending);
         self.monitor.clear_retries(&task_id.0);
 
-        // Find the execution and step for this task.
+        // Find the execution and step for this task, then retry in the DAG.
+        // This resets the Failed node and un-blocks its transitive dependents.
         if let Some((exec_id, step_id)) = self.scheduler.find_task(&task_id) {
             let exec_id = exec_id.to_string();
             let step_id = step_id.to_string();
-            // Resume the node in the DAG (it might be Failed/Blocked).
-            // We need to reset it so the scheduler can re-dispatch.
-            self.scheduler.resume_node(&exec_id, &step_id);
+            self.scheduler.retry_node(&exec_id, &step_id);
         }
 
         self.tick_scheduler()
@@ -939,8 +967,16 @@ impl Orchestrator {
     }
 
     /// Check if a failed task should be retried (timeout/stuck only).
-    /// Returns true if the task was re-queued.
-    fn maybe_retry(&mut self, task_id: &Id, title: &str, error: &str) -> bool {
+    /// Returns true if the task was re-queued. The DAG node must already be
+    /// marked Failed before calling this.
+    fn maybe_retry(
+        &mut self,
+        task_id: &Id,
+        title: &str,
+        error: &str,
+        execution_id: &Option<Id>,
+        step_id: &Option<String>,
+    ) -> bool {
         let is_timeout = error.contains("timed out") || error.contains("stuck");
         if !is_timeout {
             return false;
@@ -950,6 +986,12 @@ impl Orchestrator {
         }
         let retry_count = self.monitor.record_retry(&task_id.0);
         let _ = self.db.update_task_status(task_id, TaskStatus::Pending);
+
+        // Reset the DAG node from Failed back to Pending/Ready.
+        if let (Some(eid), Some(sid)) = (execution_id, step_id) {
+            self.scheduler.retry_node(&eid.0, sid);
+        }
+
         tracing::info!(
             task_id = %task_id, title,
             retry = retry_count,
@@ -1265,9 +1307,12 @@ mod tests {
             .iter()
             .any(|e| matches!(e, Event::WorkerFailed { error, .. } if error.contains("retrying"))));
 
-        // Task should be Ready again (retried).
+        // Retry resets the DAG node, and tick_scheduler re-dispatches it immediately.
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::SpawnWorker { .. })));
         let task = orch.db().get_task(&task_id).unwrap();
-        assert_eq!(task.status, TaskStatus::Pending);
+        assert_eq!(task.status, TaskStatus::Running);
     }
 
     #[test]

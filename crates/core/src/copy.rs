@@ -28,6 +28,14 @@ impl GitIdentity {
         Ok(Self { name, email })
     }
 
+    /// Default identity used for internal copy commits when the source isn't a git repo.
+    pub fn default_enki() -> Self {
+        Self {
+            name: "enki".into(),
+            email: "enki@localhost".into(),
+        }
+    }
+
     /// Apply this identity as env vars on a `Command`.
     pub fn apply<'a>(&self, cmd: &'a mut Command) -> &'a mut Command {
         cmd.env("GIT_AUTHOR_NAME", &self.name)
@@ -109,45 +117,66 @@ pub fn head_sha(dir: &Path) -> Option<String> {
     git_ok(dir, &["rev-parse", "HEAD"])
 }
 
+/// Check whether a directory is inside a git repository.
+pub fn is_git_repo(dir: &Path) -> bool {
+    Command::new("git")
+        .args(["rev-parse", "--git-dir"])
+        .current_dir(dir)
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
 /// Manages copy-on-write clones of the project for worker isolation.
 ///
 /// Each worker gets a clone of the project at `.enki/copies/<task_id>` that
 /// includes everything (build artifacts, .gitignored files, node_modules, etc.).
 /// Uses platform-appropriate CoW (APFS on macOS, reflink on Linux) for instant,
-/// space-efficient clones. Git is only used to commit changes at task completion
-/// and merge them back into the source repo.
+/// space-efficient clones.
+///
+/// When the source is a git repo, copies branch off HEAD and merges use git.
+/// When it's not, copies get a fresh `git init` internally so workers still
+/// have git for tracking changes, but the final merge copies files back.
 pub struct CopyManager {
     project_root: PathBuf,
     copies_dir: PathBuf,
     git_identity: GitIdentity,
+    is_git: bool,
 }
 
 impl CopyManager {
-    pub fn new(project_root: PathBuf, copies_dir: PathBuf, git_identity: GitIdentity) -> Self {
+    pub fn new(project_root: PathBuf, copies_dir: PathBuf, git_identity: GitIdentity, is_git: bool) -> Self {
         Self {
             project_root,
             copies_dir,
             git_identity,
+            is_git,
         }
     }
 
     /// Create a copy-on-write clone of the project for a worker.
     ///
+    /// For git sources:
     /// 1. Record the current HEAD commit (the "base") and branch name
     /// 2. Clone each top-level entry except `.enki/` into a temp directory
     /// 3. Atomically rename the temp directory to the final path
     /// 4. `git checkout -b task/<task_id>` inside the copy
     ///
-    /// Skipping `.enki/` avoids copying nested copies and the database.
-    /// Using a temp directory + rename ensures the final path only appears
-    /// atomically — a crash mid-copy won't leave a partial copy at the
-    /// canonical path.
+    /// For non-git sources:
+    /// 1. Clone each top-level entry except `.enki/`
+    /// 2. `git init` inside the copy + commit everything as a baseline
+    /// 3. Create a task branch
     ///
     /// Returns `(copy_path, base_commit, base_branch)`. `base_commit` is `None`
     /// for unborn repos. `base_branch` is the branch to merge back into.
     pub fn create_copy(&self, task_id: &str) -> Result<(PathBuf, Option<String>, String)> {
-        let base_commit = git_ok(&self.project_root, &["rev-parse", "HEAD"]);
-        let base_branch = self.current_branch()?;
+        let (base_commit, base_branch) = if self.is_git {
+            (
+                git_ok(&self.project_root, &["rev-parse", "HEAD"]),
+                self.current_branch()?,
+            )
+        } else {
+            (None, "main".to_string())
+        };
 
         std::fs::create_dir_all(&self.copies_dir)?;
 
@@ -171,6 +200,10 @@ impl CopyManager {
             if name == ".enki" {
                 continue;
             }
+            // Non-git sources: also skip .git/ (there isn't one, but be safe)
+            if !self.is_git && name == ".git" {
+                continue;
+            }
             if let Err(e) = clone_entry(&entry.path(), &tmp_path.join(&name)) {
                 let _ = std::fs::remove_dir_all(&tmp_path);
                 return Err(e);
@@ -180,12 +213,51 @@ impl CopyManager {
         // Atomic rename (same filesystem, instant).
         std::fs::rename(&tmp_path, &copy_path)?;
 
-        // Create a new branch for the worker's changes.
-        let branch = format!("task/{task_id}");
-        if let Err(e) = git(&copy_path, &["checkout", "-b", &branch]) {
-            let _ = std::fs::remove_dir_all(&copy_path);
-            return Err(e);
+        if self.is_git {
+            // Git source: create a new branch for the worker's changes.
+            let branch = format!("task/{task_id}");
+            if let Err(e) = git(&copy_path, &["checkout", "-b", &branch]) {
+                let _ = std::fs::remove_dir_all(&copy_path);
+                return Err(e);
+            }
+        } else {
+            // Non-git source: initialize git inside the copy for internal tracking.
+            let init_steps: &[&[&str]] = &[
+                &["init"],
+                &["checkout", "-b", "main"],
+                &["add", "-A"],
+            ];
+            for args in init_steps {
+                if let Err(e) = git(&copy_path, args) {
+                    let _ = std::fs::remove_dir_all(&copy_path);
+                    return Err(e);
+                }
+            }
+            // Commit baseline with identity.
+            let mut cmd = Command::new("git");
+            cmd.args(["commit", "-m", "baseline", "--no-verify"]);
+            self.git_identity.apply(&mut cmd);
+            let out = cmd.current_dir(&copy_path).output()
+                .map_err(|e| CopyError::Git(format!("baseline commit: {e}")))?;
+            if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let _ = std::fs::remove_dir_all(&copy_path);
+                return Err(CopyError::Git(format!("baseline commit: {stderr}")));
+            }
+            // Create task branch off baseline.
+            let branch = format!("task/{task_id}");
+            if let Err(e) = git(&copy_path, &["checkout", "-b", &branch]) {
+                let _ = std::fs::remove_dir_all(&copy_path);
+                return Err(e);
+            }
         }
+
+        // For non-git, base_commit is the baseline commit we just created.
+        let base_commit = if self.is_git {
+            base_commit
+        } else {
+            head_sha(&copy_path)
+        };
 
         Ok((copy_path, base_commit, base_branch))
     }
@@ -291,12 +363,16 @@ impl CopyManager {
     pub fn git_identity(&self) -> &GitIdentity {
         &self.git_identity
     }
+
+    pub fn is_git(&self) -> bool {
+        self.is_git
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::Rng;
+    use rand::RngExt;
 
     fn tmp_dir(prefix: &str) -> PathBuf {
         let bytes: [u8; 4] = rand::rng().random();
@@ -324,7 +400,7 @@ mod tests {
             name: "test".into(),
             email: "test@test.com".into(),
         };
-        let mgr = CopyManager::new(source.clone(), copies, identity);
+        let mgr = CopyManager::new(source.clone(), copies, identity, true);
         (source, mgr)
     }
 

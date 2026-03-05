@@ -1,19 +1,7 @@
-mod doctor;
-mod history;
 mod init;
 pub mod mcp;
-mod run;
-mod status;
-mod stop;
-mod task;
 
-pub use doctor::doctor;
-pub use history::history;
 pub use init::init;
-pub use run::run;
-pub use status::status;
-pub use stop::stop;
-pub use task::{task, TaskCmd};
 
 use std::path::PathBuf;
 
@@ -34,7 +22,7 @@ pub fn enki_dir() -> anyhow::Result<PathBuf> {
     if candidate.join("db.sqlite").exists() {
         return Ok(candidate);
     }
-    anyhow::bail!("not an enki project (no .enki/ found in current directory). Run `enki init` first.");
+    anyhow::bail!("not an enki project (no .enki/ found in current directory). Run `enki` first.");
 }
 
 /// Path to the project's SQLite database.
@@ -64,7 +52,7 @@ pub fn open_db() -> anyhow::Result<Db> {
     let path = db_path()?;
     if !path.exists() {
         anyhow::bail!(
-            "not an enki project (no .enki/ found). Run `enki init` first."
+            "not an enki project (no .enki/ found). Run `enki` first."
         );
     }
     Ok(Db::open(path.to_str().unwrap())?)

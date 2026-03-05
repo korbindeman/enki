@@ -82,6 +82,8 @@ CREATE TABLE IF NOT EXISTS messages (
     thread_id   TEXT,
     reply_to    TEXT,
     read        INTEGER NOT NULL DEFAULT 0,
+    status      TEXT NOT NULL DEFAULT 'pending',
+    expires_at  TEXT,
     created_at  TEXT NOT NULL
 );
 
@@ -96,6 +98,7 @@ CREATE INDEX IF NOT EXISTS idx_merge_requests_session ON merge_requests(session_
 CREATE INDEX IF NOT EXISTS idx_messages_to_addr ON messages(to_addr);
 CREATE INDEX IF NOT EXISTS idx_messages_unread ON messages(to_addr, read);
 CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id);
+CREATE INDEX IF NOT EXISTS idx_messages_expires ON messages(expires_at);
 ";
 
 // --- Schema parsing for auto-migration ---
@@ -283,6 +286,7 @@ pub(super) fn row_to_message(row: &Row) -> rusqlite::Result<Message> {
     let priority_str: String = row.get(5)?;
     let msg_type_str: String = row.get(6)?;
     let read_int: i32 = row.get(9)?;
+    let status_str: String = row.get(10)?;
     Ok(Message {
         id: Id(row.get(0)?),
         from_addr: row.get(1)?,
@@ -294,6 +298,8 @@ pub(super) fn row_to_message(row: &Row) -> rusqlite::Result<Message> {
         thread_id: row.get(7)?,
         reply_to: row.get(8)?,
         read: read_int != 0,
-        created_at: parse_dt(row.get(10)?),
+        status: MessageStatus::from_str(&status_str).unwrap_or(MessageStatus::Pending),
+        expires_at: parse_opt_dt(row.get(11)?),
+        created_at: parse_dt(row.get(12)?),
     })
 }

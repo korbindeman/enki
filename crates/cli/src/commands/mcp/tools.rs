@@ -299,6 +299,15 @@ pub(super) fn all_tool_definitions() -> Vec<Value> {
                     "reply_to": {
                         "type": "string",
                         "description": "Optional message ID this is a reply to."
+                    },
+                    "msg_type": {
+                        "type": "string",
+                        "enum": ["info", "request"],
+                        "description": "Message type. 'request' creates a trackable request with auto-generated thread_id. Defaults to 'info'."
+                    },
+                    "ttl_seconds": {
+                        "type": "integer",
+                        "description": "Message expires after this many seconds. Omit for no expiration."
                     }
                 },
                 "required": ["to", "subject", "body"]
@@ -332,6 +341,43 @@ pub(super) fn all_tool_definitions() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {}
+            }
+        }),
+        json!({
+            "name": "enki_mail_reply",
+            "description": "Reply to a request message. Updates the original request's status and sends a response back to the sender.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "message_id": {
+                        "type": "string",
+                        "description": "ID of the request message to reply to."
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Response body."
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["accepted", "rejected", "completed"],
+                        "description": "Status to set on the original request. Defaults to 'accepted'."
+                    }
+                },
+                "required": ["message_id", "body"]
+            }
+        }),
+        json!({
+            "name": "enki_mail_thread",
+            "description": "View all messages in a conversation thread, in chronological order.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "thread_id": {
+                        "type": "string",
+                        "description": "Thread ID to view."
+                    }
+                },
+                "required": ["thread_id"]
             }
         }),
     ]

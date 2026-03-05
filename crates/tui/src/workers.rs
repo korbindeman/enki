@@ -43,11 +43,10 @@ struct WorkerEntry {
 /// Elapsed time is color-coded: green (<2m), yellow (2-5m), red (>5m).
 ///
 /// ```text
-/// ─── Workers (Ctrl+W to close) ─────────────────
+/// ─── workers ────────────────────────────────────
 ///  ▶ [standard] Implement auth module      2m 14s  Reading src/auth.rs
 ///  ▶ [light]    Write unit tests           0m 45s  Thinking
 ///  ▶ [heavy]    Design API schema          5m 02s  analyzing codebase
-/// ────────────────────────────────────────────────
 /// ```
 pub struct WorkerPanel {
     workers: HashMap<String, WorkerEntry>,
@@ -109,7 +108,7 @@ impl WorkerPanel {
 
     /// Whether the panel should be rendered.
     pub fn is_visible(&self) -> bool {
-        self.visible && !self.workers.is_empty()
+        self.visible
     }
 
     /// Number of tracked workers.
@@ -127,16 +126,15 @@ impl WorkerPanel {
         }
 
         let w = width as usize;
-        let mut lines = Vec::with_capacity(self.workers.len() + 2);
+        let mut lines = Vec::with_capacity(self.workers.len() + 1);
 
-        // Header
-        let header_text = " Workers (Ctrl+W to close) ";
-        let rule_len = w.saturating_sub(header_text.len() + 3);
-        let header = format!("─── {header_text}{}", "─".repeat(rule_len));
-        lines.push(Line::new(vec![Span::styled(
-            header,
-            Style::new().fg(Color::DarkGrey),
-        )]));
+        // Empty state
+        if self.workers.is_empty() {
+            lines.push(Line::new(vec![Span::styled(
+                "  no active workers",
+                Style::new().fg(Color::DarkGrey).italic(),
+            )]));
+        }
 
         // Worker rows in insertion order
         for task_id in &self.order {

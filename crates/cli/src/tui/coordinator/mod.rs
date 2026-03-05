@@ -1,20 +1,19 @@
 mod prompts;
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use enki_acp::{AgentManager, SessionUpdate};
-use enki_core::monitor;
 use enki_core::orchestrator::{
     Command, Event, MergeResult, Orchestrator, WorkerOutcome, WorkerResult,
 };
 use enki_core::scheduler::Limits;
-use enki_core::types::{Id, MergeStatus, Tier, short_id};
+use enki_core::types::{Id, MergeStatus, short_id};
 use enki_core::copy::{CopyManager, GitIdentity};
 use tokio::sync::mpsc;
 
-use prompts::{build_system_prompt, build_worker_prompt, extract_output};
+use prompts::{build_merger_prompt, build_system_prompt, build_worker_prompt, extract_output};
 
 /// Messages sent from the TUI to the coordinator thread.
 #[allow(dead_code)]
@@ -137,6 +136,7 @@ struct Runtime {
     mgr: AgentManager,
     tracker: std::rc::Rc<std::cell::RefCell<WorkerTracker>>,
     worker_done_tx: mpsc::UnboundedSender<WorkerDone>,
+    merger_agent_done_tx: mpsc::UnboundedSender<MergerAgentDone>,
     tx: mpsc::UnboundedSender<FromCoordinator>,
     enki_bin: PathBuf,
     copy_mgr: CopyManager,
@@ -250,6 +250,9 @@ impl Runtime {
             let events = self.orch.reconcile_merges();
             self.process_events(events, coord).await;
         }
+
+        // Expire old messages.
+        let _ = self.orch.db().delete_expired_messages();
     }
 
     /// Process orchestrator events: spawn workers, forward TUI messages, queue status updates.
@@ -279,7 +282,7 @@ impl Runtime {
                         }
 
                         match self.spawn_worker(
-                            &task_id, &title, &description, tier,
+                            &task_id, &title, &description,
                             &execution_id, &step_id, &upstream_outputs,
                         ).await {
                             Ok(()) => {
@@ -361,6 +364,47 @@ impl Runtime {
                             "- Merge {} conflicted — task {} needs resolution", short_id(&mr_id), short_id(&task_id)
                         ));
                     }
+                    Event::MergeNeedsResolution {
+                        mr_id, task_id, temp_dir, default_branch,
+                        conflict_files, conflict_diff,
+                    } => {
+                        coord.queue_event(format!(
+                            "- Merge conflict on task {} — spawning merger agent to resolve ({} file(s))",
+                            short_id(&task_id.0), conflict_files.len()
+                        ));
+
+                        // Get the task description for context.
+                        let task_desc = self.orch.db().get_task(&task_id)
+                            .map(|t| {
+                                let desc = t.description.unwrap_or_default();
+                                format!("Task: {}\n{}", t.title, desc)
+                            })
+                            .unwrap_or_else(|_| format!("Task: {}", task_id));
+
+                        match self.spawn_merger_agent(
+                            &mr_id, &task_id, &temp_dir, &default_branch,
+                            &conflict_files, &conflict_diff, &task_desc,
+                        ).await {
+                            Ok(()) => {
+                                tracing::info!(
+                                    mr_id, task_id = %task_id,
+                                    "merger agent spawned for conflict resolution"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::error!(mr_id, error = %e, "failed to spawn merger agent");
+                                // Clean up temp dir and report failure.
+                                let _ = std::fs::remove_dir_all(&temp_dir);
+                                let more = self.orch.handle(Command::MergeDone(MergeResult {
+                                    mr_id: Id(mr_id),
+                                    outcome: enki_core::refinery::MergeOutcome::Failed(
+                                        format!("failed to spawn merger agent: {e}")
+                                    ),
+                                }));
+                                events.extend(more);
+                            }
+                        }
+                    }
                     Event::MergeFailed { mr_id, task_id, branch, reason } => {
                         let _ = self.tx.send(FromCoordinator::MergeFailed {
                             mr_id: mr_id.clone(), task_id: task_id.clone(),
@@ -423,7 +467,6 @@ impl Runtime {
         task_id: &Id,
         title: &str,
         description: &str,
-        tier: Tier,
         execution_id: &Id,
         step_id: &str,
         upstream_outputs: &[(String, String)],
@@ -457,7 +500,6 @@ impl Runtime {
         self.tracker.borrow_mut().register(session_id.clone(), task_id.0.clone());
         self.orch.set_step_session(&execution_id.0, step_id, session_id.clone());
 
-        let timeout = monitor::tier_timeout(tier);
         let prompt = build_worker_prompt(title, description, upstream_outputs);
         let mgr_clone = self.mgr.clone();
         let tracker_clone = self.tracker.clone();
@@ -471,18 +513,7 @@ impl Runtime {
         let step_id_owned = Some(step_id.to_string());
 
         tokio::task::spawn_local(async move {
-            let result =
-                match tokio::time::timeout(timeout, mgr_clone.prompt(&session_id, &prompt)).await {
-                    Ok(result) => result,
-                    Err(_) => {
-                        tracing::warn!(session_id, task_id = %task_id, "worker timed out");
-                        let _ = mgr_clone.cancel(&session_id).await;
-                        Err(enki_acp::AcpError::Io(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            format!("worker timed out after {} minutes", timeout.as_secs() / 60),
-                        )))
-                    }
-                };
+            let result = mgr_clone.prompt(&session_id, &prompt).await;
             tracker_clone.borrow_mut().remove(&session_id);
             mgr_clone.kill_session(&session_id);
             let _ = done_tx.send(WorkerDone {
@@ -496,6 +527,70 @@ impl Runtime {
                 execution_id: exec_id_owned,
                 step_id: step_id_owned,
             });
+        });
+
+        Ok(())
+    }
+
+    async fn spawn_merger_agent(
+        &mut self,
+        mr_id: &str,
+        task_id: &Id,
+        temp_dir: &Path,
+        default_branch: &str,
+        conflict_files: &[String],
+        conflict_diff: &str,
+        task_desc: &str,
+    ) -> anyhow::Result<()> {
+        let merger_mcp = vec![enki_acp::acp_schema::McpServer::Stdio(
+            enki_acp::acp_schema::McpServerStdio::new("enki", &self.enki_bin)
+                .args(vec![
+                    "mcp".into(), "--role".into(), "merger".into(),
+                    "--task-id".into(), task_id.0.clone(),
+                ]),
+        )];
+
+        let agent_cmd =
+            enki_core::agent_runtime::resolve().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let args_ref: Vec<&str> = agent_cmd.args.iter().map(|s| s.as_str()).collect();
+        let session_id = self.mgr
+            .start_session_with_mcp(
+                agent_cmd.program.to_str().unwrap(), &args_ref,
+                temp_dir.to_path_buf(), merger_mcp, &format!("merger-{mr_id}"),
+            )
+            .await?;
+
+        self.tracker.borrow_mut().register(session_id.clone(), task_id.0.clone());
+
+        let prompt = build_merger_prompt(task_desc, conflict_files, conflict_diff);
+        let mgr_clone = self.mgr.clone();
+        let tracker_clone = self.tracker.clone();
+        let done_tx = self.merger_agent_done_tx.clone();
+        let mr_id_owned = Id(mr_id.to_string());
+        let temp_dir_owned = temp_dir.to_path_buf();
+        let default_branch_owned = default_branch.to_string();
+        let sid_clone = session_id.clone();
+
+        tokio::task::spawn_local(async move {
+            let result = mgr_clone.prompt(&session_id, &prompt).await;
+            tracker_clone.borrow_mut().remove(&session_id);
+            mgr_clone.kill_session(&session_id);
+
+            match result {
+                Ok(_) => {
+                    let _ = done_tx.send(MergerAgentDone {
+                        mr_id: mr_id_owned,
+                        temp_dir: temp_dir_owned,
+                        default_branch: default_branch_owned,
+                        session_id: sid_clone,
+                    });
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "merger agent failed");
+                    // Clean up and report failure through the merge done channel.
+                    let _ = std::fs::remove_dir_all(&temp_dir_owned);
+                }
+            }
         });
 
         Ok(())
@@ -521,6 +616,13 @@ struct WorkerDone {
 struct MergerDone {
     merge_request_id: Id,
     outcome: enki_core::refinery::MergeOutcome,
+}
+
+struct MergerAgentDone {
+    mr_id: Id,
+    temp_dir: PathBuf,
+    default_branch: String,
+    session_id: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -577,17 +679,19 @@ impl WorkerTracker {
 // CoordinatorSession — the coordinator agent's session state
 // ---------------------------------------------------------------------------
 
+type PromptResult = (u64, Result<String, String>);
+
 struct CoordinatorSession {
     session_id: String,
     pending_events: Vec<String>,
     prompt_generation: u64,
     active_prompt: Option<tokio::task::JoinHandle<()>>,
-    prompt_done_tx: mpsc::UnboundedSender<(u64, Result<String, String>)>,
+    prompt_done_tx: mpsc::UnboundedSender<PromptResult>,
     forward_updates: std::rc::Rc<std::cell::Cell<bool>>,
 }
 
 impl CoordinatorSession {
-    fn new(session_id: String) -> (Self, mpsc::UnboundedReceiver<(u64, Result<String, String>)>) {
+    fn new(session_id: String) -> (Self, mpsc::UnboundedReceiver<PromptResult>) {
         let (prompt_done_tx, prompt_done_rx) = mpsc::unbounded_channel();
         let session = Self {
             session_id,
@@ -859,21 +963,29 @@ async fn coordinator_loop(
 
     let project_root = crate::commands::project_root().unwrap_or_default();
     let copies_dir = crate::commands::copies_dir().unwrap_or_default();
-    let git_identity = match GitIdentity::from_git_config(&project_root) {
-        Ok(id) => id,
-        Err(e) => {
-            let _ = tx.send(FromCoordinator::Error(format!("git identity: {e}")));
-            return;
+    let is_git = enki_core::copy::is_git_repo(&project_root);
+    let git_identity = if is_git {
+        match GitIdentity::from_git_config(&project_root) {
+            Ok(id) => id,
+            Err(e) => {
+                let _ = tx.send(FromCoordinator::Error(format!("git identity: {e}")));
+                return;
+            }
         }
+    } else {
+        GitIdentity::default_enki()
     };
+
+    let (merger_agent_done_tx, mut merger_agent_done_rx) = mpsc::unbounded_channel::<MergerAgentDone>();
 
     let mut rt = Runtime {
         mgr,
         tracker,
         worker_done_tx,
+        merger_agent_done_tx,
         tx,
         enki_bin,
-        copy_mgr: CopyManager::new(project_root, copies_dir, git_identity),
+        copy_mgr: CopyManager::new(project_root, copies_dir, git_identity, is_git),
         orch,
         infra_broken: false,
         db_path,
@@ -909,10 +1021,10 @@ async fn coordinator_loop(
             }
 
             result = prompt_done_rx.recv() => {
-                if let Some((generation, result)) = result {
-                    if let Some(msg) = coord.handle_prompt_done(generation, result) {
-                        let _ = rt.tx.send(msg);
-                    }
+                if let Some((generation, result)) = result
+                    && let Some(msg) = coord.handle_prompt_done(generation, result)
+                {
+                    let _ = rt.tx.send(msg);
                 }
             }
 
@@ -953,6 +1065,38 @@ async fn coordinator_loop(
                 }
 
                 rt.process_events(events, &mut coord).await;
+            }
+
+            done = merger_agent_done_rx.recv() => {
+                let Some(done) = done else { continue };
+                rt.tracker.borrow_mut().remove(&done.session_id);
+                rt.orch.session_ended(&done.session_id);
+
+                // Run finish_merge in a blocking thread (it does git operations).
+                let mr_id = done.mr_id.clone();
+                let temp_dir = done.temp_dir.clone();
+                let default_branch = done.default_branch.clone();
+                let db_path_clone = rt.db_path.clone();
+                let project_root = rt.copy_mgr.project_root().to_path_buf();
+                let copies_dir = rt.copy_mgr.copies_dir().to_path_buf();
+                let git_identity = rt.copy_mgr.git_identity().clone();
+                let is_git = rt.copy_mgr.is_git();
+                let merger_done_tx_clone = merger_done_tx.clone();
+
+                tokio::task::spawn_blocking(move || {
+                    let db = enki_core::db::Db::open(&db_path_clone)
+                        .expect("finish_merge: failed to open db");
+                    let copy_mgr = CopyManager::new(
+                        project_root, copies_dir, git_identity, is_git,
+                    );
+                    let outcome = enki_core::refinery::finish_merge(
+                        &copy_mgr, &temp_dir, &default_branch, &db, &mr_id,
+                    );
+                    let _ = merger_done_tx_clone.send(MergerDone {
+                        merge_request_id: mr_id,
+                        outcome,
+                    });
+                });
             }
 
             _ = poll_interval.tick() => {
@@ -1084,6 +1228,7 @@ fn try_dispatch_merge(
     let copies_dir_owned = copy_mgr.copies_dir().to_path_buf();
     let db_path_clone = db_path.to_string();
     let git_identity_owned = copy_mgr.git_identity().clone();
+    let is_git = copy_mgr.is_git();
 
     // Determine copy path from branch name (task/<task_id> → copies/<task_id>).
     let copy_path = copy_mgr.copies_dir().join(
@@ -1093,7 +1238,7 @@ fn try_dispatch_merge(
     tokio::task::spawn_blocking(move || {
         let db =
             enki_core::db::Db::open(&db_path_clone).expect("refinery: failed to open db");
-        let copy_mgr = CopyManager::new(project_root_owned, copies_dir_owned, git_identity_owned);
+        let copy_mgr = CopyManager::new(project_root_owned, copies_dir_owned, git_identity_owned, is_git);
         let outcome =
             enki_core::refinery::process_merge(&copy_mgr, &copy_path, &branch, &base_branch, &db, &mr_id);
         let _ = done_tx.send(MergerDone {

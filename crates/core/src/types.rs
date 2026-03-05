@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 
 // --- ID type ---
@@ -122,6 +122,7 @@ pub enum MergeStatus {
     Queued,
     Processing,
     Rebasing,
+    Resolving,
     Verifying,
     Merged,
     Conflicted,
@@ -134,6 +135,7 @@ impl MergeStatus {
             Self::Queued => "queued",
             Self::Processing => "processing",
             Self::Rebasing => "rebasing",
+            Self::Resolving => "resolving",
             Self::Verifying => "verifying",
             Self::Merged => "merged",
             Self::Conflicted => "conflicted",
@@ -147,6 +149,7 @@ impl MergeStatus {
             "queued" => Some(Self::Queued),
             "processing" => Some(Self::Processing),
             "rebasing" => Some(Self::Rebasing),
+            "resolving" => Some(Self::Resolving),
             "verifying" => Some(Self::Verifying),
             "merged" => Some(Self::Merged),
             "conflicted" => Some(Self::Conflicted),
@@ -262,6 +265,37 @@ impl MessageType {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageStatus {
+    Pending,
+    Accepted,
+    Rejected,
+    Completed,
+}
+
+impl MessageStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+            Self::Completed => "completed",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(Self::Pending),
+            "accepted" => Some(Self::Accepted),
+            "rejected" => Some(Self::Rejected),
+            "completed" => Some(Self::Completed),
+            _ => None,
+        }
+    }
+}
+
 // --- Domain structs ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -325,5 +359,7 @@ pub struct Message {
     pub thread_id: Option<String>,
     pub reply_to: Option<String>,
     pub read: bool,
+    pub status: MessageStatus,
+    pub expires_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }

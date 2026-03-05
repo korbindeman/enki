@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::dag::EdgeCondition;
@@ -152,6 +153,15 @@ pub enum Event {
     MergeLanded { mr_id: String, task_id: String, branch: String },
     /// A merge had a conflict.
     MergeConflicted { mr_id: String, task_id: String, branch: String },
+    /// A merge has conflicts that need resolution by a merger agent.
+    MergeNeedsResolution {
+        mr_id: String,
+        task_id: Id,
+        temp_dir: PathBuf,
+        default_branch: String,
+        conflict_files: Vec<String>,
+        conflict_diff: String,
+    },
     /// A merge failed verification or rebasing.
     MergeFailed {
         mr_id: String,

@@ -1,17 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use crate::types::Tier;
-
-/// Maximum wall-clock time a worker prompt is allowed to run before being killed.
-pub fn tier_timeout(tier: Tier) -> Duration {
-    match tier {
-        Tier::Light => Duration::from_secs(10 * 60),    // 10 minutes
-        Tier::Standard => Duration::from_secs(30 * 60), // 30 minutes
-        Tier::Heavy => Duration::from_secs(60 * 60),    // 60 minutes
-    }
-}
-
 /// If no ACP session update arrives for this long, send a cancel signal.
 /// Soft timeout — tries to gracefully stop a stale worker before the
 /// hard per-tier timeout kills it.

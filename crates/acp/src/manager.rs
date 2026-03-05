@@ -309,7 +309,9 @@ fn truncate_json(value: Option<&serde_json::Value>) -> String {
     if s.len() <= MAX_LEN {
         s
     } else {
-        let truncated = s.len() - MAX_LEN;
-        format!("{}[...truncated {truncated} chars]", &s[..MAX_LEN])
+        // Find the largest valid char boundary at or before MAX_LEN
+        let end = s.floor_char_boundary(MAX_LEN);
+        let truncated = s.len() - end;
+        format!("{}[...truncated {truncated} bytes]", &s[..end])
     }
 }

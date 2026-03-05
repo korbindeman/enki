@@ -12,39 +12,8 @@ struct Cli {
 
 #[derive(clap::Subcommand)]
 enum Cmd {
-    /// Initialize enki in the current project.
-    Init,
-    /// Manage tasks.
-    Task {
-        #[command(subcommand)]
-        cmd: commands::TaskCmd,
-    },
-    /// Run a single task via an ACP agent.
-    Run {
-        /// Task ID to run.
-        task_id: String,
-        /// Agent command (default: "bunx").
-        #[arg(long, default_value = "bunx")]
-        agent: String,
-        /// Additional agent args.
-        #[arg(long, default_value = "@zed-industries/claude-agent-acp")]
-        agent_args: String,
-        /// Keep the copy after the run instead of cleaning it up.
-        #[arg(long)]
-        keep: bool,
-    },
-    /// Show workspace status.
-    Status,
-    /// Show past session history.
-    History {
-        /// Session ID to show details for.
-        session_id: Option<String>,
-    },
-    /// Diagnose project health (copies, agent, logs).
-    Doctor,
-    /// Stop all running workers immediately.
-    Stop,
     /// Run as an MCP stdio server (used by ACP agents, not for direct use).
+    #[command(hide = true)]
     Mcp {
         /// Agent role: planner, merger, or worker. Controls which tools are exposed.
         #[arg(long, default_value = "planner")]
@@ -93,18 +62,6 @@ async fn main() {
                 }
             }
         }
-        Some(Cmd::Init) => commands::init().await,
-        Some(Cmd::Task { cmd }) => commands::task(cmd).await,
-        Some(Cmd::Run {
-            task_id,
-            agent,
-            agent_args,
-            keep,
-        }) => commands::run(&task_id, &agent, &agent_args, keep, enki_bin).await,
-        Some(Cmd::Status) => commands::status().await,
-        Some(Cmd::History { session_id }) => commands::history(session_id).await,
-        Some(Cmd::Doctor) => commands::doctor().await,
-        Some(Cmd::Stop) => commands::stop().await,
         Some(Cmd::Mcp { role, task_id }) => commands::mcp::run(&role, task_id.as_deref()),
     };
 

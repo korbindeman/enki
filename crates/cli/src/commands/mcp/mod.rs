@@ -23,6 +23,8 @@ fn tools_for_role(role: &str) -> &'static [&'static str] {
             "enki_mail_check",
             "enki_mail_read",
             "enki_mail_inbox",
+            "enki_mail_reply",
+            "enki_mail_thread",
         ],
         "worker" => &[
             "enki_status",
@@ -33,6 +35,12 @@ fn tools_for_role(role: &str) -> &'static [&'static str] {
             "enki_mail_check",
             "enki_mail_read",
             "enki_mail_inbox",
+            "enki_mail_reply",
+            "enki_mail_thread",
+        ],
+        "merger" => &[
+            "enki_status",
+            "enki_task_list",
         ],
         _ => &[],
     }
@@ -145,11 +153,14 @@ fn handle_tools_call(id: Option<Value>, params: &Value, role: &str, task_id: Opt
         "enki_mail_check" => tool_mail_check(&my_addr),
         "enki_mail_read" => tool_mail_read(args),
         "enki_mail_inbox" => tool_mail_inbox(&my_addr),
+        "enki_mail_reply" => tool_mail_reply(args, &my_addr),
+        "enki_mail_thread" => tool_mail_thread(args),
         _ => Err(format!("unknown tool: {tool_name}")),
     };
 
-    // Piggyback: only attach mail notice on worker_report (the periodic heartbeat tool).
-    let result = if tool_name == "enki_worker_report" {
+    // Piggyback: attach mail notice on every worker tool call so agents
+    // discover mail on their next action, not just on heartbeats.
+    let result = if role == "worker" {
         match result {
             Ok(mut text) => {
                 if let Ok(notice) = mail_notice(&my_addr)

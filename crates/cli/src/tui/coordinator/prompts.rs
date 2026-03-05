@@ -160,6 +160,48 @@ Brief summary of changes made, files modified, decisions taken.
     prompt
 }
 
+/// Build the prompt for a merger agent that resolves merge conflicts.
+pub(super) fn build_merger_prompt(
+    task_desc: &str,
+    conflict_files: &[String],
+    conflict_diff: &str,
+) -> String {
+    let file_list = conflict_files.join("\n  - ");
+    // Truncate diff to avoid overwhelming the agent.
+    let diff = if conflict_diff.len() > 8000 {
+        &conflict_diff[..8000]
+    } else {
+        conflict_diff
+    };
+
+    format!(
+        r#"You are a merge conflict resolver. A parallel worker's changes conflicted with the main branch during merge.
+
+## Context
+
+{task_desc}
+
+## Conflicted Files
+
+  - {file_list}
+
+## Conflict Diff
+
+```
+{diff}
+```
+
+## Instructions
+
+1. Read each conflicted file to understand both sides of the conflict
+2. Resolve the conflicts by keeping both sides' changes where they don't semantically conflict, or making a judgment call when they do
+3. After resolving each file, run `git add <file>` to mark it resolved
+4. Once all conflicts are resolved, run `git commit --no-edit` to complete the merge
+
+Do NOT change any files beyond what's needed to resolve the conflicts. The goal is to produce a clean merge that preserves both sides' intent."#
+    )
+}
+
 /// Extract the `[OUTPUT]...[/OUTPUT]` section from a worker's result.
 /// Falls back to the last 500 chars if no tags are found.
 pub(super) fn extract_output(result: &str) -> Option<String> {

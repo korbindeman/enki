@@ -548,8 +548,8 @@ impl Db {
 
     pub fn insert_message(&self, msg: &Message) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO messages (id, from_addr, to_addr, subject, body, priority, msg_type, thread_id, reply_to, read, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO messages (id, from_addr, to_addr, subject, body, priority, msg_type, thread_id, reply_to, read, status, expires_at, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 msg.id.as_str(),
                 msg.from_addr,
@@ -561,6 +561,8 @@ impl Db {
                 msg.thread_id,
                 msg.reply_to,
                 msg.read as i32,
+                msg.status.as_str(),
+                msg.expires_at.map(|dt| dt.to_rfc3339()),
                 msg.created_at.to_rfc3339(),
             ],
         )?;
@@ -569,11 +571,11 @@ impl Db {
 
     pub fn list_messages(&self, to_addr: &str, unread_only: bool) -> Result<Vec<Message>> {
         let sql = if unread_only {
-            "SELECT id, from_addr, to_addr, subject, body, priority, msg_type, thread_id, reply_to, read, created_at
+            "SELECT id, from_addr, to_addr, subject, body, priority, msg_type, thread_id, reply_to, read, status, expires_at, created_at
              FROM messages WHERE to_addr = ?1 AND read = 0
              ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, created_at DESC"
         } else {
-            "SELECT id, from_addr, to_addr, subject, body, priority, msg_type, thread_id, reply_to, read, created_at
+            "SELECT id, from_addr, to_addr, subject, body, priority, msg_type, thread_id, reply_to, read, status, expires_at, created_at
              FROM messages WHERE to_addr = ?1
              ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, created_at DESC"
         };
@@ -586,7 +588,7 @@ impl Db {
     pub fn get_message(&self, id: &str) -> Result<Message> {
         self.conn
             .query_row(
-                "SELECT id, from_addr, to_addr, subject, body, priority, msg_type, thread_id, reply_to, read, created_at
+                "SELECT id, from_addr, to_addr, subject, body, priority, msg_type, thread_id, reply_to, read, status, expires_at, created_at
                  FROM messages WHERE id = ?1",
                 params![id],
                 row_to_message,
@@ -626,11 +628,40 @@ impl Db {
 
     pub fn list_thread(&self, thread_id: &str) -> Result<Vec<Message>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, from_addr, to_addr, subject, body, priority, msg_type, thread_id, reply_to, read, created_at
+            "SELECT id, from_addr, to_addr, subject, body, priority, msg_type, thread_id, reply_to, read, status, expires_at, created_at
              FROM messages WHERE thread_id = ?1
              ORDER BY created_at ASC",
         )?;
         let rows = stmt.query_map(params![thread_id], row_to_message)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(DbError::Sqlite)
+    }
+
+    pub fn update_message_status(&self, id: &str, status: MessageStatus) -> Result<()> {
+        let updated = self.conn.execute(
+            "UPDATE messages SET status = ?1 WHERE id = ?2",
+            params![status.as_str(), id],
+        )?;
+        if updated == 0 {
+            return Err(DbError::NotFound(format!("message {id}")));
+        }
+        Ok(())
+    }
+
+    pub fn delete_expired_messages(&self) -> Result<u64> {
+        let now = Utc::now().to_rfc3339();
+        let deleted = self.conn.execute(
+            "DELETE FROM messages WHERE expires_at IS NOT NULL AND expires_at < ?1",
+            params![now],
+        )?;
+        Ok(deleted as u64)
+    }
+
+    pub fn list_running_worker_addrs(&self, session_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT 'worker/' || id FROM tasks WHERE status = 'running' AND session_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![session_id], |row| row.get(0))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(DbError::Sqlite)
     }

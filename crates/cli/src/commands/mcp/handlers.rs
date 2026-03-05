@@ -4,7 +4,7 @@ use chrono::Utc;
 use enki_core::dag::EdgeCondition;
 use enki_core::orchestrator::{StepDef, StepDep};
 use enki_core::types::{
-    Execution, ExecutionStatus, Id, Message, MessagePriority, MessageType, Task, TaskStatus, Tier,
+    Execution, ExecutionStatus, Id, Message, MessagePriority, MessageStatus, MessageType, Task, TaskStatus, Tier,
 };
 use serde_json::{Value, json};
 
@@ -153,7 +153,7 @@ pub(super) fn tool_execution_create(args: &Value) -> Result<String, String> {
             .as_array()
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|v| parse_step_dep(v))
+                    .filter_map(parse_step_dep)
                     .collect()
             })
             .unwrap_or_default();
@@ -300,7 +300,7 @@ pub(super) fn tool_execution_add_steps(args: &Value) -> Result<String, String> {
             Tier::from_str(tier_str).ok_or_else(|| format!("invalid tier: {tier_str}"))?;
         let needs: Vec<StepDep> = step["needs"]
             .as_array()
-            .map(|arr| arr.iter().filter_map(|v| parse_step_dep(v)).collect())
+            .map(|arr| arr.iter().filter_map(parse_step_dep).collect())
             .unwrap_or_default();
         let checkpoint = step["checkpoint"].as_bool().unwrap_or(false);
 
@@ -596,11 +596,92 @@ pub(super) fn tool_mail_send(args: &Value, from_addr: &str) -> Result<String, St
     let priority_str = args["priority"].as_str().unwrap_or("normal");
     let priority = MessagePriority::from_str(priority_str)
         .ok_or_else(|| format!("invalid priority: {priority_str}"))?;
-    let thread_id = args["thread_id"].as_str().map(String::from);
+
+    let msg_type_str = args["msg_type"].as_str().unwrap_or("info");
+    let msg_type = MessageType::from_str(msg_type_str)
+        .ok_or_else(|| format!("invalid msg_type: {msg_type_str} (use: info, request)"))?;
+
+    let thread_id = if let Some(tid) = args["thread_id"].as_str() {
+        Some(tid.to_string())
+    } else if msg_type == MessageType::Request {
+        Some(Id::new("thread").to_string())
+    } else {
+        None
+    };
     let reply_to = args["reply_to"].as_str().map(String::from);
+
+    let expires_at = args["ttl_seconds"].as_u64().map(|ttl| {
+        Utc::now() + chrono::Duration::seconds(ttl as i64)
+    });
+
+    let status = if msg_type == MessageType::Request {
+        MessageStatus::Pending
+    } else {
+        MessageStatus::Completed
+    };
 
     let db = open_db().map_err(|e| e.to_string())?;
     let now = Utc::now();
+
+    // Broadcast fan-out: create individual messages per active worker.
+    if to == "@workers" {
+        let session_id = std::env::var("ENKI_SESSION_ID")
+            .map_err(|_| "ENKI_SESSION_ID not set")?;
+        let worker_addrs = db.list_running_worker_addrs(&session_id)
+            .map_err(|e| e.to_string())?;
+
+        // Insert the canonical @workers message for thread tracking.
+        let canonical = Message {
+            id: Id::new("msg"),
+            from_addr: from_addr.to_string(),
+            to_addr: "@workers".to_string(),
+            subject: subject.to_string(),
+            body: body.to_string(),
+            priority,
+            msg_type,
+            thread_id: thread_id.clone(),
+            reply_to: reply_to.clone(),
+            read: true, // canonical copy is not for reading directly
+            status,
+            expires_at,
+            created_at: now,
+        };
+        db.insert_message(&canonical).map_err(|e| e.to_string())?;
+
+        // Fan out to each active worker.
+        let mut count = 0;
+        for addr in &worker_addrs {
+            let msg = Message {
+                id: Id::new("msg"),
+                from_addr: from_addr.to_string(),
+                to_addr: addr.clone(),
+                subject: subject.to_string(),
+                body: body.to_string(),
+                priority,
+                msg_type,
+                thread_id: thread_id.clone(),
+                reply_to: reply_to.clone(),
+                read: false,
+                status,
+                expires_at,
+                created_at: now,
+            };
+            db.insert_message(&msg).map_err(|e| e.to_string())?;
+            count += 1;
+        }
+
+        write_signal_file(&json!({
+            "type": "mail",
+            "message_id": canonical.id.as_str(),
+            "from": from_addr,
+            "to": "@workers",
+            "subject": subject,
+            "priority": priority_str,
+        }))?;
+
+        return Ok(format!("Broadcast sent to {count} worker(s): \"{subject}\" ({})", canonical.id));
+    }
+
     let msg = Message {
         id: Id::new("msg"),
         from_addr: from_addr.to_string(),
@@ -608,16 +689,17 @@ pub(super) fn tool_mail_send(args: &Value, from_addr: &str) -> Result<String, St
         subject: subject.to_string(),
         body: body.to_string(),
         priority,
-        msg_type: MessageType::Info,
+        msg_type,
         thread_id,
         reply_to,
         read: false,
+        status,
+        expires_at,
         created_at: now,
     };
 
     db.insert_message(&msg).map_err(|e| e.to_string())?;
 
-    // Signal the coordinator so it can surface in TUI.
     write_signal_file(&json!({
         "type": "mail",
         "message_id": msg.id.as_str(),
@@ -704,6 +786,79 @@ pub(super) fn tool_mail_inbox(my_addr: &str) -> Result<String, String> {
             "  {}{} | [{}] {} | from: {} | {}",
             read_marker, msg.id, msg.priority.as_str(), msg.subject, msg.from_addr, ts
         ));
+    }
+    Ok(lines.join("\n"))
+}
+
+pub(super) fn tool_mail_reply(args: &Value, from_addr: &str) -> Result<String, String> {
+    let message_id = args["message_id"].as_str().ok_or("missing required parameter: message_id")?;
+    let body = args["body"].as_str().ok_or("missing required parameter: body")?;
+    let status_str = args["status"].as_str().unwrap_or("accepted");
+    let status = MessageStatus::from_str(status_str)
+        .ok_or_else(|| format!("invalid status: {status_str} (use: accepted, rejected, completed)"))?;
+
+    let db = open_db().map_err(|e| e.to_string())?;
+    let original = db.get_message(message_id).map_err(|e| e.to_string())?;
+
+    if original.msg_type != MessageType::Request {
+        return Err(format!("message {} is not a request (type: {})", message_id, original.msg_type.as_str()));
+    }
+
+    db.update_message_status(message_id, status).map_err(|e| e.to_string())?;
+
+    let now = Utc::now();
+    let reply = Message {
+        id: Id::new("msg"),
+        from_addr: from_addr.to_string(),
+        to_addr: original.from_addr.clone(),
+        subject: format!("Re: {}", original.subject),
+        body: body.to_string(),
+        priority: original.priority,
+        msg_type: MessageType::Response,
+        thread_id: original.thread_id.clone(),
+        reply_to: Some(message_id.to_string()),
+        read: false,
+        status: MessageStatus::Completed,
+        expires_at: None,
+        created_at: now,
+    };
+
+    db.insert_message(&reply).map_err(|e| e.to_string())?;
+
+    write_signal_file(&json!({
+        "type": "mail",
+        "message_id": reply.id.as_str(),
+        "from": from_addr,
+        "to": original.from_addr,
+        "subject": reply.subject,
+        "priority": reply.priority.as_str(),
+    }))?;
+
+    Ok(format!("Reply sent to {}: status={} ({})", original.from_addr, status_str, reply.id))
+}
+
+pub(super) fn tool_mail_thread(args: &Value) -> Result<String, String> {
+    let thread_id = args["thread_id"].as_str().ok_or("missing required parameter: thread_id")?;
+    let db = open_db().map_err(|e| e.to_string())?;
+    let messages = db.list_thread(thread_id).map_err(|e| e.to_string())?;
+
+    if messages.is_empty() {
+        return Ok(format!("No messages in thread {thread_id}."));
+    }
+
+    let mut lines = vec![format!("Thread {thread_id} ({} message(s)):", messages.len())];
+    for msg in &messages {
+        let ts = msg.created_at.format("%H:%M:%S");
+        lines.push(format!(
+            "  {} | [{}] {} -> {} | {} | status: {} | {}",
+            msg.id, msg.msg_type.as_str(), msg.from_addr, msg.to_addr,
+            msg.subject, msg.status.as_str(), ts
+        ));
+        if !msg.body.is_empty() {
+            for line in msg.body.lines() {
+                lines.push(format!("    > {line}"));
+            }
+        }
     }
     Ok(lines.join("\n"))
 }

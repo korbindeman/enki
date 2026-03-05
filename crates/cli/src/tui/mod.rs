@@ -48,10 +48,10 @@ impl Handler<FromCoordinator> for CoordinatorHandler<'_> {
     fn on_message(&mut self, msg: FromCoordinator, cx: &mut ChatContext) {
         match msg {
             FromCoordinator::Connected => {
-                cx.print(&lines::system("Coordinator connected. Initializing..."));
+                cx.print_or_update("coordinator:init", &lines::system("Coordinator initializing..."));
             }
             FromCoordinator::Ready => {
-                cx.print(&lines::system("Coordinator ready."));
+                cx.print_or_update("coordinator:init", &lines::system("Coordinator ready."));
             }
             FromCoordinator::Text(text) => {
                 cx.stream(&text);

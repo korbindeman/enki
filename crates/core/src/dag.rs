@@ -4,21 +4,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::Tier;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EdgeCondition {
     /// Dep's merge must have landed (node status == Done). This is the default.
+    #[default]
     Merged,
     /// Dep's worker must have finished (node status == WorkerDone or Done).
     Completed,
     /// Dep just needs to have started running (node status == Running, WorkerDone, or Done).
     Started,
-}
-
-impl Default for EdgeCondition {
-    fn default() -> Self {
-        Self::Merged
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -369,6 +364,35 @@ impl Dag {
         } else {
             NodeStatus::Pending
         };
+        true
+    }
+
+    /// Retry a failed node: reset it (and its blocked dependents) so it can run again.
+    /// Returns false if the node isn't in a retryable state (Failed or Blocked).
+    pub fn retry_node(&mut self, id: &str) -> bool {
+        let Some(&idx) = self.index.get(id) else {
+            return false;
+        };
+        if !matches!(
+            self.nodes[idx].status,
+            NodeStatus::Failed | NodeStatus::Blocked
+        ) {
+            return false;
+        }
+
+        // Reset the node itself.
+        self.nodes[idx].status = NodeStatus::Pending;
+
+        // Un-block transitive dependents that were blocked by this failure.
+        let mut stack = self.nodes[idx].dependents.clone();
+        while let Some(dep_idx) = stack.pop() {
+            if self.nodes[dep_idx].status == NodeStatus::Blocked {
+                self.nodes[dep_idx].status = NodeStatus::Pending;
+                stack.extend(self.nodes[dep_idx].dependents.iter().copied());
+            }
+        }
+
+        self.evaluate_ready();
         true
     }
 
@@ -1157,6 +1181,69 @@ mod tests {
     }
 
     // --- Checkpoint field test ---
+
+    // --- retry_node tests ---
+
+    #[test]
+    fn retry_failed_node() {
+        let mut dag = make_dag();
+        dag.mark_running("design");
+        dag.mark_failed("design");
+
+        // All dependents should be blocked.
+        assert_eq!(dag.get("design").unwrap().status, NodeStatus::Failed);
+        assert_eq!(dag.get("implement").unwrap().status, NodeStatus::Blocked);
+
+        // Retry design.
+        assert!(dag.retry_node("design"));
+        assert_eq!(dag.get("design").unwrap().status, NodeStatus::Ready); // no deps → Ready
+        assert_eq!(dag.get("implement").unwrap().status, NodeStatus::Pending);
+        assert_eq!(dag.get("test").unwrap().status, NodeStatus::Pending);
+        assert_eq!(dag.get("review").unwrap().status, NodeStatus::Pending);
+        assert_eq!(dag.get("merge").unwrap().status, NodeStatus::Pending);
+    }
+
+    #[test]
+    fn retry_failed_mid_graph() {
+        let mut dag = make_dag();
+        dag.mark_running("design");
+        dag.mark_done("design");
+        dag.mark_running("implement");
+        dag.mark_running("test");
+        dag.mark_failed("implement");
+
+        // test is still running, review/merge are blocked.
+        assert_eq!(dag.get("test").unwrap().status, NodeStatus::Running);
+        assert_eq!(dag.get("review").unwrap().status, NodeStatus::Blocked);
+        assert_eq!(dag.get("merge").unwrap().status, NodeStatus::Blocked);
+
+        // Retry implement.
+        assert!(dag.retry_node("implement"));
+        assert_eq!(dag.get("implement").unwrap().status, NodeStatus::Ready); // design is Done
+        assert_eq!(dag.get("review").unwrap().status, NodeStatus::Pending); // unblocked but deps not met
+        assert_eq!(dag.get("merge").unwrap().status, NodeStatus::Pending);
+    }
+
+    #[test]
+    fn retry_non_failed_node_rejected() {
+        let mut dag = make_dag();
+        // design is Ready — can't retry.
+        assert!(!dag.retry_node("design"));
+
+        dag.mark_running("design");
+        // Running — can't retry.
+        assert!(!dag.retry_node("design"));
+
+        dag.mark_done("design");
+        // Done — can't retry.
+        assert!(!dag.retry_node("design"));
+    }
+
+    #[test]
+    fn retry_unknown_node_rejected() {
+        let mut dag = make_dag();
+        assert!(!dag.retry_node("nonexistent"));
+    }
 
     #[test]
     fn checkpoint_field_preserved() {
