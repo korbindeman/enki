@@ -350,7 +350,13 @@ impl Runtime {
                         let _ = self.tx.send(FromCoordinator::WorkerFailed {
                             task_id: task_id.clone(), title: title.clone(), error: error.clone(),
                         });
-                        coord.queue_event(format!("- Task \"{title}\" ({}) failed: {error}", short_id(&task_id)));
+                        let mut msg = format!("- Task \"{title}\" ({}) failed: {error}", short_id(&task_id));
+                        if let Some((log_path, excerpt)) = workers::read_session_log_excerpt(&task_id) {
+                            msg.push_str(&format!(
+                                "\n  Session log tail (full log: {log_path}):\n{excerpt}"
+                            ));
+                        }
+                        coord.queue_event(msg);
                     }
                     Event::MergeLanded { mr_id, task_id, branch } => {
                         let _ = self.tx.send(FromCoordinator::MergeLanded {

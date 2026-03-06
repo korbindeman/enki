@@ -373,30 +373,35 @@ impl Chat {
         let mut last_spinner_tick = Instant::now();
         let mut drag_anchor: Option<usize> = None;
 
-        // Banner
-        if let Some(title) = &self.title {
-            let mut spans = vec![
-                Span::styled(format!("  {title}"), Style::new().bold()),
-            ];
-            if let Some(subtitle) = &self.subtitle {
-                spans.push(Span::styled(
-                    format!(" {subtitle}"),
-                    Style::new().fg(Color::DarkGrey),
-                ));
+        // Banner — build as a closure so we can rebuild on resize
+        let banner_title = self.title.clone();
+        let banner_subtitle = self.subtitle.clone();
+        let build_banner = |cx: &mut ChatContext| {
+            if let Some(title) = &banner_title {
+                let mut spans = vec![
+                    Span::styled(format!("  {title}"), Style::new().bold()),
+                ];
+                if let Some(subtitle) = &banner_subtitle {
+                    spans.push(Span::styled(
+                        format!(" {subtitle}"),
+                        Style::new().fg(Color::DarkGrey),
+                    ));
+                }
+                let w = cx.canvas.width();
+                // Right-aligned hint
+                let hint = "[ctrl+w] toggle workers panel";
+                let left_len: usize = spans.iter().map(|s| s.text.chars().count()).sum();
+                let pad = (w as usize).saturating_sub(left_len + hint.len());
+                spans.push(Span::plain(" ".repeat(pad)));
+                spans.push(Span::styled(hint, Style::new().fg(Color::DarkGrey)));
+                cx.title_lines = vec![
+                    Line::new(spans),
+                    lines::separator(w),
+                ];
+                cx.canvas.set_banner(&cx.title_lines);
             }
-            let w = cx.canvas.width();
-            // Right-aligned hint
-            let hint = "[ctrl+w] toggle workers panel";
-            let left_len: usize = spans.iter().map(|s| s.text.chars().count()).sum();
-            let pad = (w as usize).saturating_sub(left_len + hint.len());
-            spans.push(Span::plain(" ".repeat(pad)));
-            spans.push(Span::styled(hint, Style::new().fg(Color::DarkGrey)));
-            cx.title_lines = vec![
-                Line::new(spans),
-                lines::separator(w),
-            ];
-            cx.canvas.set_banner(&cx.title_lines);
-        }
+        };
+        build_banner(&mut cx);
 
         cx.canvas.update_bubble(&input);
 
@@ -411,6 +416,7 @@ impl Chat {
                 match event {
                     TermEvent::Resize(w, h) => {
                         cx.canvas.handle_resize(w, h, &input);
+                        build_banner(&mut cx);
                     }
                     TermEvent::ScrollUp(n) => {
                         cx.canvas.scroll_up(n);

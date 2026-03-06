@@ -429,16 +429,34 @@ impl Orchestrator {
                 events.extend(self.tick_scheduler());
             }
             WorkerOutcome::NoChanges => {
-                let _ = self
-                    .db
-                    .update_task_status(&result.task_id, TaskStatus::Failed);
+                let error = "completed without committing changes".to_string();
                 self.notify_scheduler_failed(&result.execution_id, &result.step_id);
 
-                events.push(Event::WorkerFailed {
-                    task_id: result.task_id.0.clone(),
-                    title: result.title.clone(),
-                    error: "completed without committing changes".into(),
-                });
+                let retried = self.maybe_retry(
+                    &result.task_id,
+                    &result.title,
+                    &error,
+                    &result.execution_id,
+                    &result.step_id,
+                );
+
+                if retried {
+                    events.push(Event::WorkerFailed {
+                        task_id: result.task_id.0.clone(),
+                        title: result.title.clone(),
+                        error: format!("{error} (retrying)"),
+                    });
+                } else {
+                    let _ = self
+                        .db
+                        .update_task_status(&result.task_id, TaskStatus::Failed);
+
+                    events.push(Event::WorkerFailed {
+                        task_id: result.task_id.0.clone(),
+                        title: result.title.clone(),
+                        error,
+                    });
+                }
             }
             WorkerOutcome::Failed { ref error } => {
                 // Always mark the DAG node as failed first (consistent state machine).
@@ -1009,7 +1027,7 @@ impl Orchestrator {
         }
     }
 
-    /// Check if a failed task should be retried (timeout/stuck only).
+    /// Check if a failed task should be retried.
     /// Returns true if the task was re-queued. The DAG node must already be
     /// marked Failed before calling this.
     fn maybe_retry(
@@ -1020,8 +1038,10 @@ impl Orchestrator {
         execution_id: &Option<Id>,
         step_id: &Option<String>,
     ) -> bool {
-        let is_timeout = error.contains("timed out") || error.contains("stuck");
-        if !is_timeout {
+        let is_retryable = error.contains("timed out")
+            || error.contains("stuck")
+            || error.contains("without committing changes");
+        if !is_retryable {
             return false;
         }
         if self.monitor.should_block_retry(&task_id.0) {
@@ -1038,7 +1058,7 @@ impl Orchestrator {
         tracing::info!(
             task_id = %task_id, title,
             retry = retry_count,
-            "retrying timed-out task"
+            "retrying failed task"
         );
         true
     }
@@ -1207,7 +1227,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_no_changes_fails() {
+    fn worker_no_changes_retries_then_fails() {
         let mut orch = test_orchestrator();
         let events = orch.handle(Command::CreateTask {
             title: "Fix bug".into(),
@@ -1219,18 +1239,30 @@ mod tests {
             _ => panic!("expected SpawnWorker"),
         };
 
-        let events = orch.handle(Command::WorkerDone(WorkerResult {
+        let make_result = || WorkerResult {
             task_id: task_id.clone(),
             execution_id: None,
             step_id: None,
             title: "Fix bug".into(),
             branch: "task/fix-bug".into(),
             outcome: WorkerOutcome::NoChanges,
-        }));
+        };
 
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, Event::WorkerFailed { .. })));
+        // First NoChanges: should retry (status goes to Pending).
+        let events = orch.handle(Command::WorkerDone(make_result()));
+        assert!(events.iter().any(|e| matches!(e, Event::WorkerFailed { error, .. } if error.contains("retrying"))));
+        let task = orch.db().get_task(&task_id).unwrap();
+        assert_eq!(task.status, TaskStatus::Pending);
+
+        // Second NoChanges: should retry again.
+        let events = orch.handle(Command::WorkerDone(make_result()));
+        assert!(events.iter().any(|e| matches!(e, Event::WorkerFailed { error, .. } if error.contains("retrying"))));
+        let task = orch.db().get_task(&task_id).unwrap();
+        assert_eq!(task.status, TaskStatus::Pending);
+
+        // Third NoChanges: retry budget exhausted, permanently fails.
+        let events = orch.handle(Command::WorkerDone(make_result()));
+        assert!(events.iter().any(|e| matches!(e, Event::WorkerFailed { error, .. } if !error.contains("retrying"))));
         let task = orch.db().get_task(&task_id).unwrap();
         assert_eq!(task.status, TaskStatus::Failed);
     }

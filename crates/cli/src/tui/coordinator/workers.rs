@@ -8,6 +8,38 @@ use tokio::sync::mpsc;
 use super::prompts::extract_output;
 
 // ---------------------------------------------------------------------------
+// Session log excerpt (for failure diagnostics)
+// ---------------------------------------------------------------------------
+
+/// Read the tail of a worker's session log, filtering out streaming chunks.
+/// Returns (log_path, excerpt) so callers can reference the full log.
+pub(super) fn read_session_log_excerpt(task_id: &str) -> Option<(String, String)> {
+    let log_path = dirs::home_dir()?
+        .join(".enki/logs/sessions")
+        .join(format!("{task_id}.log"));
+
+    let content = std::fs::read_to_string(&log_path).ok()?;
+
+    // Filter out streaming message chunks — they're token-by-token fragments.
+    let meaningful: Vec<&str> = content
+        .lines()
+        .filter(|line| !line.contains("session/update"))
+        .collect();
+
+    if meaningful.is_empty() {
+        return None;
+    }
+
+    // Take last 30 meaningful lines, truncate to ~3000 chars.
+    let tail: Vec<&str> = meaningful.iter().rev().take(30).copied().collect::<Vec<_>>().into_iter().rev().collect();
+    let mut excerpt = tail.join("\n");
+    if excerpt.len() > 3000 {
+        excerpt = excerpt[excerpt.len() - 3000..].to_string();
+    }
+    Some((log_path.display().to_string(), excerpt))
+}
+
+// ---------------------------------------------------------------------------
 // Internal channel types
 // ---------------------------------------------------------------------------
 
