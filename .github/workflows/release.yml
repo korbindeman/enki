@@ -6,14 +6,7 @@ on:
 
 jobs:
   build:
-    strategy:
-      matrix:
-        include:
-          - target: aarch64-apple-darwin
-            os: macos-latest
-          - target: x86_64-apple-darwin
-            os: macos-13
-    runs-on: ${{ matrix.os }}
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -21,11 +14,11 @@ jobs:
       - name: Package binary
         run: |
           cd target/release
-          tar czf enki-${{ matrix.target }}.tar.gz enki
+          tar czf enki-aarch64-apple-darwin.tar.gz enki
       - uses: actions/upload-artifact@v4
         with:
-          name: enki-${{ matrix.target }}
-          path: target/release/enki-${{ matrix.target }}.tar.gz
+          name: enki-aarch64-apple-darwin
+          path: target/release/enki-aarch64-apple-darwin.tar.gz
 
   release:
     needs: build
@@ -56,8 +49,7 @@ jobs:
         run: |
           version="${TAG#v}"
 
-          arm_sha=$(shasum -a 256 artifacts/enki-aarch64-apple-darwin.tar.gz | cut -d' ' -f1)
-          x86_sha=$(shasum -a 256 artifacts/enki-x86_64-apple-darwin.tar.gz | cut -d' ' -f1)
+          sha=$(shasum -a 256 artifacts/enki-aarch64-apple-darwin.tar.gz | cut -d' ' -f1)
 
           mkdir -p ~/.ssh
           echo "$SSH_KEY" > ~/.ssh/tap_deploy_key
@@ -70,19 +62,12 @@ jobs:
           class Enki < Formula
             desc "Multi-agent coding orchestrator"
             homepage "https://github.com/korbindeman/enki"
+            url "https://github.com/korbindeman/enki/releases/download/${TAG}/enki-aarch64-apple-darwin.tar.gz"
             version "${version}"
+            sha256 "${sha}"
             license "MIT"
 
-            on_macos do
-              if Hardware::CPU.arm?
-                url "https://github.com/korbindeman/enki/releases/download/${TAG}/enki-aarch64-apple-darwin.tar.gz"
-                sha256 "${arm_sha}"
-              else
-                url "https://github.com/korbindeman/enki/releases/download/${TAG}/enki-x86_64-apple-darwin.tar.gz"
-                sha256 "${x86_sha}"
-              end
-            end
-
+            depends_on arch: :arm64
             depends_on :macos
 
             def install
