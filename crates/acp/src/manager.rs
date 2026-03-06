@@ -71,10 +71,13 @@ impl AgentManager {
         cwd: PathBuf,
         label: &str,
     ) -> Result<String> {
-        self.start_session_with_mcp(agent_cmd, agent_args, cwd, vec![], label).await
+        self.start_session_with_mcp(agent_cmd, agent_args, cwd, vec![], label, false).await
     }
 
     /// Spawn a new agent process with MCP servers configured.
+    ///
+    /// If `sonnet_only` is true, attempts to set the model to sonnet via
+    /// `set_session_config_option` after session creation.
     pub async fn start_session_with_mcp(
         &self,
         agent_cmd: &str,
@@ -82,6 +85,7 @@ impl AgentManager {
         cwd: PathBuf,
         mcp_servers: Vec<acp::McpServer>,
         label: &str,
+        sonnet_only: bool,
     ) -> Result<String> {
         tracing::debug!(cmd = agent_cmd, args = ?agent_args, cwd = %cwd.display(), "spawning agent process");
         // Spawn agent subprocess
@@ -228,6 +232,31 @@ impl AgentManager {
         let session_id = session_resp.session_id.to_string();
         tracing::info!(session_id, "ACP session created");
 
+        // If sonnet_only, find the model config option and switch to sonnet.
+        if sonnet_only {
+            if let Some(config_options) = &session_resp.config_options {
+                if let Some(sonnet_value) = find_sonnet_model(config_options) {
+                    tracing::info!(session_id, model = %sonnet_value, "setting sonnet-only model");
+                    let set_result = acp::Agent::set_session_config_option(
+                        conn.as_ref(),
+                        acp::SetSessionConfigOptionRequest::new(
+                            session_resp.session_id.clone(),
+                            "model",
+                            sonnet_value,
+                        ),
+                    )
+                    .await;
+                    if let Err(e) = set_result {
+                        tracing::warn!(session_id, "failed to set sonnet model: {e}");
+                    }
+                } else {
+                    tracing::warn!(session_id, "sonnet_only enabled but no sonnet model found in agent config options");
+                }
+            } else {
+                tracing::warn!(session_id, "sonnet_only enabled but agent returned no config options");
+            }
+        }
+
         // Store session
         let child_ref = Rc::new(RefCell::new(Some(child)));
         self.sessions.borrow_mut().insert(
@@ -297,6 +326,36 @@ impl AgentManager {
     pub fn session_ids(&self) -> Vec<String> {
         self.sessions.borrow().keys().cloned().collect()
     }
+}
+
+/// Find a sonnet model value from the agent's config options.
+///
+/// Searches for the model config option (by `id == "model"` or `category == Model`),
+/// then finds an option value containing "sonnet" (case-insensitive).
+fn find_sonnet_model(config_options: &[acp::SessionConfigOption]) -> Option<String> {
+    let model_option = config_options.iter().find(|opt| {
+        opt.id.0.as_ref() == "model"
+            || opt.category == Some(acp::SessionConfigOptionCategory::Model)
+    })?;
+
+    let acp::SessionConfigKind::Select(select) = &model_option.kind else {
+        return None;
+    };
+    let all_options: Vec<&acp::SessionConfigSelectOption> = match &select.options {
+        acp::SessionConfigSelectOptions::Ungrouped(opts) => opts.iter().collect(),
+        acp::SessionConfigSelectOptions::Grouped(groups) => {
+            groups.iter().flat_map(|g| g.options.iter()).collect()
+        }
+        _ => return None,
+    };
+
+    // Find the first option whose value or name contains "sonnet"
+    let matched = all_options.iter().find(|opt| {
+        opt.value.0.to_lowercase().contains("sonnet")
+            || opt.name.to_lowercase().contains("sonnet")
+    })?;
+
+    Some(matched.value.0.to_string())
 }
 
 /// Truncate a JSON value to a reasonable size for logging.

@@ -1,10 +1,12 @@
 use std::process::Command;
 
+use enki_core::config::load_config;
 use enki_core::db::Db;
 use enki_core::copy::{self, GitIdentity};
 
 pub async fn init() -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
+    let config = load_config(&cwd);
     let enki_dir = cwd.join(".enki");
     let db_path = enki_dir.join("db.sqlite");
     let copies_dir = enki_dir.join("copies");
@@ -45,7 +47,12 @@ pub async fn init() -> anyhow::Result<()> {
                 .current_dir(&cwd)
                 .output();
             let mut cmd = Command::new("git");
-            cmd.args(["commit", "--allow-empty", "-m", "initialize project\n\ncreated by enki", "--no-verify"]);
+            let commit_msg = if config.git.commit_suffix.is_empty() {
+                "initialize project".to_string()
+            } else {
+                format!("initialize project\n\n{}", config.git.commit_suffix)
+            };
+            cmd.args(["commit", "--allow-empty", "-m", &commit_msg, "--no-verify"]);
             git_identity.apply(&mut cmd);
             let result = cmd.current_dir(&cwd).output();
             match result {

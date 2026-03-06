@@ -11,7 +11,6 @@ use enki_acp::{AgentManager, SessionUpdate};
 use enki_core::orchestrator::{
     Command, Event, MergeResult, Orchestrator, WorkerOutcome, WorkerResult,
 };
-use enki_core::scheduler::Limits;
 use enki_core::types::{Id, MergeStatus, short_id};
 use enki_core::copy::{CopyManager, GitIdentity};
 use tokio::sync::mpsc;
@@ -146,6 +145,7 @@ struct Runtime {
     infra_broken: bool,
     db_path: String,
     roles: std::collections::HashMap<String, enki_core::roles::RoleConfig>,
+    config: enki_core::config::Config,
 }
 
 impl Runtime {
@@ -511,12 +511,13 @@ impl Runtime {
         )];
 
         let agent_cmd =
-            enki_core::agent_runtime::resolve().map_err(|e| anyhow::anyhow!("{e}"))?;
+            enki_core::agent_runtime::resolve_from_config(&self.config.agent).map_err(|e| anyhow::anyhow!("{e}"))?;
         let args_ref: Vec<&str> = agent_cmd.args.iter().map(|s| s.as_str()).collect();
         let session_id = self.mgr
             .start_session_with_mcp(
                 agent_cmd.program.to_str().unwrap(), &args_ref,
                 copy_path.clone(), worker_mcp, &task_id.0,
+                self.config.workers.sonnet_only,
             )
             .await?;
 
@@ -595,12 +596,13 @@ impl Runtime {
         )];
 
         let agent_cmd =
-            enki_core::agent_runtime::resolve().map_err(|e| anyhow::anyhow!("{e}"))?;
+            enki_core::agent_runtime::resolve_from_config(&self.config.agent).map_err(|e| anyhow::anyhow!("{e}"))?;
         let args_ref: Vec<&str> = agent_cmd.args.iter().map(|s| s.as_str()).collect();
         let session_id = self.mgr
             .start_session_with_mcp(
                 agent_cmd.program.to_str().unwrap(), &args_ref,
                 temp_dir.to_path_buf(), merger_mcp, &format!("merger-{mr_id}"),
+                self.config.workers.sonnet_only,
             )
             .await?;
 
@@ -676,7 +678,11 @@ async fn coordinator_loop(
     let enki_session_id = session_id_obj.0.clone();
     tracing::info!(session_id = %enki_session_id, "new session created");
 
-    let mut orch = Orchestrator::new(db, Limits::default(), enki_session_id.clone());
+    // Load config: ~/.config/enki.toml → .enki/enki.toml
+    let config = enki_core::config::load_config(&cwd);
+    tracing::info!(?config.agent.command, sonnet_only = config.workers.sonnet_only, "loaded config");
+
+    let mut orch = Orchestrator::new(db, config.workers.limits.clone(), enki_session_id.clone());
 
     let (worker_done_tx, mut worker_done_rx) = mpsc::unbounded_channel::<WorkerDone>();
 
@@ -693,6 +699,10 @@ async fn coordinator_loop(
         env.insert("ENKI_BIN".to_string(), enki_bin.display().to_string());
         env.insert("ENKI_DIR".to_string(), enki_dir.display().to_string());
         env.insert("ENKI_SESSION_ID".to_string(), enki_session_id.clone());
+        // Merge agent-specific env from config (enki vars take precedence).
+        for (k, v) in &config.agent.env {
+            env.entry(k.clone()).or_insert_with(|| v.clone());
+        }
         env
     };
 
@@ -704,8 +714,8 @@ async fn coordinator_loop(
     let mut mgr = AgentManager::new();
     mgr.set_env(enki_env);
 
-    // Resolve agent binary.
-    let agent_cmd = match enki_core::agent_runtime::resolve() {
+    // Resolve agent binary from config.
+    let agent_cmd = match enki_core::agent_runtime::resolve_from_config(&config.agent) {
         Ok(cmd) => cmd,
         Err(e) => {
             let _ = tx.send(FromCoordinator::Error(format!(
@@ -728,6 +738,7 @@ async fn coordinator_loop(
             cwd.clone(),
             planner_mcp,
             "coordinator",
+            false, // planner doesn't use sonnet_only
         )
         .await
     {
@@ -849,6 +860,7 @@ async fn coordinator_loop(
         infra_broken: false,
         db_path,
         roles,
+        config,
     };
 
     // Stateless session: no crash recovery. Fresh start every time.
@@ -897,7 +909,7 @@ async fn coordinator_loop(
                 }
                 let _ = rt.orch.db().update_task_activity(&done.task_id, None);
 
-                let worker_result = process_worker_done(done, &rt.copy_mgr, &enki_dir);
+                let worker_result = process_worker_done(done, &rt.copy_mgr, &enki_dir, &rt.config.git.commit_suffix);
                 rt.handle_command(Command::WorkerDone(worker_result), &mut coord).await;
             }
 

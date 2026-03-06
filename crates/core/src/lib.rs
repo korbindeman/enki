@@ -1,4 +1,5 @@
 pub mod agent_runtime;
+pub mod config;
 pub mod dag;
 pub mod db;
 pub mod monitor;

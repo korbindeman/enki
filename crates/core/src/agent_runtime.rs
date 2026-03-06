@@ -1,13 +1,16 @@
-//! Resolve and cache the claude-agent-acp agent binary.
+//! Resolve agent binaries for ACP sessions.
 //!
-//! On first use, installs `@zed-industries/claude-agent-acp` via npm into
-//! `~/.enki/agents/claude-agent-acp/`. On subsequent launches, reuses the
-//! cached install. Returns the `node` binary path and the entry-point script
-//! so callers can spawn `node <script>` directly — no `bunx` overhead.
+//! The built-in `claude-agent-acp` agent is installed via npm into
+//! `~/.enki/agents/claude-agent-acp/` on first use. Custom agents specified
+//! in config are resolved from PATH or as absolute paths.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 
+use crate::config::AgentConfig;
+
+const BUILTIN_COMMAND: &str = "claude-agent-acp";
 const PACKAGE: &str = "@zed-industries/claude-agent-acp";
 const ENTRY_POINT: &str = "node_modules/@zed-industries/claude-agent-acp/dist/index.js";
 
@@ -19,6 +22,8 @@ pub enum ResolveError {
     NpmInstallFailed(String),
     #[error("home directory not found")]
     NoHomeDir,
+    #[error("agent not found: {0}")]
+    AgentNotFound(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -28,6 +33,7 @@ pub enum ResolveError {
 pub struct AgentCommand {
     pub program: PathBuf,
     pub args: Vec<String>,
+    pub env: HashMap<String, String>,
 }
 
 /// Find `node` on PATH.
@@ -58,11 +64,8 @@ fn npm_install(cache: &PathBuf) -> Result<(), ResolveError> {
     Ok(())
 }
 
-/// Resolve the claude-agent-acp agent command.
-///
-/// Returns `node <path-to-index.js>` for direct spawning.
-/// Installs the package on first use.
-pub fn resolve() -> Result<AgentCommand, ResolveError> {
+/// Resolve the built-in claude-agent-acp agent.
+fn resolve_builtin(extra_args: &[String], env: &HashMap<String, String>) -> Result<AgentCommand, ResolveError> {
     let node = find_node()?;
     let cache = cache_dir()?;
     let entry = cache.join(ENTRY_POINT);
@@ -79,8 +82,45 @@ pub fn resolve() -> Result<AgentCommand, ResolveError> {
         }
     }
 
+    let mut args = vec![entry.to_string_lossy().into_owned()];
+    args.extend_from_slice(extra_args);
+
     Ok(AgentCommand {
         program: node,
-        args: vec![entry.to_string_lossy().into_owned()],
+        args,
+        env: env.clone(),
     })
+}
+
+/// Resolve an agent command from config.
+///
+/// If `command` is `"claude-agent-acp"` (the default), uses the built-in
+/// npm-based resolution. Otherwise, resolves the command from PATH or as
+/// an absolute path.
+pub fn resolve_from_config(config: &AgentConfig) -> Result<AgentCommand, ResolveError> {
+    if config.command == BUILTIN_COMMAND {
+        return resolve_builtin(&config.args, &config.env);
+    }
+
+    let program = if config.command.contains('/') {
+        // Absolute or relative path — use directly
+        PathBuf::from(&config.command)
+    } else {
+        // Look up on PATH
+        which::which(&config.command)
+            .map_err(|_| ResolveError::AgentNotFound(config.command.clone()))?
+    };
+
+    Ok(AgentCommand {
+        program,
+        args: config.args.clone(),
+        env: config.env.clone(),
+    })
+}
+
+/// Resolve the built-in claude-agent-acp agent with default config.
+///
+/// Convenience wrapper for callers that don't have config (e.g. tests).
+pub fn resolve() -> Result<AgentCommand, ResolveError> {
+    resolve_builtin(&[], &HashMap::new())
 }

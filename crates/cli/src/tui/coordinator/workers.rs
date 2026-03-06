@@ -105,7 +105,7 @@ pub(super) fn discover_artifact_files(
 
 /// Convert a raw WorkerDone (from the channel) into an orchestrator WorkerResult.
 /// Handles auto-commit, change detection, and copy cleanup.
-pub(super) fn process_worker_done(done: WorkerDone, copy_mgr: &CopyManager, enki_dir: &Path) -> WorkerResult {
+pub(super) fn process_worker_done(done: WorkerDone, copy_mgr: &CopyManager, enki_dir: &Path, commit_suffix: &str) -> WorkerResult {
     match done.result {
         Ok(ref stop_reason) => {
             // Artifact workers: the agent writes the file directly; [OUTPUT] is just a summary.
@@ -150,7 +150,11 @@ pub(super) fn process_worker_done(done: WorkerDone, copy_mgr: &CopyManager, enki
             }
 
             // Auto-commit uncommitted changes in the copy.
-            let msg = format!("{}\n\ncreated by enki", done.title);
+            let msg = if commit_suffix.is_empty() {
+                done.title.clone()
+            } else {
+                format!("{}\n\n{commit_suffix}", done.title)
+            };
             let committed = copy_mgr.commit_copy(&done.copy_path, &msg);
 
             // Check for actual changes vs the base commit.

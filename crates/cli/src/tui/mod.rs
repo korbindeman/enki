@@ -20,7 +20,12 @@ pub async fn run(_db: enki_core::db::Db, db_path: String, enki_bin: PathBuf) -> 
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
-    let status_msg = project_name;
+    let config = enki_core::config::load_config(&project_cwd);
+    let status_msg = if config.workers.sonnet_only {
+        format!("{project_name} (sonnet mode)")
+    } else {
+        project_name
+    };
 
     // Spawn coordinator
     let mut coord_handle = coordinator::spawn(project_cwd.clone(), db_path, enki_bin);
