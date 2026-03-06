@@ -523,7 +523,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "enki"
-version = "2026.306.2"
+version = "2026.306.3"
 dependencies = [
  "anyhow",
  "ascii-dag",
@@ -544,7 +544,7 @@ dependencies = [
 
 [[package]]
 name = "enki-acp"
-version = "2026.306.2"
+version = "2026.306.3"
 dependencies = [
  "agent-client-protocol",
  "async-trait",
@@ -561,7 +561,7 @@ dependencies = [
 
 [[package]]
 name = "enki-core"
-version = "2026.306.2"
+version = "2026.306.3"
 dependencies = [
  "chrono",
  "dirs",
@@ -578,7 +578,7 @@ dependencies = [
 
 [[package]]
 name = "enki-tui"
-version = "2026.306.2"
+version = "2026.306.3"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -2007,9 +2007,9 @@ dependencies = [
 
 [[package]]
 name = "which"
-version = "8.0.0"
+version = "8.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3fabb953106c3c8eea8306e4393700d7657561cb43122571b172bbfb7c7ba1d"
+checksum = "3a824aeba0fbb27264f815ada4cff43d65b1741b7a4ed7629ff9089148c4a4e0"
 dependencies = [
  "env_home",
  "rustix",
