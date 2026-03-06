@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use ascii_dag::graph::DAG;
 use chrono::Utc;
 use enki_core::dag::EdgeCondition;
 use enki_core::orchestrator::{StepDef, StepDep};
@@ -554,6 +555,48 @@ pub(super) fn tool_edit_file(args: &Value) -> Result<String, String> {
         .map_err(|e| format!("failed to write {path}: {e}"))?;
 
     Ok("ok".to_string())
+}
+
+pub(super) fn tool_dag(args: &Value) -> Result<String, String> {
+    let db = open_db().map_err(|e| e.to_string())?;
+
+    let exec_id = if let Some(id_str) = args["execution_id"].as_str() {
+        Id(id_str.to_string())
+    } else {
+        let session_id = std::env::var("ENKI_SESSION_ID").ok();
+        let exec = db
+            .get_most_recent_execution(session_id.as_deref())
+            .map_err(|e| e.to_string())?
+            .ok_or("No executions found.")?;
+        exec.id
+    };
+
+    let dag = db
+        .load_dag(&exec_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("No DAG found for execution {}.", exec_id))?;
+
+    let nodes = dag.nodes();
+    if nodes.is_empty() {
+        return Ok(format!("Execution {} has an empty DAG.", exec_id));
+    }
+
+    // Build labels so they outlive the DAG renderer.
+    let labels: Vec<String> = nodes
+        .iter()
+        .map(|n| format!("{} [{}]", n.id, n.status.as_str()))
+        .collect();
+
+    let node_entries: Vec<(usize, &str)> = labels.iter().enumerate().map(|(i, l)| (i, l.as_str())).collect();
+    let mut edges: Vec<(usize, usize)> = Vec::new();
+    for (i, node) in nodes.iter().enumerate() {
+        for dep in &node.deps {
+            edges.push((dep.target, i));
+        }
+    }
+
+    let ascii = DAG::from_edges(&node_entries, &edges);
+    Ok(ascii.render())
 }
 
 // --- Mail helpers ---

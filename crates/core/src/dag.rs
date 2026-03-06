@@ -38,6 +38,22 @@ pub enum NodeStatus {
     Cancelled,
 }
 
+impl NodeStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Ready => "ready",
+            Self::Running => "running",
+            Self::WorkerDone => "worker_done",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Blocked => "blocked",
+            Self::Paused => "paused",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
     pub id: String,

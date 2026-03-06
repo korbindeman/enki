@@ -17,6 +17,7 @@ const PLANNER_TOOLS: &[&str] = &[
     "enki_pause",
     "enki_cancel",
     "enki_stop_all",
+    "enki_dag",
     "enki_mail_send",
     "enki_mail_check",
     "enki_mail_read",
@@ -30,6 +31,7 @@ const WORKER_TOOLS: &[&str] = &[
     "enki_task_list",
     "enki_worker_report",
     "enki_edit_file",
+    "enki_dag",
     "enki_mail_send",
     "enki_mail_check",
     "enki_mail_read",
@@ -42,6 +44,7 @@ const WORKER_TOOLS_NO_EDIT: &[&str] = &[
     "enki_status",
     "enki_task_list",
     "enki_worker_report",
+    "enki_dag",
     "enki_mail_send",
     "enki_mail_check",
     "enki_mail_read",
@@ -53,6 +56,7 @@ const WORKER_TOOLS_NO_EDIT: &[&str] = &[
 const MERGER_TOOLS: &[&str] = &[
     "enki_status",
     "enki_task_list",
+    "enki_dag",
 ];
 
 fn tools_for_role(role: &str, no_edit: bool) -> &'static [&'static str] {
@@ -173,6 +177,7 @@ fn handle_tools_call(id: Option<Value>, params: &Value, role: &str, task_id: Opt
         "enki_cancel" => tool_cancel(args),
         "enki_worker_report" => tool_worker_report(args, task_id),
         "enki_edit_file" => tool_edit_file(args),
+        "enki_dag" => tool_dag(args),
         "enki_mail_send" => tool_mail_send(args, &my_addr),
         "enki_mail_check" => tool_mail_check(&my_addr),
         "enki_mail_read" => tool_mail_read(args),

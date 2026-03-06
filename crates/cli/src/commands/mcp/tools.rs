@@ -388,5 +388,18 @@ pub(super) fn all_tool_definitions() -> Vec<Value> {
                 "required": ["thread_id"]
             }
         }),
+        json!({
+            "name": "enki_dag",
+            "description": "Render the execution DAG as an ASCII graph showing steps, dependencies, and current status.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "execution_id": {
+                        "type": "string",
+                        "description": "Execution ID. If omitted, shows the most recent execution."
+                    }
+                }
+            }
+        }),
     ]
 }

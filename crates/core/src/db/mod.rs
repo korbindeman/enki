@@ -404,6 +404,33 @@ impl Db {
         }
     }
 
+    pub fn get_most_recent_execution(&self, session_id: Option<&str>) -> Result<Option<Execution>> {
+        if let Some(sid) = session_id {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, session_id, status, created_at
+                 FROM executions WHERE session_id = ?1
+                 ORDER BY created_at DESC LIMIT 1",
+            )?;
+            let mut rows = stmt.query_map(params![sid], row_to_execution)?;
+            match rows.next() {
+                Some(Ok(exec)) => Ok(Some(exec)),
+                Some(Err(e)) => Err(DbError::Sqlite(e)),
+                None => Ok(None),
+            }
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, session_id, status, created_at
+                 FROM executions ORDER BY created_at DESC LIMIT 1",
+            )?;
+            let mut rows = stmt.query_map([], row_to_execution)?;
+            match rows.next() {
+                Some(Ok(exec)) => Ok(Some(exec)),
+                Some(Err(e)) => Err(DbError::Sqlite(e)),
+                None => Ok(None),
+            }
+        }
+    }
+
     // --- Task Outputs ---
 
     pub fn insert_task_output(&self, task_id: &Id, output: &str) -> Result<()> {

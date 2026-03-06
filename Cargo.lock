@@ -114,6 +114,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "ascii-dag"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4165754f258c8eaea0362287535521a27d8a1eceefe8800f411d36c1c4952ac8"
+
+[[package]]
 name = "async-broadcast"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -520,6 +526,7 @@ name = "enki"
 version = "2026.306.2"
 dependencies = [
  "anyhow",
+ "ascii-dag",
  "chrono",
  "clap",
  "dirs",
