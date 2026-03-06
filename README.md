@@ -42,6 +42,7 @@ enki
 Opens the TUI. Sets up the project on first run.
 
 Some notes:
+ - Enki bypasses all tool permissions for the agents it spawns. An orchestrator that asks before every file write wouldn't be useful. If this causes trouble, we can add safety features later.
  - When the coordinator edits code, it does not automatically merge and commit, it just works in your actual project.
 
 ## Architecture
