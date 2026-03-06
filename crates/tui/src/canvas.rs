@@ -1445,8 +1445,9 @@ struct VisualLine {
 
 /// Wrap input text into visual lines of at most `width` characters.
 ///
-/// Splits on `\n` first (logical lines), then wraps each logical line at
-/// character boundaries when it exceeds `width`. Used only by the bubble.
+/// Splits on `\n` first (logical lines), then word-wraps each logical line.
+/// Prefers breaking at the last space within the width. Falls back to
+/// hard-wrap when a single word exceeds the width. Used only by the bubble.
 fn wrap_text(text: &str, width: usize) -> Vec<VisualLine> {
     let width = width.max(1);
     let mut result = Vec::new();
@@ -1469,7 +1470,22 @@ fn wrap_text(text: &str, width: usize) -> Vec<VisualLine> {
             let mut local_byte = 0;
 
             while char_pos < chars.len() {
-                let chunk_end = (char_pos + width).min(chars.len());
+                let remaining = chars.len() - char_pos;
+                let chunk_end;
+
+                if remaining <= width {
+                    chunk_end = chars.len();
+                } else {
+                    // Look for the last space at or before the width boundary.
+                    let max_end = char_pos + width;
+                    let break_at = chars[char_pos..max_end]
+                        .iter()
+                        .rposition(|&c| c == ' ')
+                        .map(|p| char_pos + p + 1); // break after the space
+
+                    chunk_end = break_at.unwrap_or(max_end); // hard-wrap if no space
+                }
+
                 let chunk: String = chars[char_pos..chunk_end].iter().collect();
                 let chunk_bytes = chunk.len();
 
