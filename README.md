@@ -41,6 +41,9 @@ enki
 
 Opens the TUI. Sets up the project on first run.
 
+Some notes:
+ - When the coordinator edits code, it does not automatically merge and commit, it just works in your actual project.
+
 ## Architecture
 
 Rust workspace, four crates:
