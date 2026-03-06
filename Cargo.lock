@@ -517,7 +517,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "enki"
-version = "2026.306.0"
+version = "2026.306.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -537,7 +537,7 @@ dependencies = [
 
 [[package]]
 name = "enki-acp"
-version = "2026.306.0"
+version = "2026.306.1"
 dependencies = [
  "agent-client-protocol",
  "async-trait",
@@ -554,7 +554,7 @@ dependencies = [
 
 [[package]]
 name = "enki-core"
-version = "2026.306.0"
+version = "2026.306.1"
 dependencies = [
  "chrono",
  "dirs",
@@ -571,7 +571,7 @@ dependencies = [
 
 [[package]]
 name = "enki-tui"
-version = "2026.306.0"
+version = "2026.306.1"
 dependencies = [
  "anyhow",
  "crossterm",
