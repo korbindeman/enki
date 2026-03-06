@@ -227,6 +227,7 @@ pub(super) fn try_dispatch_merge(
     copy_mgr: &CopyManager,
     merger_done_tx: &mpsc::UnboundedSender<MergerDone>,
     merge_in_progress: &mut bool,
+    commit_suffix: &str,
 ) {
     let queued = match db.get_queued_merge_requests() {
         Ok(q) => q,
@@ -239,6 +240,21 @@ pub(super) fn try_dispatch_merge(
     let branch = mr.branch.clone();
     let base_branch = mr.base_branch.clone();
     tracing::info!(mr_id = %mr_id, task_id = %mr.task_id, branch = %mr.branch, "dispatching merge");
+
+    // Build commit message from task title + configured suffix.
+    let commit_message = match db.get_task(&mr.task_id) {
+        Ok(task) => {
+            if commit_suffix.is_empty() {
+                task.title
+            } else {
+                format!("{}\n\n{commit_suffix}", task.title)
+            }
+        }
+        Err(e) => {
+            tracing::warn!(task_id = %mr.task_id, error = %e, "failed to get task for commit message, using branch name");
+            branch.clone()
+        }
+    };
 
     let _ = db.update_merge_status(&mr_id, MergeStatus::Processing);
 
@@ -259,7 +275,7 @@ pub(super) fn try_dispatch_merge(
             enki_core::db::Db::open(&db_path_clone).expect("refinery: failed to open db");
         let copy_mgr = CopyManager::new(project_root_owned, copies_dir_owned, git_identity_owned, is_git);
         let outcome =
-            enki_core::refinery::process_merge(&copy_mgr, &copy_path, &branch, &base_branch, &db, &mr_id);
+            enki_core::refinery::process_merge(&copy_mgr, &copy_path, &branch, &base_branch, &db, &mr_id, &commit_message);
         let _ = done_tx.send(MergerDone {
             merge_request_id: mr_id,
             outcome,

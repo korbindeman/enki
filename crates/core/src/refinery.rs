@@ -34,6 +34,24 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     }
 }
 
+/// Run a git commit with the copy manager's identity.
+fn git_commit(copy_mgr: &CopyManager, dir: &Path, message: &str) -> Result<String, String> {
+    let mut cmd = Command::new("git");
+    cmd.args(["commit", "-m", message, "--no-verify"]);
+    copy_mgr.git_identity().apply(&mut cmd);
+    let output = cmd
+        .current_dir(dir)
+        .output()
+        .map_err(|e| format!("failed to run git commit: {e}"))?;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(format!("git commit failed: {stderr}"))
+    }
+}
+
 /// RAII guard that removes a directory on drop.
 struct CleanupGuard(PathBuf);
 
@@ -47,6 +65,8 @@ impl Drop for CleanupGuard {
 ///
 /// Dispatches to git-based merge or filesystem merge depending on whether
 /// the source project is a git repo.
+///
+/// `commit_message` is used as the squash commit message for git-based merges.
 pub fn process_merge(
     copy_mgr: &CopyManager,
     copy_path: &Path,
@@ -54,9 +74,10 @@ pub fn process_merge(
     default_branch: &str,
     db: &Db,
     mr_id: &Id,
+    commit_message: &str,
 ) -> MergeOutcome {
     if copy_mgr.is_git() {
-        process_git_merge(copy_mgr, copy_path, branch, default_branch, db, mr_id)
+        process_git_merge(copy_mgr, copy_path, branch, default_branch, db, mr_id, commit_message)
     } else {
         process_fs_merge(copy_mgr, copy_path, branch, db, mr_id)
     }
@@ -167,10 +188,10 @@ fn process_fs_merge(
 
 /// Git-based merge for source repos that are git repositories.
 ///
-/// All rebase/merge/verify work happens in a temporary `git clone --shared`
-/// clone so the user's working tree is never touched. Only the final
-/// `git merge --ff-only FETCH_HEAD` updates the source repo — this preserves
-/// uncommitted working tree changes (git aborts if they conflict).
+/// Uses squash merge to produce a single linear commit instead of merge commits.
+/// All work happens in a temporary `git clone --shared` clone so the user's
+/// working tree is never touched. Only the final `git merge --ff-only FETCH_HEAD`
+/// updates the source repo.
 fn process_git_merge(
     copy_mgr: &CopyManager,
     copy_path: &Path,
@@ -178,6 +199,7 @@ fn process_git_merge(
     default_branch: &str,
     db: &Db,
     mr_id: &Id,
+    commit_message: &str,
 ) -> MergeOutcome {
     let source = copy_mgr.project_root();
 
@@ -225,14 +247,14 @@ fn process_git_merge(
         }
     }
 
-    // Step 4: Merge worker branch into default in the temp clone.
-    // Three-way merge auto-resolves non-overlapping additions (the most common case).
+    // Step 4: Squash-merge worker branch into default in the temp clone.
+    // --squash stages all changes without creating a merge commit.
     if let Err(e) = git(&tmp_dir, &["checkout", default_branch]) {
         return MergeOutcome::Failed(format!("checkout {default_branch} in temp: {e}"));
     }
 
-    if let Err(_) = git(&tmp_dir, &["merge", branch, "--no-edit"]) {
-        // Merge had conflicts — check if they're auto-resolvable or need agent help.
+    if let Err(_) = git(&tmp_dir, &["merge", "--squash", branch]) {
+        // Squash merge had conflicts — check if they need agent help.
         let conflict_files = match git(&tmp_dir, &["diff", "--name-only", "--diff-filter=U"]) {
             Ok(files) => files.lines().map(String::from).collect::<Vec<_>>(),
             Err(e) => return MergeOutcome::Failed(format!("list conflict files: {e}")),
@@ -240,7 +262,7 @@ fn process_git_merge(
 
         if conflict_files.is_empty() {
             // Merge failed but no unmerged files — shouldn't happen, treat as hard failure.
-            let _ = git(&tmp_dir, &["merge", "--abort"]);
+            let _ = git(&tmp_dir, &["reset", "--hard"]);
             return MergeOutcome::Conflicted(format!(
                 "merge of {branch} onto {default_branch} failed with no identifiable conflicts"
             ));
@@ -264,26 +286,39 @@ fn process_git_merge(
         };
     }
 
-    // Merge succeeded — continue to verify + bring back to source.
+    // Squash staged all changes — create the commit.
+    if let Err(e) = git_commit(copy_mgr, &tmp_dir, commit_message) {
+        return MergeOutcome::Failed(format!("squash commit: {e}"));
+    }
+
+    // Continue to verify + bring back to source.
     finish_merge_inner(copy_mgr, &tmp_dir, default_branch, db, mr_id)
 }
 
 /// Complete a merge after conflicts have been resolved by the merger agent.
 ///
-/// Runs verify.sh then fetches the result back to the source repo via ff-only merge.
-/// Cleans up the temp dir on all exit paths.
+/// Creates the squash commit, runs verify.sh, then fetches the result back
+/// to the source repo via ff-only merge. Cleans up the temp dir on all exit paths.
 pub fn finish_merge(
     copy_mgr: &CopyManager,
     temp_dir: &Path,
     default_branch: &str,
     db: &Db,
     mr_id: &Id,
+    commit_message: &str,
 ) -> MergeOutcome {
     let _cleanup = CleanupGuard(temp_dir.to_path_buf());
+
+    // The merger agent resolved conflicts and staged files, but did not commit.
+    // Create the squash commit now.
+    if let Err(e) = git_commit(copy_mgr, temp_dir, commit_message) {
+        return MergeOutcome::Failed(format!("squash commit after resolution: {e}"));
+    }
+
     finish_merge_inner(copy_mgr, temp_dir, default_branch, db, mr_id)
 }
 
-/// Shared logic for steps 5-7: verify.sh, then fetch+ff-only back to source.
+/// Shared logic: verify.sh, then fetch+ff-only back to source.
 fn finish_merge_inner(
     copy_mgr: &CopyManager,
     tmp_dir: &Path,
@@ -294,7 +329,7 @@ fn finish_merge_inner(
     let source = copy_mgr.project_root();
     let tmp_str = tmp_dir.to_string_lossy();
 
-    // Step 5: Run verify.sh if present.
+    // Run verify.sh if present.
     let verify_script = source.join(".enki/verify.sh");
     if verify_script.exists() {
         if let Err(e) = db.update_merge_status(mr_id, MergeStatus::Verifying) {
@@ -324,7 +359,7 @@ fn finish_merge_inner(
         }
     }
 
-    // Step 6: Bring result back to source safely.
+    // Bring result back to source safely.
     if let Err(e) = git(source, &["fetch", &tmp_str, default_branch]) {
         return MergeOutcome::Failed(format!("fetch result back to source: {e}"));
     }

@@ -7,30 +7,57 @@ A Rust-based process orchestrator that spawns ACP coding agents in isolated file
 ```
 crates/
 ├── core/              # Library crate. Synchronous state machines.
-│   ├── orchestrator.rs  # Command/Event state machine — the brain
-│   ├── scheduler.rs     # Tier-aware DAG scheduling with concurrency limits
-│   ├── dag.rs           # Dependency graph with pause/cancel/cascade
-│   ├── monitor.rs       # Worker health monitoring (stale detection, retries)
-│   ├── db/              # SQLite schema, CRUD, auto-migration
-│   ├── types.rs         # Core types: Id, Task, Execution, Tier, statuses
-│   ├── copy.rs          # Filesystem copy-on-write cloning for worker isolation
-│   ├── refinery.rs      # Merge queue processor
-│   ├── hashline.rs      # Content-addressed line tracking
+│   ├── orchestrator/   # Command/Event state machine — the brain
+│   │   ├── mod.rs        # Orchestrator struct, command dispatch
+│   │   └── types.rs      # Command, Event, Target, StepDef, WorkerResult
+│   ├── scheduler.rs    # Tier-aware DAG scheduling with concurrency limits
+│   ├── dag.rs          # Dependency graph with pause/cancel/cascade
+│   ├── monitor.rs      # Worker health monitoring (stale detection, retries)
+│   ├── db/             # SQLite schema, CRUD, auto-migration
+│   │   ├── mod.rs        # Db struct, queries
+│   │   └── schema.rs     # Schema definition, auto_migrate()
+│   ├── types.rs        # Core types: Id, Task, Execution, Tier, statuses
+│   ├── copy.rs         # Filesystem copy-on-write cloning for worker isolation
+│   ├── refinery.rs     # Merge queue processor (git squash-merge + optional verify)
+│   ├── hashline.rs     # Content-addressed line tracking (xxh3)
+│   ├── roles.rs        # Role configuration with cascading TOML loading
+│   ├── config.rs       # TOML configuration with cascading overlay
 │   └── agent_runtime.rs # Agent binary resolution and caching
 │
 ├── cli/               # Binary crate. CLI + TUI.
 │   ├── main.rs          # Clap command dispatch
-│   ├── commands/        # CLI subcommands (init, run, stop, mcp, doctor)
-│   │   └── mcp.rs       # MCP stdio server for external tool access
+│   ├── commands/        # CLI subcommands
+│   │   ├── mod.rs         # Shared helpers (enki_dir, db_path, project_root)
+│   │   ├── init.rs        # Project initialization
+│   │   └── mcp/           # MCP stdio server
+│   │       ├── mod.rs       # JSON-RPC loop, role-based tool filtering
+│   │       ├── tools.rs     # Tool schema definitions
+│   │       └── handlers.rs  # Tool execution handlers
 │   └── tui/             # TUI interface
-│       └── coordinator.rs  # Thin async adapter over Orchestrator
+│       ├── mod.rs         # TUI runner, CoordinatorHandler
+│       └── coordinator/   # Async adapter over Orchestrator
+│           ├── mod.rs       # Main coordinator loop (tokio::select!)
+│           ├── session.rs   # Coordinator session state
+│           ├── tracker.rs   # Worker activity tracking
+│           ├── workers.rs   # Worker completion + merge dispatch
+│           └── prompts.rs   # System/worker/merger prompt builders
 │
 ├── acp/               # ACP client library (Agent Client Protocol)
-│   └── lib.rs           # Session lifecycle, JSON-RPC over stdio
+│   ├── lib.rs           # Error types, SessionUpdate, UpdateCallback
+│   ├── manager.rs       # AgentManager — session lifecycle, Rc<RefCell<>>
+│   └── client.rs        # EnkiClient — ACP trait implementation
 │
-└── tui/               # TUI rendering library (ratatui-based)
-    ├── chat.rs          # Chat framework with markdown rendering
-    └── indicator.rs     # Status indicators
+└── tui/               # TUI rendering library (raw crossterm, not ratatui)
+    ├── lib.rs           # TermEvent, poll_event(), re-exports
+    ├── canvas.rs        # Terminal drawing surface with ANSI scroll regions
+    ├── chat.rs          # Chat framework: Handler<M> trait, ChatContext
+    ├── input.rs         # Line editing with cursor, selection, autocomplete
+    ├── indicator.rs     # Activity spinner (Thinking, ToolCall, etc.)
+    ├── workers.rs       # Worker panel display with tier badges
+    ├── style.rs         # Span, Line, Style primitives
+    ├── lines.rs         # Styled line building helpers
+    ├── notify.rs        # Desktop notifications (macOS osascript)
+    └── markdown.rs      # Optional: termimad + syntect rendering
 ```
 
 ## Key Design Principles
@@ -45,7 +72,7 @@ The `Orchestrator`, `Scheduler`, `MonitorState`, and `Dag` are all pure synchron
 
 ### Coordinator is a thin async adapter
 
-The CLI's `coordinator.rs` owns the tokio select loop, ACP sessions, and TUI channels. It translates async events (worker completions, TUI messages, merge results, timer ticks) into `Orchestrator::Command`s, and executes the resulting `Event`s (spawn workers, kill sessions, queue merges).
+The CLI's `coordinator/mod.rs` owns the tokio select loop, ACP sessions, and TUI channels. It runs on a dedicated OS thread with a `current_thread` runtime + `LocalSet` (required because ACP types are `!Send`). It translates async events (worker completions, TUI messages, merge results, timer ticks) into `Orchestrator::Command`s, and executes the resulting `Event`s (spawn workers, kill sessions, queue merges).
 
 ### Signal file protocol for cross-process communication
 
@@ -65,8 +92,8 @@ pub enum Command {
     Cancel(Target),
     StopAll,
     MonitorTick { workers },
-    Recover,
     DiscoverFromDb,
+    AddSteps { execution_id, steps },
     CheckSignals,
 }
 
@@ -78,6 +105,7 @@ pub enum Event {
     WorkerFailed { task_id, title, error },
     MergeLanded { mr_id, task_id },
     MergeConflicted { mr_id, task_id },
+    MergeNeedsResolution { mr_id, task_id, branch, copy_path, conflict_summary },
     MergeFailed { mr_id, task_id, reason },
     ExecutionComplete { execution_id },
     ExecutionFailed { execution_id },
@@ -85,7 +113,10 @@ pub enum Event {
     MonitorCancel { session_id },
     MonitorEscalation(String),
     TaskRetrying { task_id, attempt, max },
+    CheckpointReached { execution_id, step_id, title },
     StatusMessage(String),
+    WorkerReport { task_id, report },
+    Mail { from, to, subject, body, priority, thread_id },
 }
 
 pub enum Target {
@@ -96,13 +127,14 @@ pub enum Target {
 
 ## Scheduler: Tier-Based Concurrency
 
-The scheduler manages multiple concurrent executions, each with its own DAG. Concurrency limits are per-tier:
+The scheduler manages multiple concurrent executions, each with its own DAG. Concurrency limits are per-tier, with an overall cap:
 
 ```rust
 pub struct Limits {
-    pub max_light: usize,    // e.g. 5
-    pub max_standard: usize, // e.g. 3
-    pub max_heavy: usize,    // e.g. 1
+    pub max_workers: usize,   // overall cap across all tiers
+    pub max_light: usize,     // e.g. 5
+    pub max_standard: usize,  // e.g. 3
+    pub max_heavy: usize,     // e.g. 1
 }
 ```
 
@@ -138,23 +170,39 @@ This allows overlapping execution: a test step can start as soon as the implemen
 
 Pure state machine that detects stale workers based on last activity time:
 
-- Workers with no ACP update for `STALE_CANCEL_SECS` (default 120s for standard tier) get a cancel signal
-- Retry budget: up to `MAX_TASK_RETRIES` (3) per task before blocking
+- Workers with no ACP update for `STALE_CANCEL_SECS` (300s / 5 minutes) get a cancel signal
+- Retry budget: up to `MAX_TASK_RETRIES` (2) per task before blocking
 - No duplicate cancel signals (tracks already-cancelled sessions)
 
 ## MCP Server
 
-JSON-RPC 2.0 over stdio. Role-based tool filtering (planner gets all tools, worker gets status + list only).
+JSON-RPC 2.0 over stdio. Role-based tool filtering:
+
+- **Planner** (`PLANNER_TOOLS`): full access to all tools
+- **Worker** (`WORKER_TOOLS`): status, list, report, edit, mail
+- **Worker no-edit** (`WORKER_TOOLS_NO_EDIT`): same as worker minus edit
+- **Merger** (`MERGER_TOOLS`): minimal tools for conflict resolution
 
 **Tools:**
 - `enki_status` — task counts by status
 - `enki_task_create` — create standalone task (writes DB + signal file)
 - `enki_task_list` — list all tasks
-- `enki_execution_create` — create multi-step execution with dependencies
 - `enki_task_retry` — retry a failed task
+- `enki_execution_create` — create multi-step execution with dependencies
+- `enki_execution_add_steps` — add steps to a running execution
 - `enki_pause` — pause an execution or step
+- `enki_resume` — resume a paused execution or step
 - `enki_cancel` — cancel an execution or step
 - `enki_stop_all` — stop all running workers
+- `enki_worker_report` — worker reports progress back to coordinator
+- `enki_edit_file` — hashline-aware file editing
+- `enki_dag` — render execution DAG as ASCII art
+- `enki_mail_send` — send inter-agent mail
+- `enki_mail_check` — check for new mail
+- `enki_mail_read` — read a specific message
+- `enki_mail_inbox` — list inbox
+- `enki_mail_reply` — reply to a message
+- `enki_mail_thread` — view a mail thread
 
 **Signal file format:**
 ```json
@@ -167,21 +215,48 @@ JSON-RPC 2.0 over stdio. Role-based tool filtering (planner gets all tools, work
 
 ## Worker Isolation: Copy-on-Write Clones
 
-Each worker gets a full filesystem copy of the project at `.enki/copies/<task_id>`. Copies include everything — build artifacts, node_modules, .gitignored files — so workers start with a warm build cache. Uses platform-appropriate CoW (`clonefile` on macOS/APFS, `reflink` on Linux/btrfs) for instant, space-efficient clones.
+Each worker gets a full filesystem copy of the project at `.enki/copies/<task_id>`. Copies include everything — build artifacts, node_modules, .gitignored files — so workers start with a warm build cache. Uses platform-appropriate copy commands: `cp -Rc` on macOS (invokes `clonefile(2)` on APFS for instant CoW), `cp --reflink=auto -a` on Linux (btrfs/XFS reflinks), `cp -a` elsewhere.
 
 Git is used only for branching (each copy gets a `task/<id>` branch), committing worker output, fetching the branch back to the source repo, and merging via the refinery.
 
 ```
 .enki/
-├── db.sqlite         # Project state
-├── copies/           # Worker filesystem copies
-│   ├── task-a1b2.../  # One per active worker
+├── db.sqlite          # Project state (WAL mode)
+├── copies/            # Worker filesystem copies
+│   ├── task-a1b2.../   # One per active worker
 │   └── ...
-├── events/           # Signal files from MCP
+├── events/            # Signal files from MCP
 │   └── sig-01J....json
-└── logs/
-    └── enki.log
+├── roles/*.toml       # Project-specific role overrides
+├── artifacts/<exec>/<step>.md  # Artifact output mode files
+└── verify.sh          # Optional merge hook (exit non-zero = fail merge)
 ```
+
+## Configuration
+
+### TOML config (cascading)
+
+Defaults → `~/.config/enki.toml` → `.enki/enki.toml`. Each layer overlays field-by-field.
+
+```toml
+[git]
+commit_suffix = ""     # appended to worker commit messages
+
+[workers]
+max_workers = 10       # overall cap
+max_light = 5
+max_standard = 3
+max_heavy = 1
+
+[agent]
+command = ""           # custom agent binary
+args = []
+env = {}
+```
+
+### Roles (cascading)
+
+Builtins → `~/.enki/roles/*.toml` → `.enki/roles/*.toml`. Each role defines a label, system prompt, tool access, and output mode (Branch or Artifact).
 
 ## Data Flow
 
@@ -213,8 +288,8 @@ Worker completes → commit changes → WorkerDone command
 Orchestrator returns QueueMerge event
     │
     ▼
-Refinery fetches branch, merges → MergeDone command
-    │
+Refinery fetches branch, squash-merges → MergeDone command
+    │  (on conflict: MergeNeedsResolution → spawns merger agent)
     ▼
 Orchestrator advances DAG, spawns downstream workers
 ```
@@ -231,5 +306,7 @@ merge_requests   -- id, session_id, task_id, branch, base_branch, status, priori
 task_outputs     -- task_id, output
 messages         -- id, from_addr, to_addr, subject, body, priority, msg_type, thread_id, timestamps
 ```
+
+`dag_snapshots` table stores serialized DAG state for crash recovery.
 
 Auto-migration: `auto_migrate()` runs on every DB open, parses the schema const, and `ALTER TABLE ADD COLUMN` for anything missing. No version files needed.

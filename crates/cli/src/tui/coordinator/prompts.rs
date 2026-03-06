@@ -314,8 +314,8 @@ pub(super) fn build_merger_prompt(
 1. Read each conflicted file to understand both sides of the conflict
 2. Resolve the conflicts by keeping both sides' changes where they don't semantically conflict, or making a judgment call when they do
 3. After resolving each file, run `git add <file>` to mark it resolved
-4. Once all conflicts are resolved, run `git commit --no-edit` to complete the merge
 
+Do NOT commit — the orchestrator will create the commit after you finish.
 Do NOT change any files beyond what's needed to resolve the conflicts. The goal is to produce a clean merge that preserves both sides' intent."#
     )
 }

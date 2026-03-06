@@ -223,6 +223,7 @@ impl Runtime {
             try_dispatch_merge(
                 self.orch.db(), &self.db_path, &self.copy_mgr,
                 merger_done_tx, merge_in_progress,
+                &self.config.git.commit_suffix,
             );
         }
 
@@ -955,6 +956,17 @@ async fn coordinator_loop(
                 let is_git = rt.copy_mgr.is_git();
                 let merger_done_tx_clone = merger_done_tx.clone();
 
+                // Build commit message from task title + suffix.
+                let commit_message = {
+                    let mr = rt.orch.db().get_merge_request(&done.mr_id);
+                    let title = mr.as_ref().ok()
+                        .and_then(|mr| rt.orch.db().get_task(&mr.task_id).ok())
+                        .map(|t| t.title)
+                        .unwrap_or_else(|| done.mr_id.0.clone());
+                    let suffix = &rt.config.git.commit_suffix;
+                    if suffix.is_empty() { title } else { format!("{title}\n\n{suffix}") }
+                };
+
                 tokio::task::spawn_blocking(move || {
                     let db = enki_core::db::Db::open(&db_path_clone)
                         .expect("finish_merge: failed to open db");
@@ -962,7 +974,7 @@ async fn coordinator_loop(
                         project_root, copies_dir, git_identity, is_git,
                     );
                     let outcome = enki_core::refinery::finish_merge(
-                        &copy_mgr, &temp_dir, &default_branch, &db, &mr_id,
+                        &copy_mgr, &temp_dir, &default_branch, &db, &mr_id, &commit_message,
                     );
                     let _ = merger_done_tx_clone.send(MergerDone {
                         merge_request_id: mr_id,
