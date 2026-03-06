@@ -45,22 +45,3 @@ release:
     git tag "$tag"
     git push origin "$tag"
     git push origin HEAD
-
-    # Update homebrew tap
-    tap_dir="${HOME}/dev/homebrew-tap"
-    if [ ! -d "$tap_dir" ]; then
-        echo "homebrew-tap not found at $tap_dir, skipping tap update"
-        exit 0
-    fi
-    echo "Updating homebrew tap..."
-    tarball_url="https://github.com/korbindeman/enki/archive/refs/tags/${tag}.tar.gz"
-    sha=$(curl -sL "$tarball_url" | shasum -a 256 | cut -d' ' -f1)
-    formula="$tap_dir/Formula/enki.rb"
-    # Strip leading 'v' for the version field
-    tap_version="${tag#v}"
-    sed -i '' "s|^  url .*|  url \"${tarball_url}\"|" "$formula"
-    sed -i '' "s|^  version .*|  version \"${tap_version}\"|" "$formula"
-    sed -i '' "s|^  sha256 .*|  sha256 \"${sha}\"|" "$formula"
-    git -C "$tap_dir" add Formula/enki.rb
-    git -C "$tap_dir" commit -m "enki ${tag}"
-    git -C "$tap_dir" push
