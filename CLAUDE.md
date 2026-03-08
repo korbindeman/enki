@@ -19,7 +19,7 @@ Four crates, strict dependency direction: `cli` → `tui`, `acp`, `core`. No cyc
 
 | Crate | Role |
 |-------|------|
-| `core` | **Pure sync** state machine. Orchestrator, DAG scheduler, SQLite persistence, CoW copy manager, git merge refinery, roles, hashlines. Zero async, zero tokio. |
+| `core` | **Pure sync** state machine. Orchestrator, DAG scheduler, SQLite persistence, worktree copy manager, git merge refinery, roles, hashlines. Zero async, zero tokio. |
 | `acp` | Async ACP client. Spawns agent subprocesses, manages sessions, routes streaming updates. All internal state is `Rc<RefCell<...>>` — **`!Send`**, must run on a `LocalSet`. |
 | `tui` | Sync terminal UI library over raw `crossterm` (not ratatui). Chat framework via `Handler<M>` trait. Optional `markdown` feature for `termimad`+`syntect` rendering. |
 | `cli` | The `enki` binary. No args → TUI. `enki mcp` → JSON-RPC stdio server. Houses the coordinator loop (`tokio::select!` on a dedicated OS thread with `current_thread` runtime + `LocalSet`). |
@@ -36,7 +36,7 @@ Four crates, strict dependency direction: `cli` → `tui`, `acp`, `core`. No cyc
 
 **`process_events` cascade**: Spawning a worker can fail and produce new events. The coordinator drains in a `while !events.is_empty()` loop.
 
-**`infra_broken` flag**: If `cp` fails during worker spawn, coordinator auto-fails all subsequent spawns rather than retrying.
+**`infra_broken` flag**: If worktree creation fails during worker spawn, coordinator auto-fails all subsequent spawns rather than retrying.
 
 **Merger agent flow**: On merge conflict, `MergeNeedsResolution` spawns a separate ACP session with minimal tools working in a shared temp clone. `CleanupGuard` + `std::mem::forget` keeps the temp dir alive during resolution.
 
@@ -54,6 +54,8 @@ Four crates, strict dependency direction: `cli` → `tui`, `acp`, `core`. No cyc
 ```
 .enki/
 ├── db.sqlite          # SQLite (WAL mode), DAG stored as JSON blob
+├── copies/<task_id>/  # Git worktrees (one per worker), symlinks to gitignored dirs
+├── copies/.merge-*/   # Temp shared clones for merge conflict resolution
 ├── roles/*.toml       # Project-specific role overrides
 ├── artifacts/<exec>/<step>.md  # Artifact output mode files
 ├── events/sig-*.json  # Signal files (IPC)
@@ -81,5 +83,5 @@ Log levels: `ERROR` = failures, `INFO` = lifecycle events, `DEBUG` = subprocess 
 - **Architecture doc says "ratatui-based"** — incorrect. TUI uses raw crossterm with a custom canvas.
 - **`Abandoned` status**: DB-only state set on session exit for in-flight tasks. Never enters the DAG.
 - **DB migrations**: `auto_migrate()` parses schema and `ALTER TABLE ADD COLUMN` for missing columns. No migration files, no downmigrations.
-- **Copy manager**: `cp -Rc` on macOS, `cp --reflink=auto -a` on Linux. Excludes `.enki/` from copies.
+- **Copy manager**: Uses `git worktree add` to create isolated working copies in `.enki/copies/<task_id>`. Symlinks top-level gitignored directories (e.g. `target/`) back into the worktree for build caching. Symlinks are hidden before `git add -A` and restored after to avoid staging cached artifacts.
 - **MCP role-based tool access**: `PLANNER_TOOLS` (full), `WORKER_TOOLS`, `WORKER_TOOLS_NO_EDIT`, `MERGER_TOOLS` (minimal).
