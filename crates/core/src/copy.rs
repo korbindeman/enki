@@ -74,6 +74,44 @@ pub fn head_sha(dir: &Path) -> Option<String> {
     git_ok(dir, &["rev-parse", "HEAD"])
 }
 
+/// Collect all top-level symlinks in a directory and remove them.
+/// Returns a list of `(name, target)` pairs for later restoration.
+#[cfg(unix)]
+fn hide_symlinks(dir: &Path) -> Vec<(std::ffi::OsString, PathBuf)> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut saved = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_symlink() {
+            if let Ok(target) = std::fs::read_link(&path) {
+                if std::fs::remove_file(&path).is_ok() {
+                    saved.push((entry.file_name(), target));
+                }
+            }
+        }
+    }
+    saved
+}
+
+/// Restore previously removed symlinks.
+#[cfg(unix)]
+fn restore_symlinks(dir: &Path, saved: &[(std::ffi::OsString, PathBuf)]) {
+    for (name, target) in saved {
+        let link_path = dir.join(name);
+        if let Err(e) = std::os::unix::fs::symlink(target, &link_path) {
+            tracing::warn!(
+                link = %link_path.display(),
+                target = %target.display(),
+                error = %e,
+                "failed to restore symlink after staging"
+            );
+        }
+    }
+}
+
 /// Manages git worktrees for worker isolation.
 ///
 /// Each worker gets a worktree at `.enki/copies/<task_id>` that shares the
@@ -196,6 +234,10 @@ impl CopyManager {
     }
 
     /// Commit all changes in a worktree. Returns true if a commit was created.
+    ///
+    /// Temporarily removes top-level symlinks before staging so that content
+    /// inside symlinked gitignored directories (e.g. `target/`, `node_modules/`)
+    /// is never committed.
     pub fn commit_copy(&self, copy_path: &Path, message: &str) -> bool {
         let status = git_ok(copy_path, &["status", "--porcelain"]);
         let has_dirty = status.as_ref().is_some_and(|s| !s.is_empty());
@@ -203,7 +245,15 @@ impl CopyManager {
             return false;
         }
 
-        if git(copy_path, &["add", "-A"]).is_err() {
+        // Hide symlinked dirs so `git add -A` doesn't stage their contents.
+        let saved_symlinks = hide_symlinks(copy_path);
+
+        let add_ok = git(copy_path, &["add", "-A"]).is_ok();
+
+        // Always restore symlinks, even if git add failed.
+        restore_symlinks(copy_path, &saved_symlinks);
+
+        if !add_ok {
             tracing::warn!(copy = %copy_path.display(), "auto-commit: git add -A failed");
             return false;
         }
@@ -237,8 +287,13 @@ impl CopyManager {
         }
     }
 
-    /// Remove a worktree and prune stale metadata.
+    /// Remove a worktree, its branch, and prune stale metadata.
     pub fn remove_copy(&self, copy_path: &Path) -> Result<()> {
+        // Derive branch name from the directory name (e.g. "task-01" → "task/task-01").
+        let branch = copy_path
+            .file_name()
+            .map(|n| format!("task/{}", n.to_string_lossy()));
+
         if copy_path.exists() {
             let _ = git(
                 &self.project_root,
@@ -250,6 +305,12 @@ impl CopyManager {
                 let _ = git(&self.project_root, &["worktree", "prune"]);
             }
         }
+
+        // Always attempt branch cleanup, even if the directory was already gone.
+        if let Some(branch) = branch {
+            let _ = self.delete_branch(&branch);
+        }
+
         Ok(())
     }
 
@@ -280,17 +341,15 @@ impl CopyManager {
             Err(_) => return,
         };
         for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
+            let name_str = entry.file_name();
             // Skip .merge-* temp dirs (handled by refinery cleanup).
-            if name_str.starts_with('.') {
+            if name_str.to_string_lossy().starts_with('.') {
                 continue;
             }
             let path = entry.path();
             if path.is_dir() {
+                // remove_copy handles both worktree removal and branch deletion.
                 let _ = self.remove_copy(&path);
-                let branch = format!("task/{name_str}");
-                let _ = self.delete_branch(&branch);
             }
         }
         let _ = git(&self.project_root, &["worktree", "prune"]);
@@ -445,6 +504,62 @@ mod tests {
 
         let committed_again = mgr.commit_copy(&copy, "no changes");
         assert!(!committed_again);
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn commit_copy_excludes_symlinked_gitignored_dirs() {
+        let tmp = tmp_dir("copy-symlink-exclude");
+        let (source, mgr) = setup_copy_manager(&tmp);
+
+        // Set up a gitignored directory.
+        std::fs::write(source.join(".gitignore"), "build/\n").unwrap();
+        run_git(&source, &["add", ".gitignore"]);
+        run_git_with_author(&source, &["commit", "-m", "add gitignore"]);
+        std::fs::create_dir_all(source.join("build")).unwrap();
+        std::fs::write(source.join("build/output.bin"), "original").unwrap();
+
+        let (copy, _base, _branch) = mgr.create_copy("task-sym").unwrap();
+        assert!(copy.join("build").is_symlink());
+
+        // Worker writes a tracked file AND modifies a file through the symlink.
+        std::fs::write(copy.join("feature.rs"), "fn feature() {}").unwrap();
+        std::fs::write(copy.join("build/output.bin"), "modified by worker").unwrap();
+
+        let committed = mgr.commit_copy(&copy, "worker changes");
+        assert!(committed);
+
+        // The tracked file should be in the commit.
+        let diff = git_output(&copy, &["diff", "--name-only", "HEAD~1", "HEAD"]);
+        assert!(diff.contains("feature.rs"), "tracked file should be committed");
+
+        // The symlinked gitignored file should NOT be in the commit.
+        assert!(
+            !diff.contains("build/"),
+            "gitignored symlinked content should not be committed, got: {diff}"
+        );
+
+        // Symlink should still exist after commit.
+        assert!(copy.join("build").is_symlink(), "symlink should be restored");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn remove_copy_deletes_branch() {
+        let tmp = tmp_dir("copy-remove-branch");
+        let (source, mgr) = setup_copy_manager(&tmp);
+
+        let (copy, _base, _branch) = mgr.create_copy("task-rb").unwrap();
+        let branches = git_output(&source, &["branch", "--list", "task/task-rb"]);
+        assert!(branches.contains("task/task-rb"));
+
+        mgr.remove_copy(&copy).unwrap();
+        assert!(!copy.exists());
+
+        let branches = git_output(&source, &["branch", "--list", "task/task-rb"]);
+        assert!(branches.is_empty(), "branch should be deleted by remove_copy");
 
         std::fs::remove_dir_all(&tmp).ok();
     }

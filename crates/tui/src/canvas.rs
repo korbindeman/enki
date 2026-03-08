@@ -663,6 +663,7 @@ impl Canvas {
     /// Prefer `replace_stream_block_markdown` when you have the source text.
     pub fn replace_stream_block_raw(&mut self, lines: Vec<String>) {
         let msg_id = self.current_message;
+        let old_len = self.buffer.len();
         self.buffer.truncate(self.stream_start_idx);
         self.buffer_message_id.truncate(self.stream_start_idx);
         for line in &lines {
@@ -674,15 +675,18 @@ impl Canvas {
         self.logical.push_back(LogicalEntry::RawAnsi(lines));
         self.logical_message_id.push_back(msg_id);
         self.current_message = None;
-        if self.follow {
-            self.redraw_viewport();
-        }
+        // Adjust scroll offset so the viewport stays at the same content
+        // when the stream block (at the bottom) changes size.
+        let shrink = old_len.saturating_sub(self.buffer.len());
+        self.scroll_offset = self.scroll_offset.saturating_sub(shrink);
+        self.redraw_viewport();
     }
 
     /// Replace the raw streamed lines with pre-rendered markdown output,
     /// retaining the original `source` text for resize re-rendering.
     pub fn replace_stream_block_markdown(&mut self, source: String, rendered: Vec<String>) {
         let msg_id = self.current_message;
+        let old_len = self.buffer.len();
         self.buffer.truncate(self.stream_start_idx);
         self.buffer_message_id.truncate(self.stream_start_idx);
         for line in &rendered {
@@ -694,9 +698,9 @@ impl Canvas {
         self.logical.push_back(LogicalEntry::Markdown(source));
         self.logical_message_id.push_back(msg_id);
         self.current_message = None;
-        if self.follow {
-            self.redraw_viewport();
-        }
+        let shrink = old_len.saturating_sub(self.buffer.len());
+        self.scroll_offset = self.scroll_offset.saturating_sub(shrink);
+        self.redraw_viewport();
     }
 
     // ─── Scroll control ──────────────────────────────────────

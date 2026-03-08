@@ -148,6 +148,33 @@ struct Runtime {
     config: enki_core::config::Config,
 }
 
+/// Data collected during sync prep phase for a worker spawn.
+struct WorkerPrep {
+    task_id: Id,
+    title: String,
+    description: String,
+    tier: enki_core::types::Tier,
+    execution_id: Id,
+    step_id: String,
+    upstream_outputs: Vec<(String, String)>,
+    role: Option<String>,
+    branch: String,
+    copy_path: PathBuf,
+    base_commit: Option<String>,
+    artifact: bool,
+}
+
+/// Result of the sync prep phase before ACP session creation.
+struct PrepResult {
+    branch: String,
+    copy_path: PathBuf,
+    base_commit: Option<String>,
+    artifact: bool,
+    agent_program: String,
+    agent_args: Vec<String>,
+    mcp_args: Vec<String>,
+}
+
 impl Runtime {
     fn kill_all_workers(&self) {
         let t = self.tracker.borrow();
@@ -265,67 +292,20 @@ impl Runtime {
 
         while !events.is_empty() {
             let batch = std::mem::take(&mut events);
+
+            // Partition: collect SpawnWorker events for parallel processing.
+            let mut spawn_events = Vec::new();
+
             for event in batch {
                 match event {
                     Event::SpawnWorker {
                         task_id, title, description, tier,
                         execution_id, step_id, upstream_outputs, role,
                     } => {
-                        if self.infra_broken {
-                            let more = self.orch.handle(Command::WorkerDone(WorkerResult {
-                                task_id: task_id.clone(),
-                                execution_id: Some(execution_id),
-                                step_id: Some(step_id),
-                                title, branch: String::new(),
-                                outcome: WorkerOutcome::Failed {
-                                    error: "infrastructure broken".into(),
-                                },
-                            }));
-                            events.extend(more);
-                            continue;
-                        }
-
-                        match self.spawn_worker(
-                            &task_id, &title, &description,
-                            &execution_id, &step_id, &upstream_outputs,
-                            role.as_deref(),
-                        ).await {
-                            Ok(()) => {
-                                let _ = self.tx.send(FromCoordinator::WorkerSpawned {
-                                    task_id: task_id.0.clone(),
-                                    title: title.clone(),
-                                    tier: tier.as_str().to_string(),
-                                });
-                                coord.queue_event(format!(
-                                    "- Worker spawned for \"{}\" ({})", title, task_id
-                                ));
-                            }
-                            Err(e) => {
-                                let error = e.to_string();
-                                tracing::error!(task_id = %task_id, error = %error, "failed to spawn worker");
-
-                                if error.contains("worktree") || error.contains("not found") {
-                                    self.infra_broken = true;
-                                }
-
-                                let _ = self.tx.send(FromCoordinator::WorkerFailed {
-                                    task_id: task_id.0.clone(),
-                                    title: title.clone(),
-                                    error: error.clone(),
-                                });
-                                coord.queue_event(format!(
-                                    "- Task \"{}\" ({}) failed to spawn: {}",
-                                    title, task_id, error
-                                ));
-
-                                let more = self.orch.handle(Command::WorkerDone(WorkerResult {
-                                    task_id, execution_id: Some(execution_id),
-                                    step_id: Some(step_id), title, branch: String::new(),
-                                    outcome: WorkerOutcome::Failed { error },
-                                }));
-                                events.extend(more);
-                            }
-                        }
+                        spawn_events.push((
+                            task_id, title, description, tier,
+                            execution_id, step_id, upstream_outputs, role,
+                        ));
                     }
                     Event::KillSession { session_id } => {
                         self.mgr.kill_session(&session_id);
@@ -469,20 +449,128 @@ impl Runtime {
                     }
                 }
             }
+
+            // --- Parallel SpawnWorker processing ---
+            // Phase 1: Sequential sync prep (worktree creation, DB writes).
+            // Phase 2: Parallel ACP session creation (spawn_local runs concurrently).
+            // Phase 3: Sequential finalization (tracker, prompt dispatch).
+            let mut launches: Vec<(WorkerPrep, tokio::task::JoinHandle<enki_acp::Result<String>>)> = Vec::new();
+
+            for (task_id, title, description, tier, execution_id, step_id, upstream_outputs, role) in spawn_events {
+                if self.infra_broken {
+                    let more = self.orch.handle(Command::WorkerDone(WorkerResult {
+                        task_id: task_id.clone(),
+                        execution_id: Some(execution_id),
+                        step_id: Some(step_id),
+                        title, branch: String::new(),
+                        outcome: WorkerOutcome::Failed {
+                            error: "infrastructure broken".into(),
+                        },
+                    }));
+                    events.extend(more);
+                    continue;
+                }
+
+                match self.prepare_worker(&task_id, role.as_deref()) {
+                    Ok(prep_result) => {
+                        // Launch ACP session creation immediately (runs concurrently on LocalSet).
+                        let mgr = self.mgr.clone();
+                        let enki_bin = self.enki_bin.clone();
+                        let copy_path = prep_result.copy_path.clone();
+                        let mcp_args = prep_result.mcp_args.clone();
+                        let task_label = task_id.0.clone();
+                        let sonnet_only = self.config.workers.sonnet_only;
+                        let agent_program = prep_result.agent_program.clone();
+                        let agent_args = prep_result.agent_args.clone();
+
+                        let handle = tokio::task::spawn_local(async move {
+                            let worker_mcp = vec![enki_acp::acp_schema::McpServer::Stdio(
+                                enki_acp::acp_schema::McpServerStdio::new("enki", &enki_bin)
+                                    .args(mcp_args),
+                            )];
+                            let args_ref: Vec<&str> = agent_args.iter().map(|s| s.as_str()).collect();
+                            mgr.start_session_with_mcp(
+                                &agent_program, &args_ref,
+                                copy_path, worker_mcp, &task_label, sonnet_only,
+                            ).await
+                        });
+
+                        launches.push((
+                            WorkerPrep {
+                                task_id, title, description, tier,
+                                execution_id, step_id, upstream_outputs, role,
+                                branch: prep_result.branch,
+                                copy_path: prep_result.copy_path,
+                                base_commit: prep_result.base_commit,
+                                artifact: prep_result.artifact,
+                            },
+                            handle,
+                        ));
+                    }
+                    Err(e) => {
+                        let error = e.to_string();
+                        tracing::error!(task_id = %task_id, error = %error, "failed to prepare worker");
+                        if error.contains("worktree") || error.contains("not found") {
+                            self.infra_broken = true;
+                        }
+                        let _ = self.tx.send(FromCoordinator::WorkerFailed {
+                            task_id: task_id.0.clone(),
+                            title: title.clone(),
+                            error: error.clone(),
+                        });
+                        coord.queue_event(format!(
+                            "- Task \"{}\" ({}) failed to spawn: {}", title, task_id, error
+                        ));
+                        let more = self.orch.handle(Command::WorkerDone(WorkerResult {
+                            task_id, execution_id: Some(execution_id),
+                            step_id: Some(step_id), title, branch: String::new(),
+                            outcome: WorkerOutcome::Failed { error },
+                        }));
+                        events.extend(more);
+                    }
+                }
+            }
+
+            // Phase 3: Await all ACP sessions and finalize.
+            for (prep, handle) in launches {
+                let result = handle.await.expect("spawn_local panicked");
+                match result {
+                    Ok(session_id) => {
+                        self.finalize_worker_spawn(prep, session_id, coord);
+                    }
+                    Err(e) => {
+                        let error = e.to_string();
+                        tracing::error!(task_id = %prep.task_id, error = %error, "failed to spawn worker");
+                        if error.contains("worktree") || error.contains("not found") {
+                            self.infra_broken = true;
+                        }
+                        let _ = self.tx.send(FromCoordinator::WorkerFailed {
+                            task_id: prep.task_id.0.clone(),
+                            title: prep.title.clone(),
+                            error: error.clone(),
+                        });
+                        coord.queue_event(format!(
+                            "- Task \"{}\" ({}) failed to spawn: {}", prep.title, prep.task_id, error
+                        ));
+                        let more = self.orch.handle(Command::WorkerDone(WorkerResult {
+                            task_id: prep.task_id, execution_id: Some(prep.execution_id),
+                            step_id: Some(prep.step_id), title: prep.title, branch: String::new(),
+                            outcome: WorkerOutcome::Failed { error },
+                        }));
+                        events.extend(more);
+                    }
+                }
+            }
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn spawn_worker(
+    /// Sync prep phase for a worker spawn: create worktree/copy, assign task in DB,
+    /// resolve agent command. Fast with worktrees.
+    fn prepare_worker(
         &mut self,
         task_id: &Id,
-        title: &str,
-        description: &str,
-        execution_id: &Id,
-        step_id: &str,
-        upstream_outputs: &[(String, String)],
         role: Option<&str>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<PrepResult> {
         let branch = format!("task/{}", task_id);
         let (copy_path, base_commit, base_branch) = self.copy_mgr.create_copy(&task_id.0)?;
 
@@ -491,7 +579,6 @@ impl Runtime {
             task_id, &agent_id, copy_path.to_str().unwrap(), &branch, &base_branch,
         )?;
 
-        // Look up role config to determine tool access and output mode.
         let role_config = role.and_then(|r| self.roles.get(r));
         let can_edit = role_config.map(|r| r.can_edit).unwrap_or(true);
         let artifact = role_config
@@ -506,76 +593,85 @@ impl Runtime {
             mcp_args.push("--no-edit".into());
         }
 
-        let worker_mcp = vec![enki_acp::acp_schema::McpServer::Stdio(
-            enki_acp::acp_schema::McpServerStdio::new("enki", &self.enki_bin)
-                .args(mcp_args),
-        )];
-
         let agent_cmd =
-            enki_core::agent_runtime::resolve_from_config(&self.config.agent).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let args_ref: Vec<&str> = agent_cmd.args.iter().map(|s| s.as_str()).collect();
-        let session_id = self.mgr
-            .start_session_with_mcp(
-                agent_cmd.program.to_str().unwrap(), &args_ref,
-                copy_path.clone(), worker_mcp, &task_id.0,
-                self.config.workers.sonnet_only,
-            )
-            .await?;
+            enki_core::agent_runtime::resolve_from_config(&self.config.agent)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        self.tracker.borrow_mut().register(session_id.clone(), task_id.0.clone());
-        self.orch.set_step_session(&execution_id.0, step_id, session_id.clone());
+        Ok(PrepResult {
+            branch,
+            copy_path,
+            base_commit,
+            artifact,
+            agent_program: agent_cmd.program.to_str().unwrap().to_string(),
+            agent_args: agent_cmd.args,
+            mcp_args,
+        })
+    }
 
-        // Compute artifact path if this is an artifact worker.
-        let artifact_path = if artifact {
-            let artifacts_dir = self.copy_mgr.project_root().join(".enki").join("artifacts").join(&execution_id.0);
+    /// Finalize a worker spawn after the ACP session is created: register tracker,
+    /// build prompt, dispatch the worker task.
+    fn finalize_worker_spawn(
+        &mut self,
+        prep: WorkerPrep,
+        session_id: String,
+        coord: &mut CoordinatorSession,
+    ) {
+        self.tracker.borrow_mut().register(session_id.clone(), prep.task_id.0.clone());
+        self.orch.set_step_session(&prep.execution_id.0, &prep.step_id, session_id.clone());
+
+        let artifact_path = if prep.artifact {
+            let artifacts_dir = self.copy_mgr.project_root()
+                .join(".enki").join("artifacts").join(&prep.execution_id.0);
             let _ = std::fs::create_dir_all(&artifacts_dir);
-            Some(artifacts_dir.join(format!("{step_id}.md")))
+            Some(artifacts_dir.join(format!("{}.md", prep.step_id)))
         } else {
             None
         };
 
-        // Discover artifact files from completed upstream steps in this execution.
         let artifact_files = discover_artifact_files(
             self.copy_mgr.project_root(),
-            &execution_id.0,
-            upstream_outputs,
+            &prep.execution_id.0,
+            &prep.upstream_outputs,
         );
 
+        let role_config = prep.role.as_deref().and_then(|r| self.roles.get(r));
         let role_prompt = role_config.map(|r| r.system_prompt.as_str());
         let prompt = build_worker_prompt(
-            title, description, upstream_outputs, &artifact_files,
+            &prep.title, &prep.description, &prep.upstream_outputs, &artifact_files,
             role_prompt, artifact_path.as_deref(),
         );
+
+        let _ = self.tx.send(FromCoordinator::WorkerSpawned {
+            task_id: prep.task_id.0.clone(),
+            title: prep.title.clone(),
+            tier: prep.tier.as_str().to_string(),
+        });
+        coord.queue_event(format!(
+            "- Worker spawned for \"{}\" ({})", prep.title, prep.task_id
+        ));
+
         let mgr_clone = self.mgr.clone();
         let tracker_clone = self.tracker.clone();
-        let task_id = task_id.clone();
-        let title = title.to_string();
-        let branch_owned = branch;
-        let copy_path_owned = copy_path;
         let done_tx = self.worker_done_tx.clone();
         let sid_for_done = session_id.clone();
-        let exec_id_owned = Some(execution_id.clone());
-        let step_id_owned = Some(step_id.to_string());
 
         tokio::task::spawn_local(async move {
             let result = mgr_clone.prompt(&session_id, &prompt).await;
             tracker_clone.borrow_mut().remove(&session_id);
             mgr_clone.kill_session(&session_id);
             let _ = done_tx.send(WorkerDone {
-                task_id,
+                task_id: prep.task_id,
                 session_id: Some(sid_for_done),
-                title,
-                branch: branch_owned,
-                copy_path: copy_path_owned,
-                base_commit,
+                title: prep.title,
+                branch: prep.branch,
+                copy_path: prep.copy_path,
+                base_commit: prep.base_commit,
                 result: result.map_err(|e| e.to_string()),
-                execution_id: exec_id_owned,
-                step_id: step_id_owned,
-                artifact,
+                execution_id: Some(prep.execution_id),
+                step_id: Some(prep.step_id),
+                artifact: prep.artifact,
             });
         });
-
-        Ok(())
     }
 
     async fn spawn_merger_agent(
@@ -918,34 +1014,8 @@ async fn coordinator_loop(
                     outcome: done.outcome,
                 }));
 
-                // After merge, clean up worker worktrees and branches.
-                for event in &events {
-                    if let Event::MergeLanded { mr_id, .. } = event {
-                        let mr_id_obj = Id(mr_id.clone());
-                        if let Ok(mr) = rt.orch.db().get_merge_request(&mr_id_obj)
-                            && let Some(task_id) = mr.branch.strip_prefix("task/") {
-                                let copy_path = rt.copy_mgr.copies_dir().join(task_id);
-                                let project_root = rt.copy_mgr.project_root().to_path_buf();
-                                let branch = mr.branch.clone();
-                                tokio::task::spawn_blocking(move || {
-                                    // Remove worktree (also cleans .git/worktrees metadata).
-                                    let _ = std::process::Command::new("git")
-                                        .args(["worktree", "remove", "--force",
-                                               &copy_path.to_string_lossy()])
-                                        .current_dir(&project_root)
-                                        .output();
-                                    if copy_path.exists() {
-                                        let _ = std::fs::remove_dir_all(&copy_path);
-                                    }
-                                    // Delete the task branch (already merged).
-                                    let _ = std::process::Command::new("git")
-                                        .args(["branch", "-D", &branch])
-                                        .current_dir(&project_root)
-                                        .output();
-                                });
-                            }
-                    }
-                }
+                // Worktree + branch cleanup is handled by remove_copy (called from
+                // process_worker_done) and finish_merge_inner in the refinery.
 
                 rt.process_events(events, &mut coord).await;
             }
