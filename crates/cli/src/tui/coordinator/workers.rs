@@ -263,19 +263,13 @@ pub(super) fn try_dispatch_merge(
     let copies_dir_owned = copy_mgr.copies_dir().to_path_buf();
     let db_path_clone = db_path.to_string();
     let git_identity_owned = copy_mgr.git_identity().clone();
-    let is_git = copy_mgr.is_git();
-
-    // Determine copy path from branch name (task/<task_id> → copies/<task_id>).
-    let copy_path = copy_mgr.copies_dir().join(
-        branch.strip_prefix("task/").unwrap_or(&branch),
-    );
 
     tokio::task::spawn_blocking(move || {
         let db =
             enki_core::db::Db::open(&db_path_clone).expect("refinery: failed to open db");
-        let copy_mgr = CopyManager::new(project_root_owned, copies_dir_owned, git_identity_owned, is_git);
+        let copy_mgr = CopyManager::new(project_root_owned, copies_dir_owned, git_identity_owned);
         let outcome =
-            enki_core::refinery::process_merge(&copy_mgr, &copy_path, &branch, &base_branch, &db, &mr_id, &commit_message);
+            enki_core::refinery::process_merge(&copy_mgr, &branch, &base_branch, &db, &mr_id, &commit_message);
         let _ = done_tx.send(MergerDone {
             merge_request_id: mr_id,
             outcome,

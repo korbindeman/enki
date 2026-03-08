@@ -304,7 +304,7 @@ impl Runtime {
                                 let error = e.to_string();
                                 tracing::error!(task_id = %task_id, error = %error, "failed to spawn worker");
 
-                                if error.contains("cp failed") || error.contains("not found") {
+                                if error.contains("worktree") || error.contains("not found") {
                                     self.infra_broken = true;
                                 }
 
@@ -834,17 +834,12 @@ async fn coordinator_loop(
 
     let project_root = crate::commands::project_root().unwrap_or_default();
     let copies_dir = crate::commands::copies_dir().unwrap_or_default();
-    let is_git = enki_core::copy::is_git_repo(&project_root);
-    let git_identity = if is_git {
-        match GitIdentity::from_git_config(&project_root) {
-            Ok(id) => id,
-            Err(e) => {
-                let _ = tx.send(FromCoordinator::Error(format!("git identity: {e}")));
-                return;
-            }
+    let git_identity = match GitIdentity::from_git_config(&project_root) {
+        Ok(id) => id,
+        Err(e) => {
+            let _ = tx.send(FromCoordinator::Error(format!("git identity: {e}")));
+            return;
         }
-    } else {
-        GitIdentity::default_enki()
     };
 
     let (merger_agent_done_tx, mut merger_agent_done_rx) = mpsc::unbounded_channel::<MergerAgentDone>();
@@ -856,7 +851,7 @@ async fn coordinator_loop(
         merger_agent_done_tx,
         tx,
         enki_bin,
-        copy_mgr: CopyManager::new(project_root, copies_dir, git_identity, is_git),
+        copy_mgr: CopyManager::new(project_root, copies_dir, git_identity),
         orch,
         infra_broken: false,
         db_path,
@@ -923,15 +918,30 @@ async fn coordinator_loop(
                     outcome: done.outcome,
                 }));
 
-                // After merge, clean up worker copies.
+                // After merge, clean up worker worktrees and branches.
                 for event in &events {
                     if let Event::MergeLanded { mr_id, .. } = event {
                         let mr_id_obj = Id(mr_id.clone());
                         if let Ok(mr) = rt.orch.db().get_merge_request(&mr_id_obj)
                             && let Some(task_id) = mr.branch.strip_prefix("task/") {
                                 let copy_path = rt.copy_mgr.copies_dir().join(task_id);
+                                let project_root = rt.copy_mgr.project_root().to_path_buf();
+                                let branch = mr.branch.clone();
                                 tokio::task::spawn_blocking(move || {
-                                    let _ = std::fs::remove_dir_all(&copy_path);
+                                    // Remove worktree (also cleans .git/worktrees metadata).
+                                    let _ = std::process::Command::new("git")
+                                        .args(["worktree", "remove", "--force",
+                                               &copy_path.to_string_lossy()])
+                                        .current_dir(&project_root)
+                                        .output();
+                                    if copy_path.exists() {
+                                        let _ = std::fs::remove_dir_all(&copy_path);
+                                    }
+                                    // Delete the task branch (already merged).
+                                    let _ = std::process::Command::new("git")
+                                        .args(["branch", "-D", &branch])
+                                        .current_dir(&project_root)
+                                        .output();
                                 });
                             }
                     }
@@ -953,7 +963,6 @@ async fn coordinator_loop(
                 let project_root = rt.copy_mgr.project_root().to_path_buf();
                 let copies_dir = rt.copy_mgr.copies_dir().to_path_buf();
                 let git_identity = rt.copy_mgr.git_identity().clone();
-                let is_git = rt.copy_mgr.is_git();
                 let merger_done_tx_clone = merger_done_tx.clone();
 
                 // Build commit message from task title + suffix.
@@ -971,7 +980,7 @@ async fn coordinator_loop(
                     let db = enki_core::db::Db::open(&db_path_clone)
                         .expect("finish_merge: failed to open db");
                     let copy_mgr = CopyManager::new(
-                        project_root, copies_dir, git_identity, is_git,
+                        project_root, copies_dir, git_identity,
                     );
                     let outcome = enki_core::refinery::finish_merge(
                         &copy_mgr, &temp_dir, &default_branch, &db, &mr_id, &commit_message,
@@ -1002,5 +1011,9 @@ async fn coordinator_loop(
             tracing::info!(count, "session end: abandoned in-flight merges");
         }
     let _ = rt.orch.db().end_session(&enki_session_id);
+
+    // Clean up all worker worktrees.
+    rt.copy_mgr.cleanup_all_worktrees();
+
     tracing::info!(session_id = %enki_session_id, "session ended");
 }

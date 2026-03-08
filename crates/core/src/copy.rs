@@ -28,14 +28,6 @@ impl GitIdentity {
         Ok(Self { name, email })
     }
 
-    /// Default identity used for internal copy commits when the source isn't a git repo.
-    pub fn default_enki() -> Self {
-        Self {
-            name: "enki".into(),
-            email: "enki@localhost".into(),
-        }
-    }
-
     /// Apply this identity as env vars on a `Command`.
     pub fn apply<'a>(&self, cmd: &'a mut Command) -> &'a mut Command {
         cmd.env("GIT_AUTHOR_NAME", &self.name)
@@ -77,210 +69,145 @@ fn git_ok(dir: &Path, args: &[&str]) -> Option<String> {
     git(dir, args).ok()
 }
 
-/// Clone a single filesystem entry using platform-appropriate copy-on-write.
-///
-/// - macOS (APFS): `cp -Rc` — instant CoW via `clonefile(2)`
-/// - Linux (btrfs/XFS): `cp --reflink=auto -a` — CoW where supported, regular copy otherwise
-/// - Other: `cp -a` — regular recursive copy
-fn clone_entry(src: &Path, dst: &Path) -> Result<()> {
-    let output = if cfg!(target_os = "macos") {
-        Command::new("cp")
-            .args(["-Rc"])
-            .arg(src)
-            .arg(dst)
-            .output()?
-    } else if cfg!(target_os = "linux") {
-        Command::new("cp")
-            .args(["--reflink=auto", "-a"])
-            .arg(src)
-            .arg(dst)
-            .output()?
-    } else {
-        Command::new("cp")
-            .args(["-a"])
-            .arg(src)
-            .arg(dst)
-            .output()?
-    };
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(CopyError::Io(std::io::Error::other(
-            format!("cp failed for {}: {stderr}", src.display()),
-        )));
-    }
-    Ok(())
-}
-
 /// Get the current HEAD sha of a repo, or None if unborn/not a repo.
 pub fn head_sha(dir: &Path) -> Option<String> {
     git_ok(dir, &["rev-parse", "HEAD"])
 }
 
-/// Check whether a directory is inside a git repository.
-pub fn is_git_repo(dir: &Path) -> bool {
-    Command::new("git")
-        .args(["rev-parse", "--git-dir"])
-        .current_dir(dir)
-        .output()
-        .is_ok_and(|o| o.status.success())
-}
-
-/// Manages copy-on-write clones of the project for worker isolation.
+/// Manages git worktrees for worker isolation.
 ///
-/// Each worker gets a clone of the project at `.enki/copies/<task_id>` that
-/// includes everything (build artifacts, .gitignored files, node_modules, etc.).
-/// Uses platform-appropriate CoW (APFS on macOS, reflink on Linux) for instant,
-/// space-efficient clones.
-///
-/// When the source is a git repo, copies branch off HEAD and merges use git.
-/// When it's not, copies get a fresh `git init` internally so workers still
-/// have git for tracking changes, but the final merge copies files back.
+/// Each worker gets a worktree at `.enki/copies/<task_id>` that shares the
+/// source repo's `.git` object store. Top-level gitignored directories
+/// (build caches like `target/`, `node_modules/`) are symlinked from the
+/// source project for fast access without copying.
 pub struct CopyManager {
     project_root: PathBuf,
     copies_dir: PathBuf,
     git_identity: GitIdentity,
-    is_git: bool,
 }
 
 impl CopyManager {
-    pub fn new(project_root: PathBuf, copies_dir: PathBuf, git_identity: GitIdentity, is_git: bool) -> Self {
+    pub fn new(project_root: PathBuf, copies_dir: PathBuf, git_identity: GitIdentity) -> Self {
         Self {
             project_root,
             copies_dir,
             git_identity,
-            is_git,
         }
     }
 
-    /// Create a copy-on-write clone of the project for a worker.
+    /// Create a git worktree for a worker.
     ///
-    /// For git sources:
-    /// 1. Record the current HEAD commit (the "base") and branch name
-    /// 2. Clone each top-level entry except `.enki/` into a temp directory
-    /// 3. Atomically rename the temp directory to the final path
-    /// 4. `git checkout -b task/<task_id>` inside the copy
+    /// 1. Record the current HEAD commit and branch name
+    /// 2. `git worktree add .enki/copies/<task_id> -b task/<task_id>`
+    /// 3. Symlink top-level gitignored directories from the source
     ///
-    /// For non-git sources:
-    /// 1. Clone each top-level entry except `.enki/`
-    /// 2. `git init` inside the copy + commit everything as a baseline
-    /// 3. Create a task branch
-    ///
-    /// Returns `(copy_path, base_commit, base_branch)`. `base_commit` is `None`
-    /// for unborn repos. `base_branch` is the branch to merge back into.
+    /// Returns `(worktree_path, base_commit, base_branch)`.
     pub fn create_copy(&self, task_id: &str) -> Result<(PathBuf, Option<String>, String)> {
-        let (base_commit, base_branch) = if self.is_git {
-            (
-                git_ok(&self.project_root, &["rev-parse", "HEAD"]),
-                self.current_branch()?,
-            )
-        } else {
-            (None, "main".to_string())
-        };
+        let base_commit = git_ok(&self.project_root, &["rev-parse", "HEAD"]);
+        let base_branch = self.current_branch()?;
 
         std::fs::create_dir_all(&self.copies_dir)?;
 
         let copy_path = self.copies_dir.join(task_id);
+        let branch = format!("task/{task_id}");
+
+        // Clean up stale worktree from a prior crashed session.
         if copy_path.exists() {
-            std::fs::remove_dir_all(&copy_path)?;
+            let _ = git(
+                &self.project_root,
+                &["worktree", "remove", "--force", &copy_path.to_string_lossy()],
+            );
+            if copy_path.exists() {
+                std::fs::remove_dir_all(&copy_path)?;
+            }
+            let _ = git(&self.project_root, &["worktree", "prune"]);
         }
 
-        // Build into a temp directory, then atomically rename.
-        let tmp_path = self.copies_dir.join(format!(".tmp-{task_id}"));
-        if tmp_path.exists() {
-            std::fs::remove_dir_all(&tmp_path)?;
-        }
-        std::fs::create_dir_all(&tmp_path)?;
+        // Delete stale branch if it exists from a prior run.
+        let _ = git(&self.project_root, &["branch", "-D", &branch]);
 
-        // Clone each top-level entry except .enki/ — preserves CoW semantics
-        // while skipping nested copies and the database.
-        for entry in std::fs::read_dir(&self.project_root)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            if name == ".enki" {
-                continue;
-            }
-            // Non-git sources: also skip .git/ (there isn't one, but be safe)
-            if !self.is_git && name == ".git" {
-                continue;
-            }
-            if let Err(e) = clone_entry(&entry.path(), &tmp_path.join(&name)) {
-                let _ = std::fs::remove_dir_all(&tmp_path);
-                return Err(e);
-            }
+        // Create worktree with a new branch from HEAD.
+        if let Err(e) = git(
+            &self.project_root,
+            &[
+                "worktree",
+                "add",
+                &copy_path.to_string_lossy(),
+                "-b",
+                &branch,
+            ],
+        ) {
+            return Err(CopyError::Git(format!("worktree add failed: {e}")));
         }
 
-        // Atomic rename (same filesystem, instant).
-        std::fs::rename(&tmp_path, &copy_path)?;
-
-        if self.is_git {
-            // Git source: create a new branch for the worker's changes.
-            let branch = format!("task/{task_id}");
-            if let Err(e) = git(&copy_path, &["checkout", "-b", &branch]) {
-                let _ = std::fs::remove_dir_all(&copy_path);
-                return Err(e);
-            }
-        } else {
-            // Non-git source: initialize git inside the copy for internal tracking.
-            let init_steps: &[&[&str]] = &[
-                &["init"],
-                &["checkout", "-b", "main"],
-                &["add", "-A"],
-            ];
-            for args in init_steps {
-                if let Err(e) = git(&copy_path, args) {
-                    let _ = std::fs::remove_dir_all(&copy_path);
-                    return Err(e);
-                }
-            }
-            // Commit baseline with identity.
-            let mut cmd = Command::new("git");
-            cmd.args(["commit", "-m", "baseline", "--no-verify"]);
-            self.git_identity.apply(&mut cmd);
-            let out = cmd.current_dir(&copy_path).output()
-                .map_err(|e| CopyError::Git(format!("baseline commit: {e}")))?;
-            if !out.status.success() {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let _ = std::fs::remove_dir_all(&copy_path);
-                return Err(CopyError::Git(format!("baseline commit: {stderr}")));
-            }
-            // Create task branch off baseline.
-            let branch = format!("task/{task_id}");
-            if let Err(e) = git(&copy_path, &["checkout", "-b", &branch]) {
-                let _ = std::fs::remove_dir_all(&copy_path);
-                return Err(e);
-            }
+        // Symlink gitignored directories for build caches (non-fatal).
+        if let Err(e) = self.symlink_gitignored(&copy_path) {
+            tracing::warn!(error = %e, "failed to symlink gitignored dirs into worktree");
         }
-
-        // For non-git, base_commit is the baseline commit we just created.
-        let base_commit = if self.is_git {
-            base_commit
-        } else {
-            head_sha(&copy_path)
-        };
 
         Ok((copy_path, base_commit, base_branch))
     }
 
-    /// Commit all changes in a copy. Returns true if a commit was created.
+    /// Symlink top-level gitignored directories from the source into a worktree.
     ///
-    /// Workers may finish without committing. This captures their work so
-    /// we can merge it back.
+    /// Uses `git ls-files` to discover which directories are gitignored, then
+    /// creates symlinks so workers can access build caches without copying them.
+    fn symlink_gitignored(&self, worktree_path: &Path) -> Result<()> {
+        let output = Command::new("git")
+            .args([
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "--directory",
+                "--no-empty-directory",
+            ])
+            .current_dir(&self.project_root)
+            .output()
+            .map_err(|e| CopyError::Git(format!("ls-files: {e}")))?;
+
+        if !output.status.success() {
+            return Ok(());
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            let entry = line.trim_end_matches('/');
+            if entry.is_empty() || entry.contains('/') {
+                continue;
+            }
+
+            let source_path = self.project_root.join(entry);
+            let target_path = worktree_path.join(entry);
+
+            if source_path.is_dir() && !target_path.exists() {
+                #[cfg(unix)]
+                if let Err(e) = std::os::unix::fs::symlink(&source_path, &target_path) {
+                    tracing::warn!(
+                        source = %source_path.display(),
+                        target = %target_path.display(),
+                        error = %e,
+                        "failed to symlink gitignored dir"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Commit all changes in a worktree. Returns true if a commit was created.
     pub fn commit_copy(&self, copy_path: &Path, message: &str) -> bool {
-        // Check for dirty state.
         let status = git_ok(copy_path, &["status", "--porcelain"]);
         let has_dirty = status.as_ref().is_some_and(|s| !s.is_empty());
         if !has_dirty {
             return false;
         }
 
-        // Stage everything.
         if git(copy_path, &["add", "-A"]).is_err() {
             tracing::warn!(copy = %copy_path.display(), "auto-commit: git add -A failed");
             return false;
         }
 
-        // Commit with identity.
         let mut cmd = Command::new("git");
         cmd.args(["commit", "-m", message, "--no-verify"]);
         self.git_identity.apply(&mut cmd);
@@ -301,10 +228,7 @@ impl CopyManager {
         }
     }
 
-    /// Check if a copy has any file changes vs the base commit.
-    ///
-    /// `base_commit` is the HEAD hash from when the copy was created. If `None`
-    /// (unborn repo), any commit on the task branch counts as changes.
+    /// Check if a worktree has any file changes vs the base commit.
     pub fn has_changes(&self, copy_path: &Path, base_commit: Option<&str>) -> bool {
         match base_commit {
             Some(base) => git_ok(copy_path, &["diff", "--stat", base, "HEAD"])
@@ -313,35 +237,27 @@ impl CopyManager {
         }
     }
 
-    /// Remove a copy directory.
+    /// Remove a worktree and prune stale metadata.
     pub fn remove_copy(&self, copy_path: &Path) -> Result<()> {
         if copy_path.exists() {
-            std::fs::remove_dir_all(copy_path)?;
+            let _ = git(
+                &self.project_root,
+                &["worktree", "remove", "--force", &copy_path.to_string_lossy()],
+            );
+            // Fallback if git worktree remove didn't work.
+            if copy_path.exists() {
+                std::fs::remove_dir_all(copy_path)?;
+                let _ = git(&self.project_root, &["worktree", "prune"]);
+            }
         }
         Ok(())
     }
 
     /// Get the current branch name in the source repo.
-    ///
-    /// Returns whatever branch HEAD points to — no assumptions about naming.
-    /// This is the branch workers merge back into.
     pub fn current_branch(&self) -> Result<String> {
         git(&self.project_root, &["symbolic-ref", "--short", "HEAD"]).map_err(|_| {
             CopyError::Git("HEAD is detached or unborn — cannot determine current branch".into())
         })
-    }
-
-    /// Fetch a worker's branch from a copy into the source repo.
-    ///
-    /// Runs `git fetch <copy_path> <branch>:<branch>` in the source repo,
-    /// making the worker's commits available for merging.
-    pub fn fetch_branch(&self, copy_path: &Path, branch: &str) -> Result<()> {
-        let copy_str = copy_path.to_string_lossy();
-        git(
-            &self.project_root,
-            &["fetch", &copy_str, &format!("{branch}:{branch}")],
-        )?;
-        Ok(())
     }
 
     /// Delete a branch from the source repo.
@@ -350,6 +266,34 @@ impl CopyManager {
             tracing::warn!("failed to delete branch {branch}: {e}");
         }
         Ok(())
+    }
+
+    /// Remove all worktrees in the copies directory.
+    ///
+    /// Called on session exit to clean up stale worker directories.
+    pub fn cleanup_all_worktrees(&self) {
+        if !self.copies_dir.exists() {
+            return;
+        }
+        let entries = match std::fs::read_dir(&self.copies_dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            // Skip .merge-* temp dirs (handled by refinery cleanup).
+            if name_str.starts_with('.') {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                let _ = self.remove_copy(&path);
+                let branch = format!("task/{name_str}");
+                let _ = self.delete_branch(&branch);
+            }
+        }
+        let _ = git(&self.project_root, &["worktree", "prune"]);
     }
 
     pub fn project_root(&self) -> &Path {
@@ -362,10 +306,6 @@ impl CopyManager {
 
     pub fn git_identity(&self) -> &GitIdentity {
         &self.git_identity
-    }
-
-    pub fn is_git(&self) -> bool {
-        self.is_git
     }
 }
 
@@ -393,14 +333,14 @@ mod tests {
         let source = tmp.join("source");
         let copies = tmp.join("copies");
         setup_source(&source);
-        // Create .enki dir in source (simulates real project)
+        // Create .enki dir in source (simulates real project).
         std::fs::create_dir_all(source.join(".enki")).unwrap();
         std::fs::write(source.join(".enki/db.sqlite"), "fake db").unwrap();
         let identity = GitIdentity {
             name: "test".into(),
             email: "test@test.com".into(),
         };
-        let mgr = CopyManager::new(source.clone(), copies, identity, true);
+        let mgr = CopyManager::new(source.clone(), copies, identity);
         (source, mgr)
     }
 
@@ -445,11 +385,11 @@ mod tests {
     }
 
     #[test]
-    fn create_copy_produces_full_filesystem_clone() {
+    fn create_copy_produces_worktree() {
         let tmp = tmp_dir("copy-create");
         let (source, mgr) = setup_copy_manager(&tmp);
 
-        // Add a .gitignored file (this is the whole point — workers should see it)
+        // Add a .gitignored directory (should be symlinked, not copied).
         std::fs::write(source.join(".gitignore"), "build/\n").unwrap();
         run_git(&source, &["add", ".gitignore"]);
         run_git_with_author(&source, &["commit", "-m", "add gitignore"]);
@@ -458,28 +398,32 @@ mod tests {
 
         let (copy, _base, _branch) = mgr.create_copy("task-01").unwrap();
 
-        // Copy should have all files including .gitignored ones.
+        // Tracked files should exist.
         assert!(copy.join("README.md").exists());
-        assert!(copy.join("build/output.bin").exists());
-        assert_eq!(
-            std::fs::read_to_string(copy.join("build/output.bin")).unwrap(),
-            "binary data"
-        );
 
-        // .enki/ should NOT be in the copy.
+        // .enki/ should NOT be in the worktree.
         assert!(!copy.join(".enki").exists());
 
         // Should be on a task branch.
         let branch = git_output(&copy, &["rev-parse", "--abbrev-ref", "HEAD"]);
         assert_eq!(branch, "task/task-01");
 
-        // git status should work.
-        let output = Command::new("git")
-            .args(["status", "--porcelain"])
-            .current_dir(&copy)
-            .output()
-            .unwrap();
-        assert!(output.status.success());
+        // Gitignored dir should be a symlink.
+        let build_path = copy.join("build");
+        assert!(build_path.is_symlink(), "build/ should be a symlink");
+        assert_eq!(
+            std::fs::read_to_string(build_path.join("output.bin")).unwrap(),
+            "binary data"
+        );
+
+        // Branch should be visible in source repo.
+        let branches = git_output(&source, &["branch", "--list", "task/task-01"]);
+        assert!(branches.contains("task/task-01"));
+
+        // .git should be a file (worktree), not a directory.
+        let git_path = copy.join(".git");
+        assert!(git_path.exists());
+        assert!(git_path.is_file(), ".git should be a file in worktrees");
 
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -491,18 +435,14 @@ mod tests {
 
         let (copy, _base, _branch) = mgr.create_copy("task-02").unwrap();
 
-        // Worker makes changes.
         std::fs::write(copy.join("feature.rs"), "fn feature() {}").unwrap();
 
-        // Commit should succeed.
         let committed = mgr.commit_copy(&copy, "implement feature");
         assert!(committed);
 
-        // Verify commit is in log.
         let log = git_output(&copy, &["log", "--oneline", "-1"]);
         assert!(log.contains("implement feature"));
 
-        // Second commit_copy with no changes should return false.
         let committed_again = mgr.commit_copy(&copy, "no changes");
         assert!(!committed_again);
 
@@ -516,10 +456,8 @@ mod tests {
 
         let (copy, base, _branch) = mgr.create_copy("task-03").unwrap();
 
-        // No changes yet.
         assert!(!mgr.has_changes(&copy, base.as_deref()));
 
-        // Worker writes and commits.
         std::fs::write(copy.join("output.txt"), "worker output").unwrap();
         mgr.commit_copy(&copy, "worker output");
 
@@ -554,8 +492,8 @@ mod tests {
     }
 
     #[test]
-    fn fetch_branch_brings_changes_to_source() {
-        let tmp = tmp_dir("copy-fetch");
+    fn worktree_branch_visible_in_source() {
+        let tmp = tmp_dir("copy-wt-branch");
         let (source, mgr) = setup_copy_manager(&tmp);
 
         let (copy, _base, _branch) = mgr.create_copy("task-05").unwrap();
@@ -565,36 +503,39 @@ mod tests {
         run_git(&copy, &["add", "."]);
         run_git_with_author(&copy, &["commit", "-m", "implement feature"]);
 
-        // Fetch branch back to source.
-        mgr.fetch_branch(&copy, "task/task-05").unwrap();
-
-        // Source should now have the branch.
+        // Branch should already be in source (shared .git).
         let branches = git_output(&source, &["branch", "--list", "task/task-05"]);
         assert!(
             branches.contains("task/task-05"),
-            "source should have the fetched branch"
+            "worktree branch should be visible in source"
         );
 
-        // Checkout and verify.
-        run_git(&source, &["checkout", "task/task-05"]);
-        assert!(source.join("feature.rs").exists());
-        assert_eq!(
-            std::fs::read_to_string(source.join("feature.rs")).unwrap(),
-            "fn feature() {}"
+        // Shared clone should also see it.
+        let clone_dir = tmp.join("clone");
+        run_git(
+            &source,
+            &[
+                "clone",
+                "--shared",
+                &source.to_string_lossy(),
+                &clone_dir.to_string_lossy(),
+            ],
         );
-
-        // Switch back to main.
-        run_git(&source, &["checkout", "main"]);
+        let remote_branches = git_output(&clone_dir, &["branch", "-r"]);
+        assert!(
+            remote_branches.contains("origin/task/task-05"),
+            "shared clone should see worktree branch as remote"
+        );
 
         std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
-    fn e2e_copy_based_workflow() {
+    fn e2e_worktree_workflow() {
         let tmp = tmp_dir("copy-e2e");
         let (source, mgr) = setup_copy_manager(&tmp);
 
-        // Add some build artifacts that should be visible to workers.
+        // Add gitignored build artifacts.
         std::fs::write(source.join(".gitignore"), "node_modules/\n").unwrap();
         run_git(&source, &["add", ".gitignore"]);
         run_git_with_author(&source, &["commit", "-m", "add gitignore"]);
@@ -605,23 +546,26 @@ mod tests {
         )
         .unwrap();
 
-        // Worker 1: create copy, do work, commit.
+        // Worker 1: create worktree, do work, commit.
         let (copy1, _base1, _branch1) = mgr.create_copy("task-w1").unwrap();
+        // Gitignored dir should be symlinked.
+        assert!(
+            copy1.join("node_modules").is_symlink(),
+            "node_modules should be a symlink"
+        );
         assert!(
             copy1.join("node_modules/pkg/index.js").exists(),
-            "worker should see node_modules"
+            "worker should see node_modules contents via symlink"
         );
         std::fs::write(copy1.join("feature_a.rs"), "// feature A").unwrap();
         run_git(&copy1, &["add", "."]);
         run_git_with_author(&copy1, &["commit", "-m", "add feature A"]);
 
-        // Fetch and merge into source.
-        mgr.fetch_branch(&copy1, "task/task-w1").unwrap();
+        // Branch already in source — merge directly.
         run_git(&source, &["merge", "task/task-w1", "--no-edit"]);
-
         assert!(source.join("feature_a.rs").exists());
 
-        // Clean up copy and branch.
+        // Clean up.
         mgr.remove_copy(&copy1).unwrap();
         mgr.delete_branch("task/task-w1").unwrap();
 
@@ -635,9 +579,7 @@ mod tests {
         run_git(&copy2, &["add", "."]);
         run_git_with_author(&copy2, &["commit", "-m", "add feature B"]);
 
-        mgr.fetch_branch(&copy2, "task/task-w2").unwrap();
         run_git(&source, &["merge", "task/task-w2", "--no-edit"]);
-
         assert!(source.join("feature_a.rs").exists());
         assert!(source.join("feature_b.rs").exists());
 
@@ -648,22 +590,42 @@ mod tests {
     }
 
     #[test]
-    fn uncommitted_source_changes_visible_in_copy() {
-        let tmp = tmp_dir("copy-dirty");
+    fn stale_worktree_handled_on_recreate() {
+        let tmp = tmp_dir("copy-stale");
+        let (_source, mgr) = setup_copy_manager(&tmp);
+
+        // Create a worktree.
+        let (copy, _base, _branch) = mgr.create_copy("task-stale").unwrap();
+        assert!(copy.exists());
+
+        // Simulate crash: worktree dir exists but we try to create again.
+        let (copy2, _base2, _branch2) = mgr.create_copy("task-stale").unwrap();
+        assert!(copy2.exists());
+        assert_eq!(copy, copy2);
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn cleanup_all_worktrees_removes_everything() {
+        let tmp = tmp_dir("copy-cleanup");
         let (source, mgr) = setup_copy_manager(&tmp);
 
-        // User has uncommitted changes.
-        std::fs::write(source.join("README.md"), "# modified but not committed").unwrap();
-        std::fs::write(source.join("notes.txt"), "user notes").unwrap();
+        mgr.create_copy("task-a").unwrap();
+        mgr.create_copy("task-b").unwrap();
 
-        let (copy, _base, _branch) = mgr.create_copy("task-dirty").unwrap();
+        // Both worktrees exist.
+        assert!(mgr.copies_dir().join("task-a").exists());
+        assert!(mgr.copies_dir().join("task-b").exists());
 
-        // Copy should see the dirty state.
-        assert_eq!(
-            std::fs::read_to_string(copy.join("README.md")).unwrap(),
-            "# modified but not committed"
-        );
-        assert!(copy.join("notes.txt").exists());
+        mgr.cleanup_all_worktrees();
+
+        assert!(!mgr.copies_dir().join("task-a").exists());
+        assert!(!mgr.copies_dir().join("task-b").exists());
+
+        // Branches should be cleaned up too.
+        let branches = git_output(&source, &["branch", "--list", "task/*"]);
+        assert!(branches.is_empty(), "all task branches should be deleted");
 
         std::fs::remove_dir_all(&tmp).ok();
     }
