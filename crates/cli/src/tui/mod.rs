@@ -6,6 +6,7 @@ use std::time::Duration;
 use enki_tui::chat::{Chat, ChatContext, Handler};
 use enki_tui::lines;
 use enki_tui::{Color, KeyCode, KeyModifiers};
+use tokio::sync::mpsc::error::TryRecvError;
 
 use coordinator::{FromCoordinator, ToCoordinator, WorkerActivity};
 
@@ -35,11 +36,33 @@ pub async fn run(_db: enki_core::db::Db, db_path: String, enki_bin: PathBuf) -> 
         project_cwd,
     };
 
+    // Track whether the coordinator channel has disconnected (panic or exit).
+    let mut disconnected = false;
+
     Chat::new(PROMPT)
         .title("enki", &status_msg)
         .autocomplete_trigger('@')
         .exit_confirm_timeout(Duration::from_secs(5))
-        .run(app, || coord_handle.rx.try_recv().ok())?;
+        .run(app, || {
+            if disconnected {
+                return None;
+            }
+            match coord_handle.rx.try_recv() {
+                Ok(msg) => Some(msg),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    // Channel closed — coordinator exited or panicked.
+                    // Any panic error was already sent on the channel before disconnect.
+                    None
+                }
+            }
+        })?;
+
+    // Wait for coordinator thread to finish cleanup.
+    if let Some(handle) = coord_handle.join_handle.take() {
+        let _ = handle.join();
+    }
 
     Ok(())
 }

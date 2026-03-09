@@ -99,6 +99,7 @@ pub enum FromCoordinator {
 pub struct CoordinatorHandle {
     pub tx: mpsc::UnboundedSender<ToCoordinator>,
     pub rx: mpsc::UnboundedReceiver<FromCoordinator>,
+    pub(super) join_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 /// Spawn the coordinator on a dedicated OS thread with its own tokio runtime + LocalSet.
@@ -106,7 +107,10 @@ pub fn spawn(cwd: PathBuf, db_path: String, enki_bin: PathBuf) -> CoordinatorHan
     let (to_coord_tx, to_coord_rx) = mpsc::unbounded_channel::<ToCoordinator>();
     let (from_coord_tx, from_coord_rx) = mpsc::unbounded_channel::<FromCoordinator>();
 
-    std::thread::Builder::new()
+    // Clone tx so we can report panics after the original is consumed by the coordinator.
+    let panic_tx = from_coord_tx.clone();
+
+    let join_handle = std::thread::Builder::new()
         .name("coordinator-acp".into())
         .spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -114,18 +118,33 @@ pub fn spawn(cwd: PathBuf, db_path: String, enki_bin: PathBuf) -> CoordinatorHan
                 .build()
                 .expect("failed to build coordinator runtime");
 
-            rt.block_on(async {
-                let local = tokio::task::LocalSet::new();
-                local
-                    .run_until(coordinator_loop(cwd, db_path, enki_bin, to_coord_rx, from_coord_tx))
-                    .await;
-            });
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                rt.block_on(async {
+                    let local = tokio::task::LocalSet::new();
+                    local
+                        .run_until(coordinator_loop(cwd, db_path, enki_bin, to_coord_rx, from_coord_tx))
+                        .await;
+                });
+            }));
+
+            if let Err(payload) = result {
+                let msg = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".to_string());
+                tracing::error!(error = %msg, "coordinator thread panicked");
+                let _ = panic_tx.send(FromCoordinator::Error(
+                    format!("coordinator panicked: {msg}"),
+                ));
+            }
         })
         .expect("failed to spawn coordinator thread");
 
     CoordinatorHandle {
         tx: to_coord_tx,
         rx: from_coord_rx,
+        join_handle: Some(join_handle),
     }
 }
 
@@ -980,6 +999,8 @@ async fn coordinator_loop(
                         coord.interrupt(&rt.mgr, &rt.tx).await;
                     }
                     ToCoordinator::Shutdown => {
+                        // Kill all workers before shutting down the coordinator session.
+                        rt.kill_all_workers();
                         coord.shutdown(&rt.mgr);
                         break;
                     }
