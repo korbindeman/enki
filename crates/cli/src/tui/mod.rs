@@ -3,7 +3,7 @@ mod coordinator;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use enki_tui::chat::{Chat, ChatContext, Handler};
+use enki_tui::chat::{Chat, ChatContext, Handler, UserInput};
 use enki_tui::lines;
 use enki_tui::{Color, KeyCode, KeyModifiers};
 use tokio::sync::mpsc::error::TryRecvError;
@@ -224,8 +224,8 @@ impl Handler<FromCoordinator> for CoordinatorHandler<'_> {
         false
     }
 
-    fn on_submit(&mut self, text: String, _cx: &mut ChatContext) {
-        let _ = self.tx.send(ToCoordinator::Prompt(text));
+    fn on_submit(&mut self, input: UserInput, _cx: &mut ChatContext) {
+        let _ = self.tx.send(ToCoordinator::Prompt(input.text));
     }
 
     fn on_interrupt(&mut self) {

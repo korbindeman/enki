@@ -21,8 +21,8 @@
 //!         }
 //!     }
 //!
-//!     fn on_submit(&mut self, text: String, cx: &mut ChatContext) {
-//!         self.tx.send(text).ok();
+//!     fn on_submit(&mut self, input: UserInput, cx: &mut ChatContext) {
+//!         self.tx.send(input.text).ok();
 //!     }
 //! }
 //!
@@ -43,6 +43,24 @@ use crate::style::{Line, Span, Style};
 use crate::workers::WorkerPanel;
 use crate::{poll_event, KeyCode, KeyModifiers, TermEvent};
 
+/// Image data with MIME type (e.g., "image/png").
+pub struct ImageData {
+    pub bytes: Vec<u8>,
+    pub mime_type: String,
+}
+
+/// User input that may contain text and/or images.
+pub struct UserInput {
+    pub text: String,
+    pub images: Vec<ImageData>,
+}
+
+impl From<String> for UserInput {
+    fn from(text: String) -> Self {
+        Self { text, images: Vec::new() }
+    }
+}
+
 /// Trait implemented by chat consumers to handle messages and user input.
 ///
 /// The framework handles all event-loop boilerplate (resize, scroll, input
@@ -52,12 +70,12 @@ pub trait Handler<M> {
     /// Called for each message received from the backend channel.
     fn on_message(&mut self, msg: M, cx: &mut ChatContext);
 
-    /// Called when the user submits text (presses Enter).
+    /// Called when the user submits input (presses Enter).
     ///
     /// The user message is already printed and the indicator is set to
     /// "Thinking…" before this is called. Use `cx` to send text to your
-    /// backend.
-    fn on_submit(&mut self, text: String, cx: &mut ChatContext);
+    /// backend. The input may also carry attached images.
+    fn on_submit(&mut self, input: UserInput, cx: &mut ChatContext);
 
     /// Called when the user requests an interrupt (Escape or new message
     /// while one is in-flight).
@@ -528,7 +546,7 @@ impl Chat {
                                 cx.canvas.update_bubble(&input);
                                 cx.indicator.set_activity(Activity::Thinking);
                                 cx.sync_status_bar();
-                                handler.on_submit(text, &mut cx);
+                                handler.on_submit(UserInput::from(text), &mut cx);
                             }
                             InputAction::Interrupt => {
                                 cx.canvas.set_hint(None);

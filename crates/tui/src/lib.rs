@@ -10,6 +10,8 @@ pub mod workers;
 #[cfg(feature = "markdown")]
 pub mod markdown;
 
+pub use chat::{ImageData, UserInput};
+
 use std::io;
 use std::time::Duration;
 

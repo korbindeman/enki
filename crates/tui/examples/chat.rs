@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use enki_tui::chat::{Chat, ChatContext, Handler};
+use enki_tui::chat::{Chat, ChatContext, Handler, UserInput};
 use enki_tui::lines;
 use tokio::sync::mpsc;
 
@@ -137,7 +137,7 @@ impl Handler<BackendMsg> for ChatApp {
         }
     }
 
-    fn on_submit(&mut self, _text: String, _cx: &mut ChatContext) {
+    fn on_submit(&mut self, _input: UserInput, _cx: &mut ChatContext) {
         let tx = self.tx.clone();
         let idx = self.msg_count;
         self.msg_count += 1;
