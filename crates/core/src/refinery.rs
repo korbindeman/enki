@@ -156,7 +156,10 @@ pub fn process_merge(
             "merge conflict detected — requesting resolution"
         );
 
-        // Prevent temp dir cleanup so the merger agent can work in it.
+        // Prevent RAII cleanup so the merger agent can work in this temp dir.
+        // The dir is cleaned up by `finish_merge()` on the happy path, or by
+        // `CopyManager::cleanup_orphaned_merge_dirs()` on session startup if
+        // the agent dies or the session is killed before resolution completes.
         std::mem::forget(_cleanup);
 
         return MergeOutcome::NeedsResolution {

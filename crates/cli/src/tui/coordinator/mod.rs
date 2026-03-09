@@ -955,6 +955,12 @@ async fn coordinator_loop(
         config,
     };
 
+    // Clean up orphaned merge temp dirs from prior crashed sessions.
+    let removed = rt.copy_mgr.cleanup_orphaned_merge_dirs(std::time::Duration::from_secs(3600));
+    if !removed.is_empty() {
+        tracing::info!(count = removed.len(), "cleaned up orphaned merge temp dirs");
+    }
+
     // Stateless session: no crash recovery. Fresh start every time.
 
     // Refinery state.

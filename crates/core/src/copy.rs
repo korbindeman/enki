@@ -359,6 +359,49 @@ impl CopyManager {
         &self.project_root
     }
 
+    /// Remove orphaned `.merge-*` directories that are older than `max_age`.
+    ///
+    /// Merge temp dirs are created by the refinery for squash merges and conflict
+    /// resolution. During active conflict resolution, `std::mem::forget` is used
+    /// to keep the temp dir alive while the merger agent works. If the agent dies
+    /// or the session is killed, the dir leaks. This method cleans them up.
+    pub fn cleanup_orphaned_merge_dirs(&self, max_age: std::time::Duration) -> Vec<PathBuf> {
+        let mut removed = Vec::new();
+        if !self.copies_dir.exists() {
+            return removed;
+        }
+        let entries = match std::fs::read_dir(&self.copies_dir) {
+            Ok(e) => e,
+            Err(_) => return removed,
+        };
+        let now = std::time::SystemTime::now();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if !name_str.starts_with(".merge-") {
+                continue;
+            }
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            // Check modification time to avoid removing active merge dirs.
+            let dominated = match path.metadata().and_then(|m| m.modified()) {
+                Ok(mtime) => now.duration_since(mtime).unwrap_or_default() > max_age,
+                Err(_) => true, // Can't read mtime — treat as stale.
+            };
+            if dominated {
+                tracing::info!(dir = %path.display(), "removing orphaned merge temp dir");
+                if std::fs::remove_dir_all(&path).is_ok() {
+                    removed.push(path);
+                } else {
+                    tracing::warn!(dir = %path.display(), "failed to remove orphaned merge dir");
+                }
+            }
+        }
+        removed
+    }
+
     pub fn copies_dir(&self) -> &Path {
         &self.copies_dir
     }
@@ -741,6 +784,64 @@ mod tests {
         // Branches should be cleaned up too.
         let branches = git_output(&source, &["branch", "--list", "task/*"]);
         assert!(branches.is_empty(), "all task branches should be deleted");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn cleanup_orphaned_merge_dirs_removes_stale() {
+        let tmp = tmp_dir("copy-merge-cleanup");
+        let (_source, mgr) = setup_copy_manager(&tmp);
+
+        let copies = mgr.copies_dir();
+        std::fs::create_dir_all(copies).unwrap();
+
+        // Create two .merge-* dirs — both are "stale" relative to max_age=0.
+        let merge_a = copies.join(".merge-aaa");
+        std::fs::create_dir_all(&merge_a).unwrap();
+        std::fs::write(merge_a.join("dummy"), "data").unwrap();
+
+        let merge_b = copies.join(".merge-bbb");
+        std::fs::create_dir_all(&merge_b).unwrap();
+        std::fs::write(merge_b.join("dummy"), "data").unwrap();
+
+        // Create a regular worktree dir (should not be touched).
+        let task_dir = copies.join("task-xyz");
+        std::fs::create_dir_all(&task_dir).unwrap();
+
+        // A hidden non-merge dir (should not be touched).
+        let hidden_dir = copies.join(".other");
+        std::fs::create_dir_all(&hidden_dir).unwrap();
+
+        // With max_age=0, all .merge-* dirs are "stale".
+        let removed = mgr.cleanup_orphaned_merge_dirs(std::time::Duration::ZERO);
+
+        assert_eq!(removed.len(), 2, "should remove both .merge-* dirs");
+        assert!(!merge_a.exists(), "merge dir a should be removed");
+        assert!(!merge_b.exists(), "merge dir b should be removed");
+        assert!(task_dir.exists(), "non-merge dir should be untouched");
+        assert!(hidden_dir.exists(), "non-merge hidden dir should be untouched");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn cleanup_orphaned_merge_dirs_preserves_recent() {
+        let tmp = tmp_dir("copy-merge-recent");
+        let (_source, mgr) = setup_copy_manager(&tmp);
+
+        let copies = mgr.copies_dir();
+        std::fs::create_dir_all(copies).unwrap();
+
+        // Create a fresh .merge-* dir.
+        let merge_dir = copies.join(".merge-fresh");
+        std::fs::create_dir_all(&merge_dir).unwrap();
+
+        // With max_age=1h, a just-created dir should be preserved.
+        let removed = mgr.cleanup_orphaned_merge_dirs(std::time::Duration::from_secs(3600));
+
+        assert!(removed.is_empty(), "fresh merge dir should not be removed");
+        assert!(merge_dir.exists(), "fresh merge dir should still exist");
 
         std::fs::remove_dir_all(&tmp).ok();
     }
