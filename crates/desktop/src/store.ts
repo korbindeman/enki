@@ -49,7 +49,10 @@ function nextId(): string {
   return `msg-${++messageCounter}`;
 }
 
-export async function sendPrompt(text: string): Promise<void> {
+export async function sendPrompt(
+  text: string,
+  images?: Array<{ data: string; mime_type: string }>,
+): Promise<void> {
   // Append user message immediately.
   setState(
     produce((s) => {
@@ -61,7 +64,7 @@ export async function sendPrompt(text: string): Promise<void> {
       });
     }),
   );
-  await invoke("send_prompt", { text });
+  await invoke("send_prompt", { text, images: images ?? null });
 }
 
 export async function interruptCoordinator(): Promise<void> {
@@ -351,5 +354,5 @@ export async function initStore(): Promise<void> {
   });
 
   const cwd = await invoke<string>("get_project_dir");
-  setState("projectCwd", cwd);
+  if (cwd) setState("projectCwd", cwd);
 }

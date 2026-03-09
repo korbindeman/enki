@@ -20,6 +20,14 @@ import { renderMarkdown } from "./markdown";
 import type { Message } from "./types";
 import WorkerPanel from "./WorkerPanel";
 import TaskList from "./TaskList";
+import Settings from "./Settings";
+
+interface PendingImage {
+  id: string;
+  data: string; // base64
+  mime_type: string;
+  url: string; // data URL for preview
+}
 
 function ChatMessage(props: { message: Message }) {
   return (
@@ -96,7 +104,9 @@ function App() {
   let messagesContainer!: HTMLDivElement;
   let textareaRef!: HTMLTextAreaElement;
   const [input, setInput] = createSignal("");
+  const [pendingImages, setPendingImages] = createSignal<PendingImage[]>([]);
   const [contextMenu, setContextMenu] = createSignal<{ x: number; y: number } | null>(null);
+  const [settingsOpen, setSettingsOpen] = createSignal(false);
 
   const isStreaming = () => {
     const msgs = state.messages;
@@ -127,16 +137,52 @@ function App() {
       e.preventDefault();
       interruptCoordinator();
     }
+    if ((e.metaKey || e.ctrlKey) && e.key === ",") {
+      e.preventDefault();
+      setSettingsOpen((v) => !v);
+    }
   }
 
   onMount(() => window.addEventListener("keydown", handleGlobalKeydown));
   onCleanup(() => window.removeEventListener("keydown", handleGlobalKeydown));
 
+  function handlePaste(e: ClipboardEvent) {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    for (const item of items) {
+      if (item.type.startsWith("image/")) {
+        e.preventDefault();
+        const file = item.getAsFile();
+        if (!file) continue;
+        const mime = item.type;
+        const reader = new FileReader();
+        reader.onload = () => {
+          const dataUrl = reader.result as string;
+          const base64 = dataUrl.split(",")[1];
+          setPendingImages((prev) => [
+            ...prev,
+            { id: crypto.randomUUID(), data: base64, mime_type: mime, url: dataUrl },
+          ]);
+        };
+        reader.readAsDataURL(file);
+      }
+    }
+  }
+
+  function removeImage(id: string) {
+    setPendingImages((prev) => prev.filter((i) => i.id !== id));
+  }
+
   function handleSubmit() {
     const text = input().trim();
-    if (!text || isStreaming()) return;
+    const images = pendingImages();
+    if ((!text && images.length === 0) || isStreaming()) return;
     setInput("");
-    sendPrompt(text);
+    setPendingImages([]);
+    const payload = images.length > 0
+      ? images.map((i) => ({ data: i.data, mime_type: i.mime_type }))
+      : undefined;
+    sendPrompt(text, payload);
     if (textareaRef) {
       textareaRef.style.height = "auto";
     }
@@ -171,7 +217,19 @@ function App() {
       {/* Sidebar */}
       <aside class="w-[300px] shrink-0 border-r border-zinc-700 bg-zinc-950 flex flex-col">
         <div class="px-4 py-3 border-b border-zinc-700" onContextMenu={handleSidebarContextMenu}>
-          <h1 class="text-lg font-semibold">Enki</h1>
+          <div class="flex items-center justify-between">
+            <h1 class="text-lg font-semibold">Enki</h1>
+            <button
+              onClick={() => setSettingsOpen(true)}
+              class="text-zinc-500 hover:text-zinc-300 transition-colors"
+              title="Settings (⌘,)"
+            >
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+              </svg>
+            </button>
+          </div>
           <Show when={state.projectCwd}>
             <div class="text-xs text-zinc-500 truncate mt-0.5" title={state.projectCwd!}>
               {state.projectCwd!.split("/").pop()}
@@ -187,85 +245,125 @@ function App() {
 
       {/* Main chat area */}
       <main class="flex-1 flex flex-col min-w-0">
-        <header class="px-6 py-3 border-b border-zinc-700 flex items-center justify-between">
-          <h2 class="text-lg font-semibold">Chat</h2>
-          <Show when={!state.ready}>
-            <span class="text-xs text-zinc-500 animate-pulse">
-              Connecting...
-            </span>
-          </Show>
-        </header>
+        <Show
+          when={state.projectCwd}
+          fallback={
+            <div class="flex-1 flex items-center justify-center">
+              <div class="text-center space-y-4">
+                <h2 class="text-lg font-semibold text-zinc-300">No project open</h2>
+                <p class="text-sm text-zinc-500">Right-click the sidebar to open a project, or click below.</p>
+                <button
+                  onClick={handleOpenProject}
+                  class="rounded-lg bg-zinc-700 px-5 py-2.5 text-sm font-medium hover:bg-zinc-600 transition-colors"
+                >
+                  Open Project...
+                </button>
+              </div>
+            </div>
+          }
+        >
+          <header class="px-6 py-3 border-b border-zinc-700 flex items-center justify-between">
+            <h2 class="text-lg font-semibold">Chat</h2>
+            <Show when={!state.ready}>
+              <span class="text-xs text-zinc-500 animate-pulse">
+                Connecting...
+              </span>
+            </Show>
+          </header>
 
-        {/* Messages */}
-        <div ref={messagesContainer} class="flex-1 overflow-y-auto">
-          <div class="max-w-3xl mx-auto py-6 px-6">
-            <Show when={state.messages.length === 0}>
-              <div class="text-zinc-500 text-sm pt-8 text-center">
-                Start a conversation to begin orchestrating...
+          {/* Messages */}
+          <div ref={messagesContainer} class="flex-1 overflow-y-auto">
+            <div class="max-w-3xl mx-auto py-6 px-6">
+              <Show when={state.messages.length === 0}>
+                <div class="text-zinc-500 text-sm pt-8 text-center">
+                  Start a conversation to begin orchestrating...
+                </div>
+              </Show>
+              <For each={state.messages}>
+                {(msg) => <ChatMessage message={msg} />}
+              </For>
+            </div>
+          </div>
+
+          {/* Tool indicator + Input */}
+          <div class="border-t border-zinc-700">
+            <Show when={state.activeToolCall}>
+              <div class="px-6 py-1.5 text-xs text-zinc-500 flex items-center gap-2">
+                <span class="inline-block w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
+                Using {state.activeToolCall}
               </div>
             </Show>
-            <For each={state.messages}>
-              {(msg) => <ChatMessage message={msg} />}
-            </For>
-          </div>
-        </div>
-
-        {/* Tool indicator + Input */}
-        <div class="border-t border-zinc-700">
-          <Show when={state.activeToolCall}>
-            <div class="px-6 py-1.5 text-xs text-zinc-500 flex items-center gap-2">
-              <span class="inline-block w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
-              Using {state.activeToolCall}
-            </div>
-          </Show>
-          <Show when={isStreaming() && !state.activeToolCall}>
-            <div class="px-6 py-1.5 text-xs text-zinc-500 flex items-center gap-2">
-              <span class="inline-block w-1.5 h-1.5 rounded-full bg-zinc-400 animate-pulse" />
-              Responding...
-            </div>
-          </Show>
-          <div class="px-6 py-4">
-            <div class="max-w-3xl mx-auto flex gap-3 items-end">
-              <textarea
-                ref={textareaRef}
-                value={input()}
-                onInput={(e) => {
-                  setInput(e.currentTarget.value);
-                  autoResize(e.currentTarget);
-                }}
-                onKeyDown={handleTextareaKeydown}
-                disabled={!state.ready}
-                placeholder={
-                  state.ready
-                    ? "Type a message..."
-                    : "Waiting for coordinator..."
-                }
-                rows={1}
-                class="flex-1 resize-none rounded-lg bg-zinc-800 border border-zinc-600 px-4 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none focus:border-zinc-400 disabled:opacity-50 disabled:cursor-not-allowed"
-              />
-              <Show
-                when={isStreaming()}
-                fallback={
-                  <button
-                    onClick={handleSubmit}
-                    disabled={!state.ready || !input().trim()}
-                    class="rounded-lg bg-zinc-700 px-4 py-2.5 text-sm font-medium hover:bg-zinc-600 transition-colors disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
-                  >
-                    Send
-                  </button>
-                }
-              >
-                <button
-                  onClick={() => interruptCoordinator()}
-                  class="rounded-lg bg-red-900/50 text-red-300 px-4 py-2.5 text-sm font-medium hover:bg-red-900/70 transition-colors shrink-0"
-                  title="Interrupt (Ctrl+C)"
-                >
-                  Stop
-                </button>
+            <Show when={isStreaming() && !state.activeToolCall}>
+              <div class="px-6 py-1.5 text-xs text-zinc-500 flex items-center gap-2">
+                <span class="inline-block w-1.5 h-1.5 rounded-full bg-zinc-400 animate-pulse" />
+                Responding...
+              </div>
+            </Show>
+            <div class="px-6 py-4">
+              <Show when={pendingImages().length > 0}>
+                <div class="max-w-3xl mx-auto pb-3 flex gap-2 flex-wrap">
+                  <For each={pendingImages()}>
+                    {(img) => (
+                      <div class="relative group">
+                        <img
+                          src={img.url}
+                          alt=""
+                          class="h-20 rounded-lg border border-zinc-600 object-cover"
+                        />
+                        <button
+                          onClick={() => removeImage(img.id)}
+                          class="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full bg-zinc-700 border border-zinc-500 text-zinc-300 flex items-center justify-center text-xs hover:bg-red-900 hover:border-red-700 hover:text-red-300 transition-colors opacity-0 group-hover:opacity-100"
+                        >
+                          &times;
+                        </button>
+                      </div>
+                    )}
+                  </For>
+                </div>
               </Show>
+              <div class="max-w-3xl mx-auto flex gap-3 items-end">
+                <textarea
+                  ref={textareaRef}
+                  value={input()}
+                  onInput={(e) => {
+                    setInput(e.currentTarget.value);
+                    autoResize(e.currentTarget);
+                  }}
+                  onKeyDown={handleTextareaKeydown}
+                  onPaste={handlePaste}
+                  disabled={!state.ready}
+                  placeholder={
+                    state.ready
+                      ? "Type a message..."
+                      : "Waiting for coordinator..."
+                  }
+                  rows={1}
+                  class="flex-1 resize-none rounded-lg bg-zinc-800 border border-zinc-600 px-4 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none focus:border-zinc-400 disabled:opacity-50 disabled:cursor-not-allowed"
+                />
+                <Show
+                  when={isStreaming()}
+                  fallback={
+                    <button
+                      onClick={handleSubmit}
+                      disabled={!state.ready || (!input().trim() && pendingImages().length === 0)}
+                      class="rounded-lg bg-zinc-700 px-4 py-2.5 text-sm font-medium hover:bg-zinc-600 transition-colors disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
+                    >
+                      Send
+                    </button>
+                  }
+                >
+                  <button
+                    onClick={() => interruptCoordinator()}
+                    class="rounded-lg bg-red-900/50 text-red-300 px-4 py-2.5 text-sm font-medium hover:bg-red-900/70 transition-colors shrink-0"
+                    title="Interrupt (Ctrl+C)"
+                  >
+                    Stop
+                  </button>
+                </Show>
+              </div>
             </div>
           </div>
-        </div>
+        </Show>
       </main>
 
       <Show when={contextMenu()}>
@@ -278,6 +376,8 @@ function App() {
           />
         )}
       </Show>
+
+      <Settings open={settingsOpen()} onClose={() => setSettingsOpen(false)} />
     </div>
   );
 }

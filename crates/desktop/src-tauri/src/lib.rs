@@ -11,6 +11,8 @@ pub fn run() {
             bridge::stop_all,
             bridge::get_project_dir,
             bridge::open_project,
+            bridge::load_config,
+            bridge::save_config,
         ])
         .setup(|app| {
             bridge::setup(app.handle())?;

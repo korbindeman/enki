@@ -10,6 +10,10 @@ desktop:
 install:
     cargo install --path crates/cli
 
+# Build production desktop app and install to /Applications
+desktop-build:
+    cd crates/desktop && cargo tauri build
+
 # Tag a new release based on today's date (e.g. v2026.03.06, v2026.03.06.1)
 release:
     #!/usr/bin/env bash

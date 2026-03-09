@@ -95,12 +95,102 @@ pub async fn open_project(
 
     *state.tx.lock().unwrap() = tx;
     *state.join_handle.lock().unwrap() = join_handle;
-    *state.cwd.lock().unwrap() = path;
+    *state.cwd.lock().unwrap() = path.clone();
+    save_last_project(&path);
 
     // Start relaying events from the new coordinator.
     tauri::async_runtime::spawn(event_relay(app, rx));
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Config commands (settings UI)
+// ---------------------------------------------------------------------------
+
+/// Flat JSON representation of the config for the frontend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigPayload {
+    pub commit_suffix: String,
+    pub max_workers: usize,
+    pub max_heavy: usize,
+    pub max_standard: usize,
+    pub max_light: usize,
+    pub sonnet_only: bool,
+    pub agent_command: String,
+}
+
+fn global_config_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("enki.toml")
+}
+
+#[tauri::command]
+pub fn load_config() -> Result<ConfigPayload, String> {
+    let config = enki_core::config::load_config(&PathBuf::from("/dev/null"));
+    Ok(ConfigPayload {
+        commit_suffix: config.git.commit_suffix,
+        max_workers: config.workers.limits.max_workers,
+        max_heavy: config.workers.limits.max_heavy,
+        max_standard: config.workers.limits.max_standard,
+        max_light: config.workers.limits.max_light,
+        sonnet_only: config.workers.sonnet_only,
+        agent_command: config.agent.command,
+    })
+}
+
+#[tauri::command]
+pub fn save_config(config: ConfigPayload) -> Result<(), String> {
+    let path = global_config_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+
+    // Build TOML string manually to keep it clean and only include non-default values.
+    let default = enki_core::config::Config::default();
+    let mut sections: Vec<String> = Vec::new();
+
+    // [git]
+    if config.commit_suffix != default.git.commit_suffix {
+        sections.push(format!("[git]\ncommit_suffix = {:?}", config.commit_suffix));
+    }
+
+    // [workers]
+    {
+        let mut fields = Vec::new();
+        if config.max_workers != default.workers.limits.max_workers {
+            fields.push(format!("max_workers = {}", config.max_workers));
+        }
+        if config.max_heavy != default.workers.limits.max_heavy {
+            fields.push(format!("max_heavy = {}", config.max_heavy));
+        }
+        if config.max_standard != default.workers.limits.max_standard {
+            fields.push(format!("max_standard = {}", config.max_standard));
+        }
+        if config.max_light != default.workers.limits.max_light {
+            fields.push(format!("max_light = {}", config.max_light));
+        }
+        if config.sonnet_only != default.workers.sonnet_only {
+            fields.push(format!("sonnet_only = {}", config.sonnet_only));
+        }
+        if !fields.is_empty() {
+            sections.push(format!("[workers]\n{}", fields.join("\n")));
+        }
+    }
+
+    // [agent]
+    if config.agent_command != default.agent.command {
+        sections.push(format!("[agent]\ncommand = {:?}", config.agent_command));
+    }
+
+    let content = if sections.is_empty() {
+        String::new()
+    } else {
+        sections.join("\n\n") + "\n"
+    };
+
+    std::fs::write(&path, content).map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -196,44 +286,56 @@ fn to_event(msg: FromCoordinator) -> CoordinatorEvent {
 
 /// Initialize the coordinator and wire it to Tauri.
 ///
-/// Called from `tauri::Builder::setup()`. Spawns the coordinator on a dedicated
-/// OS thread and starts a tokio task that relays `FromCoordinator` messages as
-/// Tauri events to the frontend.
+/// Called from `tauri::Builder::setup()`. If `ENKI_PROJECT_DIR` is set, spawns
+/// the coordinator immediately. Otherwise starts without a project — the user
+/// can open one later via the "Open Project" context menu.
 pub fn setup(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
-    // Use ENKI_PROJECT_DIR if set (e.g. `just desktop`), otherwise fall back to CWD.
-    let cwd = match std::env::var("ENKI_PROJECT_DIR") {
-        Ok(dir) => std::path::PathBuf::from(dir),
-        Err(_) => std::env::current_dir()?,
-    };
-    let enki_dir = cwd.join(".enki");
-    let db_path = enki_dir.join("db.sqlite");
+    // GUI apps on macOS inherit a minimal PATH (just /usr/bin:/bin:/usr/sbin:/sbin).
+    // Augment it with common locations for node, cargo, and other dev tools so that
+    // the coordinator can find them when resolving agent binaries.
+    augment_path();
 
-    // Auto-initialize project if needed.
-    if !db_path.exists() {
-        std::fs::create_dir_all(&enki_dir)?;
-        enki_core::db::Db::open(db_path.to_str().unwrap())?;
+    let project_dir = std::env::var("ENKI_PROJECT_DIR")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(load_last_project);
+
+    if let Some(cwd) = project_dir {
+        let enki_dir = cwd.join(".enki");
+        let db_path = enki_dir.join("db.sqlite");
+
+        if !db_path.exists() {
+            std::fs::create_dir_all(&enki_dir)?;
+            enki_core::db::Db::open(db_path.to_str().unwrap())?;
+        }
+
+        let db_path_str = db_path.to_str().unwrap().to_string();
+        let cwd_str = cwd.to_string_lossy().to_string();
+        save_last_project(&cwd_str);
+        let enki_bin = find_enki_bin();
+
+        let CoordinatorHandle { tx, rx, join_handle } =
+            enki::coordinator::spawn(cwd, db_path_str, enki_bin);
+
+        app.manage(CoordinatorState {
+            tx: Mutex::new(tx),
+            join_handle: Mutex::new(join_handle),
+            cwd: Mutex::new(cwd_str),
+        });
+
+        let handle = app.clone();
+        tauri::async_runtime::spawn(event_relay(handle, rx));
+    } else {
+        // No project directory — start with a dummy channel.
+        // The user will open a project via the context menu, which calls open_project
+        // and replaces these with a real coordinator.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.manage(CoordinatorState {
+            tx: Mutex::new(tx),
+            join_handle: Mutex::new(None),
+            cwd: Mutex::new(String::new()),
+        });
     }
-
-    let db_path_str = db_path.to_str().unwrap().to_string();
-    let cwd_str = cwd.to_string_lossy().to_string();
-
-    // Resolve the enki CLI binary — NOT current_exe(), which is the desktop app
-    // and would cause infinite window spawning when the coordinator launches
-    // `enki mcp` subprocesses.
-    let enki_bin = find_enki_bin();
-
-    let CoordinatorHandle { tx, rx, join_handle } =
-        enki::coordinator::spawn(cwd, db_path_str, enki_bin);
-
-    app.manage(CoordinatorState {
-        tx: Mutex::new(tx),
-        join_handle: Mutex::new(join_handle),
-        cwd: Mutex::new(cwd_str),
-    });
-
-    // Spawn the event relay task on Tauri's async runtime.
-    let handle = app.clone();
-    tauri::async_runtime::spawn(event_relay(handle, rx));
 
     Ok(())
 }
@@ -250,6 +352,72 @@ async fn event_relay(
         }
     }
     tracing::info!("coordinator event relay ended");
+}
+
+/// macOS GUI apps inherit a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin).
+/// Prepend well-known dev tool directories so we can find node, cargo, etc.
+fn augment_path() {
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => return,
+    };
+
+    let extra_dirs: Vec<PathBuf> = vec![
+        home.join(".cargo/bin"),
+        home.join(".local/bin"),
+        // nvm
+        home.join(".nvm/current/bin"),
+        // volta
+        home.join(".volta/bin"),
+        // fnm
+        home.join(".local/share/fnm/aliases/default/bin"),
+        // mise / rtx
+        home.join(".local/share/mise/shims"),
+        // homebrew
+        PathBuf::from("/opt/homebrew/bin"),
+        PathBuf::from("/opt/homebrew/sbin"),
+        PathBuf::from("/usr/local/bin"),
+    ];
+
+    let current = std::env::var("PATH").unwrap_or_default();
+    let current_dirs: std::collections::HashSet<PathBuf> =
+        std::env::split_paths(&current).collect();
+
+    let mut prepend: Vec<PathBuf> = extra_dirs
+        .into_iter()
+        .filter(|d| d.is_dir() && !current_dirs.contains(d))
+        .collect();
+
+    if prepend.is_empty() {
+        return;
+    }
+
+    prepend.extend(std::env::split_paths(&current));
+    let new_path = std::env::join_paths(&prepend).unwrap_or_default();
+    // SAFETY: called once at startup before any threads are spawned.
+    unsafe { std::env::set_var("PATH", &new_path) };
+}
+
+// ---------------------------------------------------------------------------
+// Last-project persistence (~/.enki/last-project)
+// ---------------------------------------------------------------------------
+
+fn last_project_path() -> Option<PathBuf> {
+    Some(dirs::home_dir()?.join(".enki").join("last-project"))
+}
+
+fn load_last_project() -> Option<PathBuf> {
+    let path = PathBuf::from(std::fs::read_to_string(last_project_path()?).ok()?.trim());
+    if path.is_dir() { Some(path) } else { None }
+}
+
+fn save_last_project(dir: &str) {
+    if let Some(p) = last_project_path() {
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        std::fs::write(p, dir).ok();
+    }
 }
 
 /// Find the `enki` CLI binary on PATH or at the default cargo install location.
