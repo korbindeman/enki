@@ -20,6 +20,8 @@ export interface AppState {
   tasks: Task[];
   /** Coordinator-level error, if any. */
   error: string | null;
+  /** Name of the tool currently being called by the planner, if any. */
+  activeToolCall: string | null;
 }
 
 const [state, setState] = createStore<AppState>({
@@ -29,6 +31,7 @@ const [state, setState] = createStore<AppState>({
   workerCount: 0,
   tasks: [],
   error: null,
+  activeToolCall: null,
 });
 
 export { state };
@@ -118,8 +121,11 @@ function handleEvent(event: CoordinatorEvent): void {
         }
 
         case "tool_call":
+          s.activeToolCall = event.name;
+          break;
+
         case "tool_call_done":
-          // UI can show a thinking/tool indicator; for now these are no-ops.
+          s.activeToolCall = null;
           break;
 
         case "worker_spawned":

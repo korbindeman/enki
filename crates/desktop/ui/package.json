@@ -10,6 +10,8 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2.10.1",
+    "highlight.js": "^11.11.1",
+    "marked": "^17.0.4",
     "solid-js": "^1.9.11"
   },
   "devDependencies": {
