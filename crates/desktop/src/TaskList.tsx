@@ -48,7 +48,7 @@ function TaskRow(props: { task: Task }) {
   };
 
   return (
-    <div class="flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-zinc-800/60 transition-colors">
+    <div class="flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-zinc-800/40 transition-colors">
       <span
         class={`inline-block w-2 h-2 rounded-full shrink-0 ${statusDot[props.task.status]}`}
         classList={{
@@ -76,7 +76,7 @@ export default function TaskList() {
 
   return (
     <div>
-      <h2 class="text-xs font-medium text-zinc-500 uppercase tracking-wide mb-2 flex items-center justify-between">
+      <h2 class="text-[11px] font-medium text-zinc-500 tracking-wide mb-2 flex items-center justify-between">
         <span>Tasks</span>
         <Show when={state.tasks.length > 0}>
           <span class="text-zinc-400 normal-case tracking-normal font-normal">
@@ -88,7 +88,7 @@ export default function TaskList() {
         <Show
           when={sorted().length > 0}
           fallback={
-            <div class="rounded-lg bg-zinc-800/40 p-3 text-xs text-zinc-500">
+            <div class="text-xs text-zinc-600 px-1">
               No tasks yet
             </div>
           }

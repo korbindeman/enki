@@ -80,7 +80,7 @@ export default function Settings(props: { open: boolean; onClose: () => void }) 
         onClick={handleBackdrop}
         onKeyDown={handleKeydown}
       >
-        <div class="w-[420px] bg-zinc-800 border border-zinc-600 rounded-lg px-5 py-5 pb-7 shadow-xl">
+        <div class="w-[420px] bg-zinc-800 border border-zinc-700/50 rounded-xl px-5 py-5 pb-7 shadow-xl">
           <Show when={!loading() && config()} fallback={
             <div class="text-zinc-500 text-sm">Loading settings...</div>
           }>

@@ -33,13 +33,12 @@ function ChatMessage(props: { message: Message }) {
   return (
     <Switch>
       <Match when={props.message.role === "system"}>
-        <div class="text-xs text-zinc-500 text-center py-2">
+        <div class="text-xs text-zinc-500 text-center py-3">
           {props.message.content}
         </div>
       </Match>
       <Match when={props.message.role === "user"}>
-        <div class="py-3">
-          <div class="text-xs font-medium text-zinc-500 mb-1.5">You</div>
+        <div class="border-l-2 border-zinc-600 pl-4 py-3">
           <div class="text-sm whitespace-pre-wrap text-zinc-100">
             {props.message.content}
           </div>
@@ -47,7 +46,6 @@ function ChatMessage(props: { message: Message }) {
       </Match>
       <Match when={props.message.role === "assistant"}>
         <div class="py-3">
-          <div class="text-xs font-medium text-zinc-500 mb-1.5">Enki</div>
           <div
             class="prose"
             innerHTML={renderMarkdown(
@@ -79,7 +77,7 @@ function ContextMenu(props: {
 
   return (
     <div
-      class="fixed z-50 min-w-[160px] py-1 bg-zinc-800 border border-zinc-600 rounded-md shadow-lg"
+      class="fixed z-50 min-w-[160px] py-1 bg-zinc-800 border border-zinc-700/50 rounded-xl shadow-lg"
       style={{ left: `${props.x}px`, top: `${props.y}px` }}
     >
       <For each={props.items}>
@@ -215,8 +213,8 @@ function App() {
   return (
     <div class="flex h-screen bg-zinc-900 text-zinc-100">
       {/* Sidebar */}
-      <aside class="w-[300px] shrink-0 border-r border-zinc-700 bg-zinc-950 flex flex-col">
-        <div class="px-4 py-3 border-b border-zinc-700" onContextMenu={handleSidebarContextMenu}>
+      <aside class="w-[260px] shrink-0 border-r border-zinc-800 bg-zinc-950 flex flex-col">
+        <div class="px-4 py-3" onContextMenu={handleSidebarContextMenu}>
           <div class="flex items-center justify-between">
             <h1 class="text-lg font-semibold">Enki</h1>
             <button
@@ -236,9 +234,8 @@ function App() {
             </div>
           </Show>
         </div>
-        <div class="flex-1 overflow-y-auto p-3 space-y-5">
+        <div class="flex-1 overflow-y-auto p-4 space-y-6">
           <WorkerPanel />
-          <div class="border-t border-zinc-800" />
           <TaskList />
         </div>
       </aside>
@@ -262,20 +259,11 @@ function App() {
             </div>
           }
         >
-          <header class="px-6 py-3 border-b border-zinc-700 flex items-center justify-between">
-            <h2 class="text-lg font-semibold">Chat</h2>
-            <Show when={!state.ready}>
-              <span class="text-xs text-zinc-500 animate-pulse">
-                Connecting...
-              </span>
-            </Show>
-          </header>
-
           {/* Messages */}
           <div ref={messagesContainer} class="flex-1 overflow-y-auto">
-            <div class="max-w-3xl mx-auto py-6 px-6">
+            <div class="max-w-3xl mx-auto py-8 px-6">
               <Show when={state.messages.length === 0}>
-                <div class="text-zinc-500 text-sm pt-8 text-center">
+                <div class="text-zinc-500 text-sm pt-20 text-center">
                   Start a conversation to begin orchestrating...
                 </div>
               </Show>
@@ -286,7 +274,8 @@ function App() {
           </div>
 
           {/* Tool indicator + Input */}
-          <div class="border-t border-zinc-700">
+          <div class="relative">
+            <div class="absolute top-0 left-0 right-0 -translate-y-full bg-gradient-to-t from-zinc-900 to-transparent h-8 pointer-events-none" />
             <Show when={state.activeToolCall}>
               <div class="px-6 py-1.5 text-xs text-zinc-500 flex items-center gap-2">
                 <span class="inline-block w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
@@ -299,7 +288,7 @@ function App() {
                 Responding...
               </div>
             </Show>
-            <div class="px-6 py-4">
+            <div class="px-6 py-3 pb-5">
               <Show when={pendingImages().length > 0}>
                 <div class="max-w-3xl mx-auto pb-3 flex gap-2 flex-wrap">
                   <For each={pendingImages()}>
@@ -335,10 +324,10 @@ function App() {
                   placeholder={
                     state.ready
                       ? "Type a message..."
-                      : "Waiting for coordinator..."
+                      : "Connecting..."
                   }
                   rows={1}
-                  class="flex-1 resize-none rounded-lg bg-zinc-800 border border-zinc-600 px-4 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none focus:border-zinc-400 disabled:opacity-50 disabled:cursor-not-allowed"
+                  class="flex-1 resize-none rounded-xl bg-zinc-800/50 border border-zinc-700/50 px-4 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none focus:border-zinc-500 disabled:opacity-50 disabled:cursor-not-allowed"
                 />
                 <Show
                   when={isStreaming()}
@@ -346,18 +335,18 @@ function App() {
                     <button
                       onClick={handleSubmit}
                       disabled={!state.ready || (!input().trim() && pendingImages().length === 0)}
-                      class="rounded-lg bg-zinc-700 px-4 py-2.5 text-sm font-medium hover:bg-zinc-600 transition-colors disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
+                      class="rounded-xl w-10 h-10 flex items-center justify-center bg-zinc-700 hover:bg-zinc-600 transition-colors disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
                     >
-                      Send
+                      <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M5 12l7-7 7 7M12 5v14" /></svg>
                     </button>
                   }
                 >
                   <button
                     onClick={() => interruptCoordinator()}
-                    class="rounded-lg bg-red-900/50 text-red-300 px-4 py-2.5 text-sm font-medium hover:bg-red-900/70 transition-colors shrink-0"
+                    class="rounded-xl w-10 h-10 flex items-center justify-center bg-red-900/50 text-red-300 hover:bg-red-900/70 transition-colors shrink-0"
                     title="Interrupt (Ctrl+C)"
                   >
-                    Stop
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M6 6h12v12H6z" /></svg>
                   </button>
                 </Show>
               </div>

@@ -11,10 +11,10 @@ function WorkerCard(props: {
 }) {
   return (
     <div
-      class="rounded-lg p-3 text-sm transition-colors"
+      class="rounded-lg p-2.5 text-sm transition-colors"
       classList={{
         "bg-red-950/50 border border-red-800/50": props.failed,
-        "bg-zinc-800/80": !props.failed,
+        "bg-zinc-800/50": !props.failed,
       }}
     >
       <div class="flex items-center gap-2 mb-1">
@@ -47,7 +47,7 @@ function WorkerCard(props: {
 export default function WorkerPanel() {
   return (
     <div>
-      <h2 class="text-xs font-medium text-zinc-500 uppercase tracking-wide mb-2 flex items-center justify-between">
+      <h2 class="text-[11px] font-medium text-zinc-500 tracking-wide mb-2 flex items-center justify-between">
         <span>Workers</span>
         <Show when={state.workerCount > 0}>
           <span class="text-zinc-400 normal-case tracking-normal font-normal">
@@ -59,7 +59,7 @@ export default function WorkerPanel() {
         <Show
           when={state.workers.length > 0}
           fallback={
-            <div class="rounded-lg bg-zinc-800/40 p-3 text-xs text-zinc-500">
+            <div class="text-xs text-zinc-600 px-1">
               No active workers
             </div>
           }
