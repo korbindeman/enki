@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use enki::coordinator::{CoordinatorHandle, FromCoordinator, ToCoordinator, WorkerActivity};
-use serde::Serialize;
+use enki::coordinator::{CoordinatorHandle, FromCoordinator, ImageData, ToCoordinator, WorkerActivity};
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::mpsc;
 
@@ -18,10 +18,32 @@ pub struct CoordinatorState {
 // Tauri commands (frontend → Rust)
 // ---------------------------------------------------------------------------
 
+/// Image payload received from the frontend (base64-encoded).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ImagePayload {
+    pub data: String,
+    pub mime_type: String,
+}
+
 #[tauri::command]
-pub fn send_prompt(text: String, state: tauri::State<CoordinatorState>) -> Result<(), String> {
+pub fn send_prompt(
+    text: String,
+    images: Option<Vec<ImagePayload>>,
+    state: tauri::State<CoordinatorState>,
+) -> Result<(), String> {
+    use base64::Engine;
+    let images = images
+        .unwrap_or_default()
+        .into_iter()
+        .map(|img| {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(&img.data)
+                .map_err(|e| format!("invalid base64 image data: {e}"))?;
+            Ok(ImageData { bytes, mime_type: img.mime_type })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     state.tx.lock().unwrap()
-        .send(ToCoordinator::Prompt { text, images: vec![] })
+        .send(ToCoordinator::Prompt { text, images })
         .map_err(|_| "coordinator channel closed".to_string())
 }
 
