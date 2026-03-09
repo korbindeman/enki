@@ -2,6 +2,10 @@
 chat:
     cargo run -p enki-tui --example chat
 
+# Run the desktop app in dev mode
+desktop:
+    cd crates/desktop && cargo tauri dev
+
 # Build and install release binary to ~/.cargo/bin
 install:
     cargo install --path crates/cli
