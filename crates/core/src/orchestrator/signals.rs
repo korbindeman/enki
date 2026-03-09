@@ -86,7 +86,7 @@ impl Orchestrator {
                             }
                         }
                         _ => {
-                            tracing::warn!(path = %path.display(), "unknown signal type: {signal_type}");
+                            tracing::warn!(path = %path.display(), signal_type, "unknown signal type");
                         }
                     }
                 }

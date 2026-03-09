@@ -71,7 +71,7 @@ fn resolve_builtin(extra_args: &[String], env: &HashMap<String, String>) -> Resu
     let entry = cache.join(ENTRY_POINT);
 
     if !entry.exists() {
-        tracing::info!("installing {PACKAGE} into {}", cache.display());
+        tracing::info!(package = PACKAGE, path = %cache.display(), "installing agent package");
         npm_install(&cache)?;
 
         if !entry.exists() {

@@ -33,6 +33,7 @@ pub(super) async fn initialize(
     enki_bin: PathBuf,
     tx: mpsc::UnboundedSender<FromCoordinator>,
 ) -> Option<InitState> {
+    let init_start = Instant::now();
     tracing::info!(cwd = %cwd.display(), enki_bin = %enki_bin.display(), "coordinator loop started");
 
     let db = match enki_core::db::Db::open(&db_path) {
@@ -238,6 +239,9 @@ pub(super) async fn initialize(
         db_path,
         roles,
         config,
+        session_start: Instant::now(),
+        stats: super::SessionStats::default(),
+        merge_start_times: std::collections::HashMap::new(),
     };
 
     // Clean up orphaned merge temp dirs from prior crashed sessions.
@@ -245,6 +249,11 @@ pub(super) async fn initialize(
     if !removed.is_empty() {
         tracing::info!(count = removed.len(), "cleaned up orphaned merge temp dirs");
     }
+
+    tracing::info!(
+        elapsed_ms = init_start.elapsed().as_millis() as u64,
+        "coordinator initialized"
+    );
 
     Some(InitState {
         rt,

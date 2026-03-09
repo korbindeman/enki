@@ -90,6 +90,14 @@ impl Runtime {
         self.tracker.borrow_mut().register(session_id.clone(), prep.task_id.0.clone());
         self.orch.set_step_session(&prep.execution_id.0, &prep.step_id, session_id.clone());
 
+        tracing::info!(
+            task_id = %prep.task_id, title = %prep.title,
+            branch = %prep.branch, execution_id = %prep.execution_id,
+            tier = %prep.tier.as_str(),
+            role = prep.role.as_deref().unwrap_or("default"),
+            "worker spawned"
+        );
+
         let artifact_path = if prep.artifact {
             let artifacts_dir = self.copy_mgr.project_root()
                 .join(".enki").join("artifacts").join(&prep.execution_id.0);

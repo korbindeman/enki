@@ -58,7 +58,7 @@ impl Db {
             for (col_name, col_def) in &columns {
                 if !existing.iter().any(|e| e == col_name) {
                     let sql = format!("ALTER TABLE {} ADD COLUMN {} {}", table, col_name, col_def);
-                    tracing::info!("auto-migrate: {}", sql);
+                    tracing::info!(sql = %sql, "auto-migrate");
                     self.conn.execute_batch(&sql)?;
                 }
             }

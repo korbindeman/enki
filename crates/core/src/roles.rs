@@ -92,7 +92,7 @@ fn load_from_dir(dir: &Path, roles: &mut HashMap<String, RoleConfig>) {
                         roles.insert(config.name.clone(), config);
                     }
                     Err(e) => {
-                        tracing::warn!("failed to parse role file {}: {e}", path.display());
+                        tracing::warn!(path = %path.display(), error = %e, "failed to parse role file");
                     }
                 }
             }

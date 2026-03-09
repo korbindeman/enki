@@ -324,7 +324,7 @@ impl CopyManager {
     /// Delete a branch from the source repo.
     pub fn delete_branch(&self, branch: &str) -> Result<()> {
         if let Err(e) = git(&self.project_root, &["branch", "-D", branch]) {
-            tracing::warn!("failed to delete branch {branch}: {e}");
+            tracing::warn!(branch, error = %e, "failed to delete branch");
         }
         Ok(())
     }

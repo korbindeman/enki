@@ -122,7 +122,7 @@ fn load_file(path: &Path, config: &mut Config) {
     match toml::from_str::<ConfigToml>(&contents) {
         Ok(toml) => toml.apply_to(config),
         Err(e) => {
-            tracing::warn!("failed to parse {}: {e}", path.display());
+            tracing::warn!(path = %path.display(), error = %e, "failed to parse config file");
         }
     }
 }

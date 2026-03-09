@@ -118,9 +118,9 @@ impl AgentManager {
                 while let Ok(Some(line)) = lines.next_line().await {
                     if !line.is_empty() {
                         if line.contains("onPostToolUseHook") || line.starts_with("[{") {
-                            tracing::debug!(agent = agent_cmd_owned, cwd = cwd_owned, "agent stderr: {}", line);
+                            tracing::debug!(agent = agent_cmd_owned, cwd = cwd_owned, stderr_line = %line, "agent stderr");
                         } else {
-                            tracing::warn!(agent = agent_cmd_owned, cwd = cwd_owned, "agent stderr: {}", line);
+                            tracing::warn!(agent = agent_cmd_owned, cwd = cwd_owned, stderr_line = %line, "agent stderr");
                         }
                     }
                 }
@@ -142,7 +142,7 @@ impl AgentManager {
         // Drive the I/O loop in background
         tokio::task::spawn_local(async move {
             if let Err(e) = handle_io.await {
-                tracing::error!("ACP I/O error: {e}");
+                tracing::error!(error = %e, "ACP I/O error");
             }
         });
 
@@ -154,7 +154,7 @@ impl AgentManager {
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join(".enki/logs/sessions");
             if let Err(e) = tokio::fs::create_dir_all(&log_dir).await {
-                tracing::warn!("failed to create session log dir: {e}");
+                tracing::warn!(error = %e, "failed to create session log dir");
                 return;
             }
             let log_path = log_dir.join(format!("{log_label}.log"));
@@ -166,7 +166,7 @@ impl AgentManager {
             {
                 Ok(f) => f,
                 Err(e) => {
-                    tracing::warn!("failed to open session log {}: {e}", log_path.display());
+                    tracing::warn!(path = %log_path.display(), error = %e, "failed to open session log");
                     return;
                 }
             };
@@ -197,7 +197,7 @@ impl AgentManager {
                     }
                 };
                 if let Err(e) = writer.write_all(line.as_bytes()).await {
-                    tracing::warn!("session log write error: {e}");
+                    tracing::warn!(error = %e, "session log write error");
                     break;
                 }
                 let _ = writer.flush().await;
@@ -247,7 +247,7 @@ impl AgentManager {
                     )
                     .await;
                     if let Err(e) = set_result {
-                        tracing::warn!(session_id, "failed to set sonnet model: {e}");
+                        tracing::warn!(session_id, error = %e, "failed to set sonnet model");
                     }
                 } else {
                     tracing::warn!(session_id, "sonnet_only enabled but no sonnet model found in agent config options");

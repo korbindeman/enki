@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use enki_core::orchestrator::{Command, Event, MergeResult, WorkerOutcome, WorkerResult};
 use enki_core::types::{Id, MergeStatus, short_id};
@@ -132,9 +133,11 @@ impl Runtime {
                         coord.queue_event(format!("- Merge {mr_id} failed: {reason}"));
                     }
                     Event::ExecutionComplete { execution_id } => {
+                        tracing::info!(execution_id = %execution_id, "execution completed");
                         coord.queue_event(format!("- Execution {execution_id} completed successfully"));
                     }
                     Event::ExecutionFailed { execution_id } => {
+                        tracing::warn!(execution_id = %execution_id, "execution failed");
                         coord.queue_event(format!("- Execution {execution_id} failed"));
                     }
                     Event::AllStopped { count } => {
@@ -182,6 +185,8 @@ impl Runtime {
             // Phase 1: Sequential sync prep (worktree creation, DB writes).
             // Phase 2: Parallel ACP session creation (spawn_local runs concurrently).
             // Phase 3: Sequential finalization (tracker, prompt dispatch).
+            let spawn_batch_start = Instant::now();
+            let spawn_batch_count = spawn_events.len();
             let mut launches: Vec<(WorkerPrep, tokio::task::JoinHandle<enki_acp::Result<String>>)> = Vec::new();
 
             for (task_id, title, description, tier, execution_id, step_id, upstream_outputs, role) in spawn_events {
@@ -264,6 +269,7 @@ impl Runtime {
                 let result = handle.await.expect("spawn_local panicked");
                 match result {
                     Ok(session_id) => {
+                        self.stats.workers_spawned += 1;
                         self.finalize_worker_spawn(prep, session_id, coord);
                     }
                     Err(e) => {
@@ -288,6 +294,14 @@ impl Runtime {
                         events.extend(more);
                     }
                 }
+            }
+
+            if spawn_batch_count > 0 {
+                tracing::info!(
+                    count = spawn_batch_count,
+                    elapsed_ms = spawn_batch_start.elapsed().as_millis() as u64,
+                    "worker spawn batch completed"
+                );
             }
         }
     }
@@ -350,6 +364,7 @@ impl Runtime {
                 self.orch.db(), &self.db_path, &self.copy_mgr,
                 merger_done_tx, merge_in_progress,
                 &self.config.git.commit_suffix,
+                &mut self.merge_start_times,
             );
         }
 

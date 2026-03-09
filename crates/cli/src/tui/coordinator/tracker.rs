@@ -14,6 +14,7 @@ pub(super) struct WorkerTracker {
     pub last_activity: HashMap<String, Instant>,
     pub current_tool: HashMap<String, String>,
     pub thinking: HashSet<String>,
+    pub spawn_time: HashMap<String, Instant>,
 }
 
 impl WorkerTracker {
@@ -23,20 +24,23 @@ impl WorkerTracker {
             last_activity: HashMap::new(),
             current_tool: HashMap::new(),
             thinking: HashSet::new(),
+            spawn_time: HashMap::new(),
         }
     }
 
     pub fn register(&mut self, session_id: String, task_id: String) {
         self.session_to_task
             .insert(session_id.clone(), task_id);
-        self.last_activity.insert(session_id, Instant::now());
+        self.last_activity.insert(session_id.clone(), Instant::now());
+        self.spawn_time.insert(session_id, Instant::now());
     }
 
-    pub fn remove(&mut self, session_id: &str) {
+    pub fn remove(&mut self, session_id: &str) -> Option<Instant> {
         self.session_to_task.remove(session_id);
         self.last_activity.remove(session_id);
         self.current_tool.remove(session_id);
         self.thinking.remove(session_id);
+        self.spawn_time.remove(session_id)
     }
 
     /// Build the worker list for MonitorTick: (session_id, task_id, last_activity).

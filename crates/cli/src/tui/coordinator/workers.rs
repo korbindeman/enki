@@ -228,6 +228,7 @@ pub(super) fn try_dispatch_merge(
     merger_done_tx: &mpsc::UnboundedSender<MergerDone>,
     merge_in_progress: &mut bool,
     commit_suffix: &str,
+    merge_start_times: &mut std::collections::HashMap<String, std::time::Instant>,
 ) {
     let queued = match db.get_queued_merge_requests() {
         Ok(q) => q,
@@ -239,6 +240,7 @@ pub(super) fn try_dispatch_merge(
     let mr_id = mr.id.clone();
     let branch = mr.branch.clone();
     let base_branch = mr.base_branch.clone();
+    merge_start_times.insert(mr_id.0.clone(), std::time::Instant::now());
     tracing::info!(mr_id = %mr_id, task_id = %mr.task_id, branch = %mr.branch, "dispatching merge");
 
     // Build commit message from task title + configured suffix.
