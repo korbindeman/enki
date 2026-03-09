@@ -611,3 +611,106 @@ fn copy_to_clipboard(text: &str) {
         }
     }
 }
+
+/// Attempt to read image data from the system clipboard.
+/// Returns (bytes, mime_type) if an image is available, None otherwise.
+///
+/// macOS: writes clipboard PNG to a temp file via `osascript`, reads it back.
+/// Linux: `wl-paste --type image/png` (Wayland) or `xclip -selection clipboard -t image/png -o` (X11).
+/// Returns None if the clipboard has no image or no tool is available.
+fn paste_image_from_clipboard() -> Option<(Vec<u8>, String)> {
+    if cfg!(target_os = "macos") {
+        paste_image_macos()
+    } else {
+        paste_image_linux()
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn paste_image_macos() -> Option<(Vec<u8>, String)> {
+    use std::process::{Command, Stdio};
+
+    // Use osascript to write clipboard image (PNGf class) to a temp file, return the path.
+    let script = r#"try
+set pngData to (the clipboard as «class PNGf»)
+set filePath to (POSIX path of (path to temporary items folder)) & "enki-paste.png"
+set fRef to open for access filePath with write permission
+set eof fRef to 0
+write pngData to fRef
+close access fRef
+return filePath
+end try"#;
+
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let path = String::from_utf8(output.stdout).ok()?;
+    let path = path.trim();
+    if path.is_empty() {
+        return None;
+    }
+
+    let bytes = std::fs::read(path).ok()?;
+    // Clean up the temp file.
+    let _ = std::fs::remove_file(path);
+
+    if bytes.is_empty() {
+        return None;
+    }
+
+    Some((bytes, "image/png".to_string()))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn paste_image_macos() -> Option<(Vec<u8>, String)> {
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+fn paste_image_linux() -> Option<(Vec<u8>, String)> {
+    use std::process::{Command, Stdio};
+
+    // Pick candidate commands based on display server.
+    let candidates: &[&[&str]] = if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        &[
+            &["wl-paste", "--type", "image/png"],
+            &["xclip", "-selection", "clipboard", "-t", "image/png", "-o"],
+        ]
+    } else {
+        &[
+            &["xclip", "-selection", "clipboard", "-t", "image/png", "-o"],
+            &["wl-paste", "--type", "image/png"],
+        ]
+    };
+
+    for args in candidates {
+        let (cmd, cmd_args) = args.split_first().unwrap();
+        if let Ok(output) = Command::new(cmd)
+            .args(cmd_args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+        {
+            if output.status.success() && !output.stdout.is_empty() {
+                return Some((output.stdout, "image/png".to_string()));
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn paste_image_linux() -> Option<(Vec<u8>, String)> {
+    None
+}
