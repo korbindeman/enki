@@ -248,8 +248,8 @@ function ChatMessage(props: { message: Message }) {
           </div>
         </Match>
         <Match when={props.message.role === "user"}>
-          <div class="border-l-2 border-border pl-4 py-3">
-            <div class="text-sm whitespace-pre-wrap text-text">
+          <div class="flex justify-end py-3">
+            <div class="max-w-[85%] rounded-2xl bg-surface px-4 py-2.5 text-sm whitespace-pre-wrap text-text">
               {textContent()}
             </div>
           </div>
