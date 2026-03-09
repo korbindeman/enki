@@ -11,9 +11,9 @@ path = "src/main.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-enki = { path = "../cli" }
-enki-core = { path = "../core" }
-enki-acp = { path = "../acp" }
+enki = { path = "../../cli" }
+enki-core = { path = "../../core" }
+enki-acp = { path = "../../acp" }
 tauri = { version = "2", features = [] }
 anyhow = "1"
 dirs = "6"

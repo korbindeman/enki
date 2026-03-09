@@ -1,6 +1,11 @@
 @import "tailwindcss";
 @import "highlight.js/styles/github-dark-dimmed.css";
 
+html,
+body {
+  overscroll-behavior: none;
+}
+
 @keyframes flash-green {
   0%,
   100% {

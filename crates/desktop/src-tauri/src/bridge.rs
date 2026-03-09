@@ -131,20 +131,22 @@ fn to_event(msg: FromCoordinator) -> CoordinatorEvent {
 /// OS thread and starts a tokio task that relays `FromCoordinator` messages as
 /// Tauri events to the frontend.
 pub fn setup(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
-    let cwd = enki::commands::project_root()?;
-    let db_path = enki::commands::db_path()?;
-    let db_path_str = db_path.to_str().unwrap().to_string();
-
-    let enki_bin = std::env::current_exe()
-        .and_then(|p| p.canonicalize())
-        .unwrap_or_else(|_| std::path::PathBuf::from("enki"));
+    let cwd = std::env::current_dir()?;
+    let enki_dir = cwd.join(".enki");
+    let db_path = enki_dir.join("db.sqlite");
 
     // Auto-initialize project if needed.
-    let enki_dir = cwd.join(".enki");
-    if !enki_dir.join("db.sqlite").exists() {
+    if !db_path.exists() {
         std::fs::create_dir_all(&enki_dir)?;
-        let _ = enki_core::db::Db::open(enki_dir.join("db.sqlite").to_str().unwrap())?;
+        enki_core::db::Db::open(db_path.to_str().unwrap())?;
     }
+
+    let db_path_str = db_path.to_str().unwrap().to_string();
+
+    // Resolve the enki CLI binary — NOT current_exe(), which is the desktop app
+    // and would cause infinite window spawning when the coordinator launches
+    // `enki mcp` subprocesses.
+    let enki_bin = find_enki_bin();
 
     let CoordinatorHandle { tx, rx, join_handle } =
         enki::coordinator::spawn(cwd, db_path_str, enki_bin);
@@ -154,9 +156,9 @@ pub fn setup(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         _join_handle: Mutex::new(join_handle),
     });
 
-    // Spawn the event relay task.
+    // Spawn the event relay task on Tauri's async runtime.
     let handle = app.clone();
-    tokio::spawn(event_relay(handle, rx));
+    tauri::async_runtime::spawn(event_relay(handle, rx));
 
     Ok(())
 }
@@ -173,4 +175,19 @@ async fn event_relay(
         }
     }
     tracing::info!("coordinator event relay ended");
+}
+
+/// Find the `enki` CLI binary on PATH or at the default cargo install location.
+fn find_enki_bin() -> std::path::PathBuf {
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = dir.join("enki");
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".cargo/bin/enki")
 }

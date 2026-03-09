@@ -3,7 +3,7 @@
   "productName": "Enki",
   "identifier": "com.enki.desktop",
   "build": {
-    "frontendDist": "ui/dist",
+    "frontendDist": "../dist",
     "devUrl": "http://localhost:5173",
     "beforeDevCommand": "pnpm dev",
     "beforeBuildCommand": "pnpm build"
