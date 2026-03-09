@@ -22,11 +22,31 @@ Works in any folder, git or not. In a git repo, enki commits each task on a bran
 
 ## Install
 
+### macOS
+
 ```bash
 brew install korbindeman/tap/enki
 ```
 
-Or build from source:
+### Linux
+
+Download the latest binary from [GitHub Releases](https://github.com/korbindeman/enki/releases):
+
+```bash
+curl -fsSL https://github.com/korbindeman/enki/releases/latest/download/enki-x86_64-unknown-linux-gnu.tar.gz | tar xz
+sudo mv enki /usr/local/bin/
+```
+
+For clipboard support, install `xclip` (X11) or `wl-clipboard` (Wayland):
+
+```bash
+# X11
+sudo apt install xclip
+# Wayland
+sudo apt install wl-clipboard
+```
+
+### From source (any platform)
 
 ```bash
 cargo install --path crates/cli
