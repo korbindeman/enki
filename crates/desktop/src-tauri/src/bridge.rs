@@ -62,10 +62,42 @@ pub fn stop_all(state: tauri::State<CoordinatorState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn set_agent(agent: String, state: tauri::State<CoordinatorState>) -> Result<(), String> {
-    state.tx.lock().unwrap()
-        .send(ToCoordinator::SetAgent(agent))
-        .map_err(|_| "coordinator channel closed".to_string())
+pub async fn set_agent(
+    agent: String,
+    state: tauri::State<'_, CoordinatorState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let cwd = state.cwd.lock().unwrap().clone();
+    if cwd.is_empty() {
+        return Err("no project open".into());
+    }
+
+    let enki_dir = PathBuf::from(&cwd).join(".enki");
+    let db_path = enki_dir.join("db.sqlite");
+
+    // Shutdown old coordinator.
+    state.tx.lock().unwrap().send(ToCoordinator::Shutdown).ok();
+    if let Some(handle) = state.join_handle.lock().unwrap().take() {
+        handle.join().ok();
+    }
+
+    // Spawn new coordinator with the selected agent.
+    let enki_bin = find_enki_bin();
+    let CoordinatorHandle { tx, rx, join_handle } =
+        enki::coordinator::spawn(
+            PathBuf::from(&cwd),
+            db_path.to_str().unwrap().to_string(),
+            enki_bin,
+            Some(agent),
+        );
+
+    *state.tx.lock().unwrap() = tx;
+    *state.join_handle.lock().unwrap() = join_handle;
+
+    // Start relaying events from the new coordinator.
+    tauri::async_runtime::spawn(event_relay(app, rx));
+
+    Ok(())
 }
 
 #[tauri::command]

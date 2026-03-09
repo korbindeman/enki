@@ -84,6 +84,18 @@ export async function fetchBranch(): Promise<void> {
   }
 }
 
+export async function switchAgent(agent: string): Promise<void> {
+  setState({
+    ready: false,
+    messages: [],
+    workers: [],
+    workerCount: 0,
+    tasks: [],
+    error: null,
+  });
+  await invoke("set_agent", { agent });
+}
+
 export async function openProject(path: string): Promise<void> {
   // Reset all state before switching.
   setState({

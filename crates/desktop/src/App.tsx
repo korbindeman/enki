@@ -14,6 +14,7 @@ import {
   sendPrompt,
   interruptCoordinator,
   openProject,
+  switchAgent,
 } from "./store";
 import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
@@ -59,9 +60,9 @@ function AgentSelector() {
     setAgent(key);
     setOpen(false);
     try {
-      await invoke("set_agent", { agent: key });
+      await switchAgent(key);
     } catch {
-      // Command may not exist yet — ignore.
+      // Ignore if coordinator not ready.
     }
   }
 

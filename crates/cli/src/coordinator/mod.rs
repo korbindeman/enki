@@ -53,8 +53,6 @@ pub enum ToCoordinator {
     Shutdown,
     /// Stop all running workers immediately.
     StopAll,
-    /// Switch the ACP agent command at runtime.
-    SetAgent(String),
 }
 
 /// Messages sent from the coordinator thread back to the UI.
@@ -269,9 +267,6 @@ async fn coordinator_loop(
                         ToCoordinator::StopAll => {
                             rt.kill_all_workers();
                             rt.handle_command(Command::StopAll, &mut coord).await;
-                        }
-                        ToCoordinator::SetAgent(agent) => {
-                            rt.config.agent.command = agent;
                         }
                     }
                 }
