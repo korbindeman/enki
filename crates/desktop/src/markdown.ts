@@ -33,5 +33,5 @@ export function renderMarkdown(
       src += "\n```";
     }
   }
-  return marked.parse(src, { async: false }) as string;
+  return marked.parse(src, { async: false, breaks: true }) as string;
 }
