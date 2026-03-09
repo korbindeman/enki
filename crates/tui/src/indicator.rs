@@ -135,12 +135,19 @@ impl Indicator {
                 Activity::Tool(name) => {
                     // " ⠋ " = 3 cols, time suffix, possible worker suffix.
                     // Truncate the tool name so the line fits in `width`.
+                    // Collapse newlines/control chars — tool titles (e.g. bash
+                    // commands) can be multi-line and would overflow into the
+                    // input bubble.
+                    let flat_name: String = name
+                        .chars()
+                        .map(|c| if c.is_control() { ' ' } else { c })
+                        .collect();
                     let prefix_len = 3; // " ⠋ "
                     let time_len = time.len();
                     let worker_suffix_len = if self.worker_count > 0 { 20 } else { 0 };
                     let overhead = prefix_len + time_len + worker_suffix_len;
                     let max_name = (width as usize).saturating_sub(overhead);
-                    let truncated = truncate_str(name, max_name);
+                    let truncated = truncate_str(&flat_name, max_name);
                     vec![
                         Span::styled(format!(" {spinner} "), Style::new().fg(Color::DarkYellow)),
                         Span::styled(truncated, Style::new().fg(Color::DarkYellow)),
