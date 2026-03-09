@@ -255,6 +255,7 @@ impl acp::Client for EnkiClient {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
         cmd.stdin(std::process::Stdio::null());
+        cmd.kill_on_drop(true);
 
         let child = cmd.spawn().map_err(|e| {
             acp::Error::into_internal_error(std::io::Error::other(format!("failed to spawn terminal: {e}")))
@@ -363,9 +364,11 @@ impl acp::Client for EnkiClient {
         let tid = args.terminal_id.to_string();
         let entry = self.terminals.borrow_mut().remove(&tid);
 
-        // If still running, the child is dropped which kills it (kill_on_drop isn't set
-        // on these, but dropping the pipes will cause the process to get SIGPIPE).
-        drop(entry);
+        // Explicitly kill a running child and collect its exit status to avoid zombies.
+        if let Some(TerminalState::Running { mut child, .. }) = entry {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
 
         Ok(acp::ReleaseTerminalResponse::default())
     }
