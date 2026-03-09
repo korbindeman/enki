@@ -33,7 +33,7 @@ jobs:
           echo '[target.aarch64-unknown-linux-gnu]' >> ~/.cargo/config.toml
           echo 'linker = "aarch64-linux-gnu-gcc"' >> ~/.cargo/config.toml
 
-      - run: cargo build --release --target ${{ matrix.target }}
+      - run: cargo build --release --bin enki --target ${{ matrix.target }}
 
       - name: Package binary
         run: |
