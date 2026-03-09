@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use enki::coordinator::{CoordinatorHandle, FromCoordinator, ToCoordinator, WorkerActivity};
@@ -5,16 +6,12 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::mpsc;
 
-/// Tauri-managed state: the sender half of the coordinator channel.
+/// Tauri-managed state: coordinator channel + project info.
+/// All fields are behind Mutex so the coordinator can be replaced on project switch.
 pub struct CoordinatorState {
-    tx: mpsc::UnboundedSender<ToCoordinator>,
-    /// Keep the join handle so the coordinator thread lives as long as the app.
-    _join_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
-}
-
-/// Static project info, queryable by the frontend on init.
-pub struct ProjectState {
-    pub cwd: String,
+    tx: Mutex<mpsc::UnboundedSender<ToCoordinator>>,
+    join_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+    cwd: Mutex<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -23,25 +20,65 @@ pub struct ProjectState {
 
 #[tauri::command]
 pub fn send_prompt(text: String, state: tauri::State<CoordinatorState>) -> Result<(), String> {
-    state.tx.send(ToCoordinator::Prompt { text, images: vec![] })
+    state.tx.lock().unwrap()
+        .send(ToCoordinator::Prompt { text, images: vec![] })
         .map_err(|_| "coordinator channel closed".to_string())
 }
 
 #[tauri::command]
 pub fn interrupt(state: tauri::State<CoordinatorState>) -> Result<(), String> {
-    state.tx.send(ToCoordinator::Interrupt)
+    state.tx.lock().unwrap()
+        .send(ToCoordinator::Interrupt)
         .map_err(|_| "coordinator channel closed".to_string())
 }
 
 #[tauri::command]
 pub fn stop_all(state: tauri::State<CoordinatorState>) -> Result<(), String> {
-    state.tx.send(ToCoordinator::StopAll)
+    state.tx.lock().unwrap()
+        .send(ToCoordinator::StopAll)
         .map_err(|_| "coordinator channel closed".to_string())
 }
 
 #[tauri::command]
-pub fn get_project_dir(state: tauri::State<ProjectState>) -> String {
-    state.cwd.clone()
+pub fn get_project_dir(state: tauri::State<CoordinatorState>) -> String {
+    state.cwd.lock().unwrap().clone()
+}
+
+#[tauri::command]
+pub async fn open_project(
+    path: String,
+    state: tauri::State<'_, CoordinatorState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let cwd = PathBuf::from(&path);
+    let enki_dir = cwd.join(".enki");
+    let db_path = enki_dir.join("db.sqlite");
+
+    // Auto-initialize project if needed.
+    if !db_path.exists() {
+        std::fs::create_dir_all(&enki_dir).map_err(|e| e.to_string())?;
+        enki_core::db::Db::open(db_path.to_str().unwrap()).map_err(|e| e.to_string())?;
+    }
+
+    // Shutdown old coordinator.
+    state.tx.lock().unwrap().send(ToCoordinator::Shutdown).ok();
+    if let Some(handle) = state.join_handle.lock().unwrap().take() {
+        handle.join().ok();
+    }
+
+    // Spawn new coordinator for the selected project.
+    let enki_bin = find_enki_bin();
+    let CoordinatorHandle { tx, rx, join_handle } =
+        enki::coordinator::spawn(cwd, db_path.to_str().unwrap().to_string(), enki_bin);
+
+    *state.tx.lock().unwrap() = tx;
+    *state.join_handle.lock().unwrap() = join_handle;
+    *state.cwd.lock().unwrap() = path;
+
+    // Start relaying events from the new coordinator.
+    tauri::async_runtime::spawn(event_relay(app, rx));
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -167,10 +204,10 @@ pub fn setup(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         enki::coordinator::spawn(cwd, db_path_str, enki_bin);
 
     app.manage(CoordinatorState {
-        tx,
-        _join_handle: Mutex::new(join_handle),
+        tx: Mutex::new(tx),
+        join_handle: Mutex::new(join_handle),
+        cwd: Mutex::new(cwd_str),
     });
-    app.manage(ProjectState { cwd: cwd_str });
 
     // Spawn the event relay task on Tauri's async runtime.
     let handle = app.clone();

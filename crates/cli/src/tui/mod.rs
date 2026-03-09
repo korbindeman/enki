@@ -12,7 +12,7 @@ const PROMPT: &str = "› ";
 /// Run the chat interface. This takes over terminal input (raw mode)
 /// with a pinned input bubble at the bottom.
 pub async fn run(_db: enki_core::db::Db, db_path: String, enki_bin: PathBuf) -> anyhow::Result<()> {
-    let project_cwd = enki::commands::project_root()?;
+    let project_cwd = std::env::current_dir()?;
     let project_name = project_cwd
         .file_name()
         .unwrap_or_default()

@@ -72,6 +72,21 @@ export async function stopAll(): Promise<void> {
   await invoke("stop_all");
 }
 
+export async function openProject(path: string): Promise<void> {
+  // Reset all state before switching.
+  setState({
+    ready: false,
+    messages: [],
+    workers: [],
+    workerCount: 0,
+    tasks: [],
+    error: null,
+    activeToolCall: null,
+    projectCwd: path,
+  });
+  await invoke("open_project", { path });
+}
+
 // ---------------------------------------------------------------------------
 // Event handling (Rust → frontend)
 // ---------------------------------------------------------------------------

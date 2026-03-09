@@ -4,11 +4,13 @@ pub fn run() {
     init_logging();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             bridge::send_prompt,
             bridge::interrupt,
             bridge::stop_all,
             bridge::get_project_dir,
+            bridge::open_project,
         ])
         .setup(|app| {
             bridge::setup(app.handle())?;

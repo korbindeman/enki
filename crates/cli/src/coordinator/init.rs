@@ -66,14 +66,8 @@ pub(super) async fn initialize(
 
     let (worker_done_tx, worker_done_rx) = mpsc::unbounded_channel::<WorkerDone>();
 
-    // Env vars for spawned agents.
-    let enki_dir = match crate::commands::enki_dir() {
-        Ok(d) => d,
-        Err(e) => {
-            let _ = tx.send(FromCoordinator::Error(format!("failed to find .enki dir: {e}")));
-            return None;
-        }
-    };
+    // Derive all paths from the explicit `cwd` parameter, not from env vars or process CWD.
+    let enki_dir = cwd.join(".enki");
     let enki_env = {
         let mut env = HashMap::new();
         env.insert("ENKI_BIN".to_string(), enki_bin.display().to_string());
@@ -214,8 +208,8 @@ pub(super) async fn initialize(
     let mut poll_interval = tokio::time::interval(std::time::Duration::from_secs(3));
     poll_interval.tick().await;
 
-    let project_root = crate::commands::project_root().unwrap_or_default();
-    let copies_dir = crate::commands::copies_dir().unwrap_or_default();
+    let project_root = cwd.clone();
+    let copies_dir = enki_dir.join("copies");
     let git_identity = match GitIdentity::from_git_config(&project_root) {
         Ok(id) => id,
         Err(e) => {

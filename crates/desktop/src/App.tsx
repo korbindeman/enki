@@ -13,7 +13,9 @@ import {
   initStore,
   sendPrompt,
   interruptCoordinator,
+  openProject,
 } from "./store";
+import { open } from "@tauri-apps/plugin-dialog";
 import { renderMarkdown } from "./markdown";
 import type { Message } from "./types";
 import WorkerPanel from "./WorkerPanel";
@@ -54,10 +56,47 @@ function ChatMessage(props: { message: Message }) {
   );
 }
 
+function ContextMenu(props: {
+  x: number;
+  y: number;
+  onClose: () => void;
+  items: { label: string; action: () => void }[];
+}) {
+  function handleClickOutside(e: MouseEvent) {
+    props.onClose();
+  }
+
+  onMount(() => window.addEventListener("click", handleClickOutside));
+  onCleanup(() => window.removeEventListener("click", handleClickOutside));
+
+  return (
+    <div
+      class="fixed z-50 min-w-[160px] py-1 bg-zinc-800 border border-zinc-600 rounded-md shadow-lg"
+      style={{ left: `${props.x}px`, top: `${props.y}px` }}
+    >
+      <For each={props.items}>
+        {(item) => (
+          <button
+            class="w-full text-left px-3 py-1.5 text-sm text-zinc-200 hover:bg-zinc-700"
+            onClick={(e) => {
+              e.stopPropagation();
+              props.onClose();
+              item.action();
+            }}
+          >
+            {item.label}
+          </button>
+        )}
+      </For>
+    </div>
+  );
+}
+
 function App() {
   let messagesContainer!: HTMLDivElement;
   let textareaRef!: HTMLTextAreaElement;
   const [input, setInput] = createSignal("");
+  const [contextMenu, setContextMenu] = createSignal<{ x: number; y: number } | null>(null);
 
   const isStreaming = () => {
     const msgs = state.messages;
@@ -115,11 +154,23 @@ function App() {
     el.style.height = Math.min(el.scrollHeight, 200) + "px";
   }
 
+  function handleSidebarContextMenu(e: MouseEvent) {
+    e.preventDefault();
+    setContextMenu({ x: e.clientX, y: e.clientY });
+  }
+
+  async function handleOpenProject() {
+    const folder = await open({ directory: true });
+    if (folder) {
+      await openProject(folder);
+    }
+  }
+
   return (
     <div class="flex h-screen bg-zinc-900 text-zinc-100">
       {/* Sidebar */}
       <aside class="w-[300px] shrink-0 border-r border-zinc-700 bg-zinc-950 flex flex-col">
-        <div class="px-4 py-3 border-b border-zinc-700">
+        <div class="px-4 py-3 border-b border-zinc-700" onContextMenu={handleSidebarContextMenu}>
           <h1 class="text-lg font-semibold">Enki</h1>
           <Show when={state.projectCwd}>
             <div class="text-xs text-zinc-500 truncate mt-0.5" title={state.projectCwd!}>
@@ -216,6 +267,17 @@ function App() {
           </div>
         </div>
       </main>
+
+      <Show when={contextMenu()}>
+        {(menu) => (
+          <ContextMenu
+            x={menu().x}
+            y={menu().y}
+            onClose={() => setContextMenu(null)}
+            items={[{ label: "Open Project...", action: handleOpenProject }]}
+          />
+        )}
+      </Show>
     </div>
   );
 }
