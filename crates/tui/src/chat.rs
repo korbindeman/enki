@@ -575,14 +575,39 @@ impl Chat {
     }
 }
 
-/// Copy text to the system clipboard (macOS: pbcopy).
+/// Copy text to the system clipboard.
+///
+/// macOS: `pbcopy`. Linux: `wl-copy` (Wayland) or `xclip`/`xsel` (X11).
+/// Silently fails if no clipboard command is available.
 fn copy_to_clipboard(text: &str) {
     use std::process::{Command, Stdio};
-    if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
-        if let Some(stdin) = child.stdin.as_mut() {
-            use std::io::Write;
-            stdin.write_all(text.as_bytes()).ok();
+
+    let candidates: &[&[&str]] = if cfg!(target_os = "macos") {
+        &[&["pbcopy"]]
+    } else {
+        // On Linux, prefer the session's display protocol, then fall back.
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            &[&["wl-copy"], &["xclip", "-selection", "clipboard"], &["xsel", "--clipboard", "--input"]]
+        } else {
+            &[&["xclip", "-selection", "clipboard"], &["xsel", "--clipboard", "--input"], &["wl-copy"]]
         }
-        child.wait().ok();
+    };
+
+    for args in candidates {
+        let (cmd, cmd_args) = args.split_first().unwrap();
+        if let Ok(mut child) = Command::new(cmd)
+            .args(cmd_args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            if let Some(stdin) = child.stdin.as_mut() {
+                use std::io::Write;
+                stdin.write_all(text.as_bytes()).ok();
+            }
+            child.wait().ok();
+            return;
+        }
     }
 }
