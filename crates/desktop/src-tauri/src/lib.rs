@@ -12,6 +12,7 @@ pub fn run() {
             bridge::send_prompt,
             bridge::interrupt,
             bridge::stop_all,
+            bridge::set_agent,
             bridge::get_project_dir,
             bridge::open_project,
             bridge::load_config,

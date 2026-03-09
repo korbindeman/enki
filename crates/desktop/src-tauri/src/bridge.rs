@@ -62,6 +62,13 @@ pub fn stop_all(state: tauri::State<CoordinatorState>) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub fn set_agent(agent: String, state: tauri::State<CoordinatorState>) -> Result<(), String> {
+    state.tx.lock().unwrap()
+        .send(ToCoordinator::SetAgent(agent))
+        .map_err(|_| "coordinator channel closed".to_string())
+}
+
+#[tauri::command]
 pub fn get_project_dir(state: tauri::State<CoordinatorState>) -> String {
     state.cwd.lock().unwrap().clone()
 }
