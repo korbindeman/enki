@@ -121,6 +121,11 @@ function App() {
       <aside class="w-[300px] shrink-0 border-r border-zinc-700 bg-zinc-950 flex flex-col">
         <div class="px-4 py-3 border-b border-zinc-700">
           <h1 class="text-lg font-semibold">Enki</h1>
+          <Show when={state.projectCwd}>
+            <div class="text-xs text-zinc-500 truncate mt-0.5" title={state.projectCwd!}>
+              {state.projectCwd!.split("/").pop()}
+            </div>
+          </Show>
         </div>
         <div class="flex-1 overflow-y-auto p-3 space-y-5">
           <WorkerPanel />

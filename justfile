@@ -2,9 +2,9 @@
 chat:
     cargo run -p enki-tui --example chat
 
-# Run the desktop app in dev mode
+# Run the desktop app in dev mode (uses current directory as project)
 desktop:
-    cd crates/desktop && cargo tauri dev
+    export ENKI_PROJECT_DIR="{{justfile_directory()}}" && cd crates/desktop && cargo tauri dev
 
 # Build and install release binary to ~/.cargo/bin
 install:

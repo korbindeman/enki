@@ -8,6 +8,7 @@ pub fn run() {
             bridge::send_prompt,
             bridge::interrupt,
             bridge::stop_all,
+            bridge::get_project_dir,
         ])
         .setup(|app| {
             bridge::setup(app.handle())?;

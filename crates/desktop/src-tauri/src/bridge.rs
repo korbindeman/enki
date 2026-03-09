@@ -12,6 +12,11 @@ pub struct CoordinatorState {
     _join_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
+/// Static project info, queryable by the frontend on init.
+pub struct ProjectState {
+    pub cwd: String,
+}
+
 // ---------------------------------------------------------------------------
 // Tauri commands (frontend → Rust)
 // ---------------------------------------------------------------------------
@@ -32,6 +37,11 @@ pub fn interrupt(state: tauri::State<CoordinatorState>) -> Result<(), String> {
 pub fn stop_all(state: tauri::State<CoordinatorState>) -> Result<(), String> {
     state.tx.send(ToCoordinator::StopAll)
         .map_err(|_| "coordinator channel closed".to_string())
+}
+
+#[tauri::command]
+pub fn get_project_dir(state: tauri::State<ProjectState>) -> String {
+    state.cwd.clone()
 }
 
 // ---------------------------------------------------------------------------
@@ -131,7 +141,11 @@ fn to_event(msg: FromCoordinator) -> CoordinatorEvent {
 /// OS thread and starts a tokio task that relays `FromCoordinator` messages as
 /// Tauri events to the frontend.
 pub fn setup(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
-    let cwd = std::env::current_dir()?;
+    // Use ENKI_PROJECT_DIR if set (e.g. `just desktop`), otherwise fall back to CWD.
+    let cwd = match std::env::var("ENKI_PROJECT_DIR") {
+        Ok(dir) => std::path::PathBuf::from(dir),
+        Err(_) => std::env::current_dir()?,
+    };
     let enki_dir = cwd.join(".enki");
     let db_path = enki_dir.join("db.sqlite");
 
@@ -142,6 +156,7 @@ pub fn setup(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let db_path_str = db_path.to_str().unwrap().to_string();
+    let cwd_str = cwd.to_string_lossy().to_string();
 
     // Resolve the enki CLI binary — NOT current_exe(), which is the desktop app
     // and would cause infinite window spawning when the coordinator launches
@@ -155,6 +170,7 @@ pub fn setup(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         tx,
         _join_handle: Mutex::new(join_handle),
     });
+    app.manage(ProjectState { cwd: cwd_str });
 
     // Spawn the event relay task on Tauri's async runtime.
     let handle = app.clone();

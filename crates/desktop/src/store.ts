@@ -8,6 +8,8 @@ import type { CoordinatorEvent, Message, Task, Worker } from "./types";
 // ---------------------------------------------------------------------------
 
 export interface AppState {
+  /** Project working directory. */
+  projectCwd: string | null;
   /** Whether the coordinator is initialized and ready. */
   ready: boolean;
   /** Chat messages in the main panel. */
@@ -25,6 +27,7 @@ export interface AppState {
 }
 
 const [state, setState] = createStore<AppState>({
+  projectCwd: null,
   ready: false,
   messages: [],
   workers: [],
@@ -327,8 +330,11 @@ function handleEvent(event: CoordinatorEvent): void {
 // ---------------------------------------------------------------------------
 
 /** Start listening to coordinator events. Call once on app mount. */
-export function initStore(): void {
+export async function initStore(): Promise<void> {
   listen<CoordinatorEvent>("coordinator", (event) => {
     handleEvent(event.payload);
   });
+
+  const cwd = await invoke<string>("get_project_dir");
+  setState("projectCwd", cwd);
 }
