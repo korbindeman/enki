@@ -18,6 +18,7 @@ import {
 import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import { renderMarkdown } from "./markdown";
+import { invoke } from "@tauri-apps/api/core";
 import type { Message } from "./types";
 import WorkerPanel from "./WorkerPanel";
 import TaskList from "./TaskList";
@@ -30,7 +31,75 @@ interface PendingImage {
   url: string; // data URL for preview
 }
 
+const AGENT_DISPLAY_NAMES: Record<string, string> = {
+  claude: "Claude Code",
+  codex: "OpenAI Codex",
+};
+
+const AGENT_KEYS = Object.keys(AGENT_DISPLAY_NAMES);
+
+function AgentSelector() {
+  const [agent, setAgent] = createSignal("claude");
+  const [open, setOpen] = createSignal(false);
+
+  onMount(async () => {
+    try {
+      const config = await invoke<{ agent_command?: string }>("load_config");
+      if (config.agent_command && config.agent_command in AGENT_DISPLAY_NAMES) {
+        setAgent(config.agent_command);
+      }
+    } catch {
+      // Config not available yet — keep default.
+    }
+  });
+
+  async function select(key: string) {
+    setAgent(key);
+    setOpen(false);
+    try {
+      await invoke("set_agent", { agent: key });
+    } catch {
+      // Command may not exist yet — ignore.
+    }
+  }
+
+  return (
+    <div class="relative">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        class="flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs text-zinc-400 hover:text-zinc-200 hover:bg-zinc-700/50 transition-colors"
+      >
+        {AGENT_DISPLAY_NAMES[agent()]}
+        <svg class="w-3 h-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7" />
+        </svg>
+      </button>
+      <Show when={open()}>
+        <div class="absolute bottom-full left-0 mb-1 rounded-lg bg-zinc-800 border border-zinc-700 shadow-xl py-1 min-w-[140px] z-10">
+          <For each={AGENT_KEYS}>
+            {(key) => (
+              <button
+                onClick={() => select(key)}
+                class={`w-full text-left px-3 py-1.5 text-xs transition-colors ${
+                  key === agent()
+                    ? "text-zinc-100 bg-zinc-700/50"
+                    : "text-zinc-400 hover:text-zinc-200 hover:bg-zinc-700/30"
+                }`}
+              >
+                {AGENT_DISPLAY_NAMES[key]}
+              </button>
+            )}
+          </For>
+        </div>
+      </Show>
+    </div>
+  );
+}
+
 function ChatMessage(props: { message: Message }) {
+  const activeToolCall = () =>
+    props.message.toolCalls.find((tc) => !tc.done);
+
   return (
     <Switch>
       <Match when={props.message.role === "system"}>
@@ -47,15 +116,53 @@ function ChatMessage(props: { message: Message }) {
       </Match>
       <Match when={props.message.role === "assistant"}>
         <div class="py-3">
-          <div
-            class="prose"
-            innerHTML={renderMarkdown(
-              props.message.content,
-              props.message.streaming,
-            )}
-          />
+          <Show when={props.message.content}>
+            <div
+              class="prose"
+              innerHTML={renderMarkdown(
+                props.message.content,
+                props.message.streaming,
+              )}
+            />
+          </Show>
+          {/* Inline tool calls */}
+          <Show when={props.message.toolCalls.length > 0}>
+            <div class="mt-3 border border-zinc-700/50 rounded-lg bg-zinc-800/30 px-4 py-3">
+              <div class="text-[10px] uppercase tracking-wider text-zinc-500 font-medium mb-2">
+                Tool calls ({props.message.toolCalls.length})
+              </div>
+              <For each={props.message.toolCalls}>
+                {(tc) => (
+                  <div class="flex items-center gap-2 py-0.5">
+                    <span
+                      class={`inline-block w-1.5 h-1.5 rounded-full shrink-0 ${tc.done ? "bg-zinc-600" : "bg-amber-500 animate-pulse"}`}
+                    />
+                    <span class="text-xs text-zinc-400 font-mono truncate">
+                      {tc.name}
+                    </span>
+                  </div>
+                )}
+              </For>
+            </div>
+          </Show>
+          {/* Inline status indicator */}
           <Show when={props.message.streaming}>
-            <span class="inline-block w-1.5 h-4 bg-zinc-400 animate-pulse align-middle mt-1" />
+            <div class="mt-2 flex items-center gap-2">
+              <Show
+                when={activeToolCall()}
+                fallback={
+                  <>
+                    <span class="inline-block w-1.5 h-1.5 rounded-full bg-zinc-400 animate-pulse" />
+                    <span class="text-xs text-zinc-500">Responding...</span>
+                  </>
+                }
+              >
+                <span class="inline-block w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
+                <span class="text-xs text-zinc-500">
+                  Using {activeToolCall()!.name}
+                </span>
+              </Show>
+            </div>
           </Show>
         </div>
       </Match>
@@ -237,44 +344,34 @@ function App() {
             </div>
           </div>
 
-          {/* Tool indicator + Input */}
+          {/* Input area */}
           <div class="relative">
             <div class="absolute top-0 left-0 right-0 -translate-y-full bg-gradient-to-t from-zinc-900 to-transparent h-8 pointer-events-none" />
-            <Show when={state.activeToolCall}>
-              <div class="px-6 py-1.5 text-xs text-zinc-500 flex items-center gap-2">
-                <span class="inline-block w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
-                Using {state.activeToolCall}
-              </div>
-            </Show>
-            <Show when={isStreaming() && !state.activeToolCall}>
-              <div class="px-6 py-1.5 text-xs text-zinc-500 flex items-center gap-2">
-                <span class="inline-block w-1.5 h-1.5 rounded-full bg-zinc-400 animate-pulse" />
-                Responding...
-              </div>
-            </Show>
             <div class="px-6 py-3 pb-5">
-              <Show when={pendingImages().length > 0}>
-                <div class="max-w-3xl mx-auto pb-3 flex gap-2 flex-wrap">
-                  <For each={pendingImages()}>
-                    {(img) => (
-                      <div class="relative group">
-                        <img
-                          src={img.url}
-                          alt=""
-                          class="h-20 rounded-lg border border-zinc-600 object-cover"
-                        />
-                        <button
-                          onClick={() => removeImage(img.id)}
-                          class="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full bg-zinc-700 border border-zinc-500 text-zinc-300 flex items-center justify-center text-xs hover:bg-red-900 hover:border-red-700 hover:text-red-300 transition-colors opacity-0 group-hover:opacity-100"
-                        >
-                          &times;
-                        </button>
-                      </div>
-                    )}
-                  </For>
-                </div>
-              </Show>
-              <div class="max-w-3xl mx-auto flex gap-3 items-end">
+              <div class="max-w-3xl mx-auto rounded-2xl bg-zinc-800/50 border border-zinc-700/50 focus-within:border-zinc-500 transition-colors">
+                {/* Pending images */}
+                <Show when={pendingImages().length > 0}>
+                  <div class="px-4 pt-3 flex gap-2 flex-wrap">
+                    <For each={pendingImages()}>
+                      {(img) => (
+                        <div class="relative group">
+                          <img
+                            src={img.url}
+                            alt=""
+                            class="h-20 rounded-lg border border-zinc-600 object-cover"
+                          />
+                          <button
+                            onClick={() => removeImage(img.id)}
+                            class="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full bg-zinc-700 border border-zinc-500 text-zinc-300 flex items-center justify-center text-xs hover:bg-red-900 hover:border-red-700 hover:text-red-300 transition-colors opacity-0 group-hover:opacity-100"
+                          >
+                            &times;
+                          </button>
+                        </div>
+                      )}
+                    </For>
+                  </div>
+                </Show>
+                {/* Textarea */}
                 <textarea
                   ref={textareaRef}
                   value={input()}
@@ -291,28 +388,34 @@ function App() {
                       : "Connecting..."
                   }
                   rows={1}
-                  class="flex-1 resize-none rounded-xl bg-zinc-800/50 border border-zinc-700/50 px-4 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none focus:border-zinc-500 disabled:opacity-50 disabled:cursor-not-allowed"
+                  class="w-full resize-none bg-transparent px-4 py-3 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none disabled:opacity-50 disabled:cursor-not-allowed"
                 />
-                <Show
-                  when={isStreaming()}
-                  fallback={
-                    <button
-                      onClick={handleSubmit}
-                      disabled={!state.ready || (!input().trim() && pendingImages().length === 0)}
-                      class="rounded-xl w-10 h-10 flex items-center justify-center bg-zinc-700 hover:bg-zinc-600 transition-colors disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
-                    >
-                      <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M5 12l7-7 7 7M12 5v14" /></svg>
-                    </button>
-                  }
-                >
-                  <button
-                    onClick={() => interruptCoordinator()}
-                    class="rounded-xl w-10 h-10 flex items-center justify-center bg-red-900/50 text-red-300 hover:bg-red-900/70 transition-colors shrink-0"
-                    title="Interrupt (Ctrl+C)"
+                {/* Bottom toolbar */}
+                <div class="flex items-center justify-between px-3 py-2">
+                  {/* Agent selector */}
+                  <AgentSelector />
+                  {/* Send / Stop button */}
+                  <Show
+                    when={isStreaming()}
+                    fallback={
+                      <button
+                        onClick={handleSubmit}
+                        disabled={!state.ready || (!input().trim() && pendingImages().length === 0)}
+                        class="rounded-lg w-8 h-8 flex items-center justify-center bg-zinc-700 hover:bg-zinc-600 transition-colors disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
+                      >
+                        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M5 12l7-7 7 7M12 5v14" /></svg>
+                      </button>
+                    }
                   >
-                    <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M6 6h12v12H6z" /></svg>
-                  </button>
-                </Show>
+                    <button
+                      onClick={() => interruptCoordinator()}
+                      class="rounded-lg w-8 h-8 flex items-center justify-center bg-red-900/50 text-red-300 hover:bg-red-900/70 transition-colors shrink-0"
+                      title="Interrupt (Ctrl+C)"
+                    >
+                      <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M6 6h12v12H6z" /></svg>
+                    </button>
+                  </Show>
+                </div>
               </div>
             </div>
           </div>

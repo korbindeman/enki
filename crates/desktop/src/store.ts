@@ -22,8 +22,6 @@ export interface AppState {
   tasks: Task[];
   /** Coordinator-level error, if any. */
   error: string | null;
-  /** Name of the tool currently being called by the planner, if any. */
-  activeToolCall: string | null;
   /** Current git branch name. */
   currentBranch: string | null;
 }
@@ -36,7 +34,6 @@ const [state, setState] = createStore<AppState>({
   workerCount: 0,
   tasks: [],
   error: null,
-  activeToolCall: null,
   currentBranch: null,
 });
 
@@ -64,6 +61,7 @@ export async function sendPrompt(
         role: "user",
         content: text,
         streaming: false,
+        toolCalls: [],
       });
     }),
   );
@@ -96,7 +94,6 @@ export async function openProject(path: string): Promise<void> {
     workerCount: 0,
     tasks: [],
     error: null,
-    activeToolCall: null,
     currentBranch: null,
     projectCwd: path,
   });
@@ -118,6 +115,7 @@ function handleEvent(event: CoordinatorEvent): void {
             role: "system",
             content: "Coordinator initializing...",
             streaming: false,
+            toolCalls: [],
           });
           break;
 
@@ -142,6 +140,7 @@ function handleEvent(event: CoordinatorEvent): void {
               role: "assistant",
               content: event.content,
               streaming: true,
+              toolCalls: [],
             });
           }
           break;
@@ -155,13 +154,30 @@ function handleEvent(event: CoordinatorEvent): void {
           break;
         }
 
-        case "tool_call":
-          s.activeToolCall = event.name;
+        case "tool_call": {
+          const lastAsst = s.messages.findLast((m) => m.role === "assistant");
+          if (lastAsst) {
+            lastAsst.toolCalls.push({ name: event.name, done: false });
+          } else {
+            s.messages.push({
+              id: nextId(),
+              role: "assistant",
+              content: "",
+              streaming: true,
+              toolCalls: [{ name: event.name, done: false }],
+            });
+          }
           break;
+        }
 
-        case "tool_call_done":
-          s.activeToolCall = null;
+        case "tool_call_done": {
+          const lastAsst = s.messages.findLast((m) => m.role === "assistant");
+          if (lastAsst) {
+            const pending = lastAsst.toolCalls.find((tc) => !tc.done);
+            if (pending) pending.done = true;
+          }
           break;
+        }
 
         case "worker_spawned":
           s.workers.push({
@@ -300,6 +316,7 @@ function handleEvent(event: CoordinatorEvent): void {
             role: "system",
             content: `Error: ${event.message}`,
             streaming: false,
+            toolCalls: [],
           });
           break;
 

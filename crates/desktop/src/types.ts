@@ -53,6 +53,12 @@ export type CoordinatorEvent =
   | { type: "interrupted" }
   | { type: "error"; message: string };
 
+/** A tool call tracked on an assistant message. */
+export interface ToolCall {
+  name: string;
+  done: boolean;
+}
+
 /** A chat message displayed in the main panel. */
 export interface Message {
   id: string;
@@ -60,6 +66,8 @@ export interface Message {
   content: string;
   /** Set to true while the assistant is still streaming. */
   streaming: boolean;
+  /** Tool calls accumulated during this assistant turn. */
+  toolCalls: ToolCall[];
 }
 
 /** A tracked worker shown in the sidebar. */
