@@ -599,6 +599,19 @@ pub(super) fn tool_dag(args: &Value) -> Result<String, String> {
     Ok(ascii.render())
 }
 
+pub(super) fn tool_quick_task(args: &Value) -> Result<String, String> {
+    let prompt = args["prompt"]
+        .as_str()
+        .ok_or("missing required parameter: prompt")?;
+
+    write_signal_file(&json!({
+        "type": "quick_task",
+        "prompt": prompt,
+    }))?;
+
+    Ok("queued".to_string())
+}
+
 // --- Mail helpers ---
 
 /// Derive the caller's mail address from their role and task_id.

@@ -401,5 +401,19 @@ pub(super) fn all_tool_definitions() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "name": "enki_quick_task",
+            "description": "Dispatch a quick task to the sidecar agent. The sidecar works directly on main (no worktree), executes the task, and commits changes. Use for small edits, fixes, and commits that don't warrant a full worker.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "Task instructions for the sidecar agent"
+                    }
+                },
+                "required": ["prompt"]
+            }
+        }),
     ]
 }

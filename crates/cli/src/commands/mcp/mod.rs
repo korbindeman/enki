@@ -14,6 +14,7 @@ const PLANNER_TOOLS: &[&str] = &[
     "enki_task_list",
     "enki_task_retry",
     "enki_execution_create",
+    "enki_quick_task",
     "enki_pause",
     "enki_cancel",
     "enki_stop_all",
@@ -59,6 +60,11 @@ const MERGER_TOOLS: &[&str] = &[
     "enki_dag",
 ];
 
+const SIDECAR_TOOLS: &[&str] = &[
+    "enki_status",
+    "enki_task_list",
+];
+
 fn tools_for_role(role: &str, no_edit: bool) -> &'static [&'static str] {
     match role {
         "planner" => PLANNER_TOOLS,
@@ -70,6 +76,7 @@ fn tools_for_role(role: &str, no_edit: bool) -> &'static [&'static str] {
             }
         }
         "merger" => MERGER_TOOLS,
+        "sidecar" => SIDECAR_TOOLS,
         _ => &[],
     }
 }
@@ -184,6 +191,7 @@ fn handle_tools_call(id: Option<Value>, params: &Value, role: &str, task_id: Opt
         "enki_mail_inbox" => tool_mail_inbox(&my_addr),
         "enki_mail_reply" => tool_mail_reply(args, &my_addr),
         "enki_mail_thread" => tool_mail_thread(args),
+        "enki_quick_task" => tool_quick_task(args),
         _ => Err(format!("unknown tool: {tool_name}")),
     };
 
