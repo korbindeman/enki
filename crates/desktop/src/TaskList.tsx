@@ -11,7 +11,7 @@ const statusOrder: Record<TaskStatus, number> = {
 };
 
 const statusDot: Record<TaskStatus, string> = {
-  pending: "bg-zinc-500",
+  pending: "bg-text-muted",
   running: "bg-blue-400",
   completed: "bg-emerald-400",
   failed: "bg-red-400",
@@ -23,7 +23,7 @@ function MergeIndicator(props: { status: MergeStatus; flash: boolean }) {
       <span
         class="text-[10px] leading-none rounded px-1 py-0.5"
         classList={{
-          "bg-zinc-700 text-zinc-400": props.status === "queued",
+          "bg-button-bg text-text-muted": props.status === "queued",
           "bg-blue-900/60 text-blue-300": props.status === "merging",
           "bg-emerald-900/60 text-emerald-300": props.status === "landed",
           "bg-red-900/60 text-red-300":
@@ -48,14 +48,14 @@ function TaskRow(props: { task: Task }) {
   };
 
   return (
-    <div class="flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-zinc-800/40 transition-colors">
+    <div class="flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-surface/40 transition-colors">
       <span
         class={`inline-block w-2 h-2 rounded-full shrink-0 ${statusDot[props.task.status]}`}
         classList={{
           "animate-pulse": props.task.status === "running",
         }}
       />
-      <span class="text-sm text-zinc-300 truncate flex-1">
+      <span class="text-sm text-text truncate flex-1">
         {props.task.title}
       </span>
       <MergeIndicator
@@ -76,10 +76,10 @@ export default function TaskList() {
 
   return (
     <div>
-      <h2 class="text-[11px] font-medium text-zinc-500 tracking-wide mb-2 flex items-center justify-between">
+      <h2 class="text-[11px] font-medium text-text-muted tracking-wide mb-2 flex items-center justify-between">
         <span>Tasks</span>
         <Show when={state.tasks.length > 0}>
-          <span class="text-zinc-400 normal-case tracking-normal font-normal">
+          <span class="text-text-muted normal-case tracking-normal font-normal">
             {state.tasks.length}
           </span>
         </Show>
@@ -88,7 +88,7 @@ export default function TaskList() {
         <Show
           when={sorted().length > 0}
           fallback={
-            <div class="text-xs text-zinc-600 px-1">
+            <div class="text-xs text-text-faint px-1">
               No tasks yet
             </div>
           }

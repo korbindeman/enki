@@ -80,13 +80,13 @@ export default function Settings(props: { open: boolean; onClose: () => void }) 
         onClick={handleBackdrop}
         onKeyDown={handleKeydown}
       >
-        <div class="w-[420px] bg-zinc-800 border border-zinc-700/50 rounded-xl px-5 py-5 pb-7 shadow-xl">
+        <div class="w-[420px] bg-surface border border-border-subtle rounded-xl px-5 py-5 pb-7 shadow-xl">
           <Show when={!loading() && config()} fallback={
-            <div class="text-zinc-500 text-sm">Loading settings...</div>
+            <div class="text-text-muted text-sm">Loading settings...</div>
           }>
             <div class="space-y-3">
-              <h2 class="text-base font-semibold text-zinc-100 pb-1">Settings</h2>
-              <p class="text-xs text-zinc-500">
+              <h2 class="text-base font-semibold text-text pb-1">Settings</h2>
+              <p class="text-xs text-text-muted">
                 Global config (~/.config/enki.toml). Restart to apply changes.
               </p>
               <For each={settingsConfig}>
@@ -94,12 +94,12 @@ export default function Settings(props: { open: boolean; onClose: () => void }) 
                   const current = config()!;
 
                   if (setting.type === "separator") {
-                    return <hr class="border-zinc-700" />;
+                    return <hr class="border-border" />;
                   }
 
                   if (setting.type === "heading") {
                     return (
-                      <div class="text-xs font-medium text-zinc-400 uppercase tracking-wide pt-1">
+                      <div class="text-xs font-medium text-text-muted uppercase tracking-wide pt-1">
                         {setting.label}
                       </div>
                     );
@@ -111,11 +111,11 @@ export default function Settings(props: { open: boolean; onClose: () => void }) 
                     const hasChanged = value !== defaultValue;
                     return (
                       <div class="flex items-center justify-between">
-                        <label class="text-sm text-zinc-300">{setting.label}</label>
+                        <label class="text-sm text-text">{setting.label}</label>
                         <div class="flex items-center gap-2">
                           <Show when={hasChanged}>
                             <button
-                              class="text-xs text-zinc-500 hover:text-zinc-300 hover:underline"
+                              class="text-xs text-text-muted hover:text-text hover:underline"
                               onClick={() => resetField(setting.key)}
                             >
                               Reset
@@ -123,7 +123,7 @@ export default function Settings(props: { open: boolean; onClose: () => void }) 
                           </Show>
                           <div class="flex items-center">
                             <button
-                              class="w-7 h-7 flex items-center justify-center rounded-l border border-zinc-600 bg-zinc-700 text-zinc-300 hover:bg-zinc-600 text-sm"
+                              class="w-7 h-7 flex items-center justify-center rounded-l border border-border bg-button-bg text-text hover:bg-button-hover text-sm"
                               onClick={() => {
                                 const next = Math.max(setting.min, value - 1);
                                 updateField(setting.key, next);
@@ -133,7 +133,7 @@ export default function Settings(props: { open: boolean; onClose: () => void }) 
                             </button>
                             <input
                               type="number"
-                              class="w-12 h-7 text-center text-sm bg-zinc-900 border-y border-zinc-600 text-zinc-100 appearance-none [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                              class="w-12 h-7 text-center text-sm bg-input-bg border-y border-border text-text appearance-none [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
                               value={value}
                               min={setting.min}
                               max={setting.max}
@@ -145,7 +145,7 @@ export default function Settings(props: { open: boolean; onClose: () => void }) 
                               }}
                             />
                             <button
-                              class="w-7 h-7 flex items-center justify-center rounded-r border border-zinc-600 bg-zinc-700 text-zinc-300 hover:bg-zinc-600 text-sm"
+                              class="w-7 h-7 flex items-center justify-center rounded-r border border-border bg-button-bg text-text hover:bg-button-hover text-sm"
                               onClick={() => {
                                 const next = Math.min(setting.max, value + 1);
                                 updateField(setting.key, next);
@@ -165,11 +165,11 @@ export default function Settings(props: { open: boolean; onClose: () => void }) 
                     const hasChanged = value !== defaultValue;
                     return (
                       <div class="flex items-center justify-between">
-                        <label class="text-sm text-zinc-300">{setting.label}</label>
+                        <label class="text-sm text-text">{setting.label}</label>
                         <div class="flex items-center gap-2">
                           <Show when={hasChanged}>
                             <button
-                              class="text-xs text-zinc-500 hover:text-zinc-300 hover:underline"
+                              class="text-xs text-text-muted hover:text-text hover:underline"
                               onClick={() => resetField(setting.key)}
                             >
                               Reset
@@ -177,7 +177,7 @@ export default function Settings(props: { open: boolean; onClose: () => void }) 
                           </Show>
                           <input
                             type="text"
-                            class="w-48 h-7 px-2 text-sm bg-zinc-900 border border-zinc-600 rounded text-zinc-100 focus:outline-none focus:border-zinc-400"
+                            class="w-48 h-7 px-2 text-sm bg-input-bg border border-border rounded text-text focus:outline-none focus:border-text-muted"
                             value={value}
                             onInput={(e) => updateField(setting.key, e.currentTarget.value)}
                           />
@@ -192,11 +192,11 @@ export default function Settings(props: { open: boolean; onClose: () => void }) 
                     const hasChanged = value !== defaultValue;
                     return (
                       <div class="flex items-center justify-between">
-                        <label class="text-sm text-zinc-300">{setting.label}</label>
+                        <label class="text-sm text-text">{setting.label}</label>
                         <div class="flex items-center gap-2">
                           <Show when={hasChanged}>
                             <button
-                              class="text-xs text-zinc-500 hover:text-zinc-300 hover:underline"
+                              class="text-xs text-text-muted hover:text-text hover:underline"
                               onClick={() => resetField(setting.key)}
                             >
                               Reset
@@ -205,8 +205,8 @@ export default function Settings(props: { open: boolean; onClose: () => void }) 
                           <button
                             class={`w-5 h-5 rounded border flex items-center justify-center text-xs ${
                               value
-                                ? "bg-zinc-600 border-zinc-500 text-zinc-100"
-                                : "bg-zinc-900 border-zinc-600 text-transparent"
+                                ? "bg-button-hover border-border text-text"
+                                : "bg-input-bg border-border text-transparent"
                             }`}
                             onClick={() => updateField(setting.key, !value)}
                           >

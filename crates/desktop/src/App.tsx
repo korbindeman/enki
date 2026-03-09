@@ -67,7 +67,7 @@ function AgentSelector() {
     <div class="relative">
       <button
         onClick={() => setOpen((v) => !v)}
-        class="flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs text-zinc-400 hover:text-zinc-200 hover:bg-zinc-700/50 transition-colors"
+        class="flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs text-text-muted hover:text-text hover:bg-surface/50 transition-colors"
       >
         {AGENT_DISPLAY_NAMES[agent()]}
         <svg class="w-3 h-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
@@ -75,15 +75,15 @@ function AgentSelector() {
         </svg>
       </button>
       <Show when={open()}>
-        <div class="absolute bottom-full left-0 mb-1 rounded-lg bg-zinc-800 border border-zinc-700 shadow-xl py-1 min-w-[140px] z-10">
+        <div class="absolute bottom-full left-0 mb-1 rounded-lg bg-surface border border-border shadow-xl py-1 min-w-[140px] z-10">
           <For each={AGENT_KEYS}>
             {(key) => (
               <button
                 onClick={() => select(key)}
                 class={`w-full text-left px-3 py-1.5 text-xs transition-colors ${
                   key === agent()
-                    ? "text-zinc-100 bg-zinc-700/50"
-                    : "text-zinc-400 hover:text-zinc-200 hover:bg-zinc-700/30"
+                    ? "text-text bg-surface/50"
+                    : "text-text-muted hover:text-text hover:bg-surface/30"
                 }`}
               >
                 {AGENT_DISPLAY_NAMES[key]}
@@ -103,13 +103,13 @@ function ChatMessage(props: { message: Message }) {
   return (
     <Switch>
       <Match when={props.message.role === "system"}>
-        <div class="text-xs text-zinc-500 text-center py-3">
+        <div class="text-xs text-text-muted text-center py-3">
           {props.message.content}
         </div>
       </Match>
       <Match when={props.message.role === "user"}>
-        <div class="border-l-2 border-zinc-600 pl-4 py-3">
-          <div class="text-sm whitespace-pre-wrap text-zinc-100">
+        <div class="border-l-2 border-border pl-4 py-3">
+          <div class="text-sm whitespace-pre-wrap text-text">
             {props.message.content}
           </div>
         </div>
@@ -127,17 +127,17 @@ function ChatMessage(props: { message: Message }) {
           </Show>
           {/* Inline tool calls */}
           <Show when={props.message.toolCalls.length > 0}>
-            <div class="mt-3 border border-zinc-700/50 rounded-lg bg-zinc-800/30 px-4 py-3">
-              <div class="text-[10px] uppercase tracking-wider text-zinc-500 font-medium mb-2">
+            <div class="mt-3 border border-border-subtle rounded-lg bg-surface/30 px-4 py-3">
+              <div class="text-[10px] uppercase tracking-wider text-text-muted font-medium mb-2">
                 Tool calls ({props.message.toolCalls.length})
               </div>
               <For each={props.message.toolCalls}>
                 {(tc) => (
                   <div class="flex items-center gap-2 py-0.5">
                     <span
-                      class={`inline-block w-1.5 h-1.5 rounded-full shrink-0 ${tc.done ? "bg-zinc-600" : "bg-amber-500 animate-pulse"}`}
+                      class={`inline-block w-1.5 h-1.5 rounded-full shrink-0 ${tc.done ? "bg-text-faint" : "bg-amber-500 animate-pulse"}`}
                     />
-                    <span class="text-xs text-zinc-400 font-mono truncate">
+                    <span class="text-xs text-text-muted font-mono truncate">
                       {tc.name}
                     </span>
                   </div>
@@ -152,13 +152,13 @@ function ChatMessage(props: { message: Message }) {
                 when={activeToolCall()}
                 fallback={
                   <>
-                    <span class="inline-block w-1.5 h-1.5 rounded-full bg-zinc-400 animate-pulse" />
-                    <span class="text-xs text-zinc-500">Responding...</span>
+                    <span class="inline-block w-1.5 h-1.5 rounded-full bg-text-muted animate-pulse" />
+                    <span class="text-xs text-text-muted">Responding...</span>
                   </>
                 }
               >
                 <span class="inline-block w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
-                <span class="text-xs text-zinc-500">
+                <span class="text-xs text-text-muted">
                   Using {activeToolCall()!.name}
                 </span>
               </Show>
@@ -278,15 +278,15 @@ function App() {
   }
 
   return (
-    <div class="flex h-screen bg-zinc-900 text-zinc-100">
+    <div class="flex h-screen bg-background text-text">
       {/* Sidebar */}
-      <aside class="w-[260px] shrink-0 border-r border-zinc-800 bg-zinc-950 flex flex-col">
+      <aside class="w-[260px] shrink-0 border-r border-border bg-paper flex flex-col">
         <div class="px-4 py-3">
           <div class="flex items-center justify-between">
             <h1 class="text-lg font-semibold">Enki</h1>
             <button
               onClick={() => setSettingsOpen(true)}
-              class="text-zinc-500 hover:text-zinc-300 transition-colors"
+              class="text-text-muted hover:text-text transition-colors"
               title="Settings (⌘,)"
             >
               <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -296,11 +296,11 @@ function App() {
             </button>
           </div>
           <Show when={state.projectCwd}>
-            <div class="text-xs text-zinc-500 truncate mt-0.5 flex items-center gap-1.5">
+            <div class="text-xs text-text-muted truncate mt-0.5 flex items-center gap-1.5">
               <span title={state.projectCwd!}>{state.projectCwd!.split("/").pop()}</span>
               <Show when={state.currentBranch}>
-                <span class="text-zinc-600">/</span>
-                <span class="text-zinc-400">{state.currentBranch}</span>
+                <span class="text-text-faint">/</span>
+                <span class="text-text-muted">{state.currentBranch}</span>
               </Show>
             </div>
           </Show>
@@ -318,11 +318,11 @@ function App() {
           fallback={
             <div class="flex-1 flex items-center justify-center">
               <div class="text-center space-y-4">
-                <h2 class="text-lg font-semibold text-zinc-300">No project open</h2>
-                <p class="text-sm text-zinc-500">Use File &gt; Open Project, or click below.</p>
+                <h2 class="text-lg font-semibold text-text">No project open</h2>
+                <p class="text-sm text-text-muted">Use File &gt; Open Project, or click below.</p>
                 <button
                   onClick={handleOpenProject}
-                  class="rounded-lg bg-zinc-700 px-5 py-2.5 text-sm font-medium hover:bg-zinc-600 transition-colors"
+                  class="rounded-lg bg-button-bg px-5 py-2.5 text-sm font-medium hover:bg-button-hover transition-colors"
                 >
                   Open Project...
                 </button>
@@ -334,7 +334,7 @@ function App() {
           <div ref={messagesContainer} class="flex-1 overflow-y-auto">
             <div class="max-w-3xl mx-auto py-8 px-6">
               <Show when={state.messages.length === 0}>
-                <div class="text-zinc-500 text-sm pt-20 text-center">
+                <div class="text-text-muted text-sm pt-20 text-center">
                   Start a conversation to begin orchestrating...
                 </div>
               </Show>
@@ -346,9 +346,9 @@ function App() {
 
           {/* Input area */}
           <div class="relative">
-            <div class="absolute top-0 left-0 right-0 -translate-y-full bg-gradient-to-t from-zinc-900 to-transparent h-8 pointer-events-none" />
+            <div class="absolute top-0 left-0 right-0 -translate-y-full h-8 pointer-events-none" style="background: linear-gradient(to top, var(--color-background), transparent)" />
             <div class="px-6 py-3 pb-5">
-              <div class="max-w-3xl mx-auto rounded-2xl bg-zinc-800/50 border border-zinc-700/50 focus-within:border-zinc-500 transition-colors">
+              <div class="max-w-3xl mx-auto rounded-2xl bg-surface/50 border border-border-subtle focus-within:border-text-muted transition-colors">
                 {/* Pending images */}
                 <Show when={pendingImages().length > 0}>
                   <div class="px-4 pt-3 flex gap-2 flex-wrap">
@@ -358,11 +358,11 @@ function App() {
                           <img
                             src={img.url}
                             alt=""
-                            class="h-20 rounded-lg border border-zinc-600 object-cover"
+                            class="h-20 rounded-lg border border-border object-cover"
                           />
                           <button
                             onClick={() => removeImage(img.id)}
-                            class="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full bg-zinc-700 border border-zinc-500 text-zinc-300 flex items-center justify-center text-xs hover:bg-red-900 hover:border-red-700 hover:text-red-300 transition-colors opacity-0 group-hover:opacity-100"
+                            class="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full bg-button-bg border border-border text-text flex items-center justify-center text-xs hover:bg-red-900 hover:border-red-700 hover:text-red-300 transition-colors opacity-0 group-hover:opacity-100"
                           >
                             &times;
                           </button>
@@ -388,7 +388,7 @@ function App() {
                       : "Connecting..."
                   }
                   rows={1}
-                  class="w-full resize-none bg-transparent px-4 py-3 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none disabled:opacity-50 disabled:cursor-not-allowed"
+                  class="w-full resize-none bg-transparent px-4 py-3 text-sm text-text placeholder-text-muted focus:outline-none disabled:opacity-50 disabled:cursor-not-allowed"
                 />
                 {/* Bottom toolbar */}
                 <div class="flex items-center justify-between px-3 py-2">
@@ -401,7 +401,7 @@ function App() {
                       <button
                         onClick={handleSubmit}
                         disabled={!state.ready || (!input().trim() && pendingImages().length === 0)}
-                        class="rounded-lg w-8 h-8 flex items-center justify-center bg-zinc-700 hover:bg-zinc-600 transition-colors disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
+                        class="rounded-lg w-8 h-8 flex items-center justify-center bg-button-bg hover:bg-button-hover transition-colors disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
                       >
                         <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M5 12l7-7 7 7M12 5v14" /></svg>
                       </button>

@@ -14,7 +14,7 @@ function WorkerCard(props: {
       class="rounded-lg p-2.5 text-sm transition-colors"
       classList={{
         "bg-red-950/50 border border-red-800/50": props.failed,
-        "bg-zinc-800/50": !props.failed,
+        "bg-surface/50": !props.failed,
       }}
     >
       <div class="flex items-center gap-2 mb-1">
@@ -26,7 +26,7 @@ function WorkerCard(props: {
         >
           <span class="inline-block w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
         </Show>
-        <span class="font-medium text-zinc-200 truncate flex-1">
+        <span class="font-medium text-text truncate flex-1">
           {props.title}
         </span>
         <TierBadge tier={props.tier} />
@@ -35,7 +35,7 @@ function WorkerCard(props: {
         class="text-xs truncate pl-4"
         classList={{
           "text-red-400": props.failed,
-          "text-zinc-400": !props.failed,
+          "text-text-muted": !props.failed,
         }}
       >
         {props.activity}
@@ -47,10 +47,10 @@ function WorkerCard(props: {
 export default function WorkerPanel() {
   return (
     <div>
-      <h2 class="text-[11px] font-medium text-zinc-500 tracking-wide mb-2 flex items-center justify-between">
+      <h2 class="text-[11px] font-medium text-text-muted tracking-wide mb-2 flex items-center justify-between">
         <span>Workers</span>
         <Show when={state.workerCount > 0}>
-          <span class="text-zinc-400 normal-case tracking-normal font-normal">
+          <span class="text-text-muted normal-case tracking-normal font-normal">
             {state.workerCount} active
           </span>
         </Show>
@@ -59,7 +59,7 @@ export default function WorkerPanel() {
         <Show
           when={state.workers.length > 0}
           fallback={
-            <div class="text-xs text-zinc-600 px-1">
+            <div class="text-xs text-text-faint px-1">
               No active workers
             </div>
           }

@@ -5,7 +5,7 @@ const tierColors: Record<string, string> = {
 };
 
 export default function TierBadge(props: { tier: string }) {
-  const color = () => tierColors[props.tier] ?? "bg-zinc-700 text-zinc-300";
+  const color = () => tierColors[props.tier] ?? "bg-button-bg text-text";
   return (
     <span
       class={`inline-block rounded px-1.5 py-0.5 text-[10px] font-medium uppercase leading-none ${color()}`}
