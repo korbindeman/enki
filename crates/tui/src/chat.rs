@@ -119,6 +119,7 @@ pub struct ChatContext {
     panel: WorkerPanel,
     title_lines: Vec<Line>,
     streaming: bool,
+    pending_images: Vec<ImageData>,
 }
 
 impl ChatContext {
@@ -130,6 +131,7 @@ impl ChatContext {
             panel: WorkerPanel::new(),
             title_lines: Vec::new(),
             streaming: false,
+            pending_images: Vec::new(),
         }
     }
 
@@ -288,6 +290,36 @@ impl ChatContext {
     /// Send a desktop notification (auto-detects terminal support).
     pub fn notify(&self, message: &str) {
         notify::notify(message);
+    }
+
+    // ─── Images ──────────────────────────────────────────────
+
+    /// Add a pending image and update the attachment indicator.
+    fn add_pending_image(&mut self, data: ImageData) {
+        self.pending_images.push(data);
+        self.sync_attachment_label();
+    }
+
+    /// Take all pending images, clearing the attachment indicator.
+    fn take_pending_images(&mut self) -> Vec<ImageData> {
+        let images = std::mem::take(&mut self.pending_images);
+        self.sync_attachment_label();
+        images
+    }
+
+    /// Clear pending images and the attachment indicator.
+    fn clear_pending_images(&mut self) {
+        self.pending_images.clear();
+        self.sync_attachment_label();
+    }
+
+    fn sync_attachment_label(&mut self) {
+        let label = match self.pending_images.len() {
+            0 => None,
+            1 => Some("\u{1f4ce} 1 image".to_string()),
+            n => Some(format!("\u{1f4ce} {n} images")),
+        };
+        self.canvas.set_attachment_label(label);
     }
 
     // ─── Internal ────────────────────────────────────────────
@@ -506,6 +538,27 @@ impl Chat {
                             }
                         }
 
+                        // Ctrl+C with pending images: clear them along with text
+                        if key.code == KeyCode::Char('c')
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
+                            && !cx.pending_images.is_empty()
+                        {
+                            cx.clear_pending_images();
+                        }
+
+                        // Ctrl+V: check clipboard for an image before text paste
+                        if key.code == KeyCode::Char('v')
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
+                        {
+                            if let Some((bytes, mime_type)) = paste_image_from_clipboard() {
+                                cx.add_pending_image(ImageData { bytes, mime_type });
+                                cx.canvas.update_bubble(&input);
+                                continue;
+                            }
+                            // No image — fall through to normal input handling
+                            // (terminal may deliver pasted text as key events)
+                        }
+
                         let old_ac_count = input
                             .autocomplete
                             .as_ref()
@@ -543,13 +596,15 @@ impl Chat {
                                 cx.canvas.scroll_to_bottom();
                                 cx.finish_stream_if_active();
                                 cx.canvas.print_lines(&lines::user_message(&text));
+                                let images = cx.take_pending_images();
                                 cx.canvas.update_bubble(&input);
                                 cx.indicator.set_activity(Activity::Thinking);
                                 cx.sync_status_bar();
-                                handler.on_submit(UserInput::from(text), &mut cx);
+                                handler.on_submit(UserInput { text, images }, &mut cx);
                             }
                             InputAction::Interrupt => {
                                 cx.canvas.set_hint(None);
+                                cx.clear_pending_images();
                                 if old_ac_count > 0 {
                                     cx.canvas.clear_autocomplete(old_ac_count);
                                 }

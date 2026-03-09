@@ -99,6 +99,8 @@ pub struct Canvas {
     cached_cursor: usize,
     /// Hint text shown in the input bubble when input is empty.
     hint: Option<String>,
+    /// Label shown in the bottom border of the input bubble (e.g. "📎 1 image").
+    attachment_label: Option<String>,
 
     /// Status bar lines rendered between the scroll region and the input bubble.
     /// Empty when no status bar is visible.
@@ -165,6 +167,7 @@ impl Canvas {
             cached_input_text: String::new(),
             cached_cursor: 0,
             hint: None,
+            attachment_label: None,
             status_bar_lines: Vec::new(),
             status_bar_height: 0,
             banner_lines: Vec::new(),
@@ -811,6 +814,11 @@ impl Canvas {
         self.hint = hint;
     }
 
+    /// Set or clear the attachment label shown in the bubble bottom border.
+    pub fn set_attachment_label(&mut self, label: Option<String>) {
+        self.attachment_label = label;
+    }
+
     // ─── Status bar ──────────────────────────────────────
 
     /// Set the status bar content. Pass an empty slice to hide it.
@@ -1006,13 +1014,27 @@ impl Canvas {
             style::write_span(&mut self.out, &Span::styled(" │", border_fg.clone())).ok();
         }
 
-        // Bottom border
+        // Bottom border (with optional attachment label)
         let bottom_row = bubble_top + self.bubble_height - 1;
         write!(self.out, "\x1b[{bottom_row};1H").ok();
         write!(self.out, "{}", terminal::Clear(ClearType::CurrentLine)).ok();
+        let bottom_border = if let Some(label) = &self.attachment_label {
+            let label_display = format!(" {label} ");
+            let label_chars = label_display.chars().count();
+            let left_rule = 2; // "╰──"
+            let right_rule = (inner_w + 2).saturating_sub(left_rule + label_chars);
+            format!(
+                "╰{}{}{}╯",
+                "─".repeat(left_rule),
+                label_display,
+                "─".repeat(right_rule),
+            )
+        } else {
+            format!("╰{horiz}╯")
+        };
         style::write_span(
             &mut self.out,
-            &Span::styled(format!("╰{horiz}╯"), Style::new().fg(Color::DarkGrey)),
+            &Span::styled(bottom_border, Style::new().fg(Color::DarkGrey)),
         )
         .ok();
 
