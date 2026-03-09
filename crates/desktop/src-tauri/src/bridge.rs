@@ -274,6 +274,9 @@ pub enum CoordinatorEvent {
     WorkerCount { count: usize },
     AllStopped { count: usize },
     Mail { from: String, to: String, subject: String, priority: String },
+    SidecarStarted { prompt: String },
+    SidecarUpdate { activity: WorkerActivityEvent },
+    SidecarCompleted,
     Connected,
     Ready,
     Interrupted,
@@ -331,6 +334,17 @@ fn to_event(msg: FromCoordinator) -> CoordinatorEvent {
             CoordinatorEvent::AllStopped { count },
         FromCoordinator::Mail { from, to, subject, priority } =>
             CoordinatorEvent::Mail { from, to, subject, priority },
+        FromCoordinator::SidecarStarted { prompt } =>
+            CoordinatorEvent::SidecarStarted { prompt },
+        FromCoordinator::SidecarUpdate { activity } => {
+            let activity = match activity {
+                WorkerActivity::ToolStarted(name) => WorkerActivityEvent::ToolStarted { name },
+                WorkerActivity::ToolDone => WorkerActivityEvent::ToolDone,
+                WorkerActivity::Thinking => WorkerActivityEvent::Thinking,
+            };
+            CoordinatorEvent::SidecarUpdate { activity }
+        }
+        FromCoordinator::SidecarCompleted => CoordinatorEvent::SidecarCompleted,
         FromCoordinator::Interrupted => CoordinatorEvent::Interrupted,
         FromCoordinator::Error(message) => CoordinatorEvent::Error { message },
     }

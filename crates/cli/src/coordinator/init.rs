@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 
 use super::prompts::build_system_prompt;
 use super::session::CoordinatorSession;
+use super::sidecar::{self, SidecarSession};
 use super::tracker::WorkerTracker;
 use super::workers::{MergerAgentDone, WorkerDone};
 use super::{FromCoordinator, Runtime, WorkerActivity};
@@ -20,6 +21,8 @@ pub(super) struct InitState {
     pub prompt_done_rx: mpsc::UnboundedReceiver<super::session::PromptResult>,
     pub worker_done_rx: mpsc::UnboundedReceiver<WorkerDone>,
     pub merger_agent_done_rx: mpsc::UnboundedReceiver<MergerAgentDone>,
+    pub sidecar: SidecarSession,
+    pub sidecar_done_rx: mpsc::UnboundedReceiver<sidecar::SidecarResult>,
     pub enki_dir: PathBuf,
     pub enki_session_id: String,
     pub poll_interval: tokio::time::Interval,
@@ -134,11 +137,41 @@ pub(super) async fn initialize(
 
     let (coord, prompt_done_rx) = CoordinatorSession::new(coord_session_id);
 
+    // Create sidecar ACP session (works in project root, no worktree).
+    let sidecar_mcp = vec![enki_acp::acp_schema::McpServer::Stdio(
+        enki_acp::acp_schema::McpServerStdio::new("enki", &enki_bin)
+            .args(vec!["mcp".into(), "--role".into(), "sidecar".into()]),
+    )];
+
+    let sidecar_session_id = match mgr
+        .start_session_with_mcp(
+            agent_cmd.program.to_str().unwrap(),
+            &args_ref,
+            cwd.clone(),
+            sidecar_mcp,
+            "sidecar",
+            true, // sonnet_only — fast and cheap for quick tasks
+        )
+        .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            let _ = tx.send(FromCoordinator::Error(format!(
+                "failed to start sidecar: {e}"
+            )));
+            return None;
+        }
+    };
+
+    let (sidecar, sidecar_done_rx) = SidecarSession::new(sidecar_session_id);
+
     // Unified on_update callback routing by session_id.
     let tracker = std::rc::Rc::new(std::cell::RefCell::new(WorkerTracker::new()));
     {
         let coord_sid = coord.session_id.clone();
+        let sidecar_sid = sidecar.session_id.clone();
         let forward_flag = coord.forward_updates.clone();
+        let forward_sidecar = sidecar.forward_updates.clone();
         let tx_updates = tx.clone();
         let tracker_cb = tracker.clone();
         mgr.on_update(move |session_id, update| {
@@ -153,6 +186,17 @@ pub(super) async fn initialize(
                     SessionUpdate::Plan(_) => return,
                 };
                 let _ = tx_updates.send(msg);
+            } else if session_id == sidecar_sid {
+                if !forward_sidecar.get() {
+                    return;
+                }
+                let activity = match update {
+                    SessionUpdate::ToolCallStarted { title, .. } => WorkerActivity::ToolStarted(title),
+                    SessionUpdate::ToolCallDone { .. } => WorkerActivity::ToolDone,
+                    SessionUpdate::Text(_) => WorkerActivity::Thinking,
+                    SessionUpdate::Plan(_) => return,
+                };
+                let _ = tx_updates.send(FromCoordinator::SidecarUpdate { activity });
             } else {
                 let mut t = tracker_cb.borrow_mut();
                 t.last_activity
@@ -209,6 +253,25 @@ pub(super) async fn initialize(
         }
     }
 
+    // Send sidecar system prompt.
+    let sidecar_prompt = "You are a quick-task sidecar agent for the Enki coding orchestrator. \
+        You work directly on the main branch in the project root directory. \
+        Your job is to handle small, focused tasks: fixing typos, making config changes, \
+        committing code, running quick checks. \
+        After making any file changes, ALWAYS commit them with a clear, concise commit message. \
+        Keep your changes small and focused. Do not create branches or worktrees.";
+    let sidecar_content = vec![enki_acp::acp_schema::ContentBlock::Text(
+        enki_acp::acp_schema::TextContent::new(sidecar_prompt.to_string()),
+    )];
+    match mgr.prompt(&sidecar.session_id, sidecar_content).await {
+        Ok(_) => {
+            sidecar.forward_updates.set(true);
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "sidecar system prompt failed (non-fatal)");
+        }
+    }
+
     let mut poll_interval = tokio::time::interval(std::time::Duration::from_secs(3));
     poll_interval.tick().await;
 
@@ -259,6 +322,8 @@ pub(super) async fn initialize(
         prompt_done_rx,
         worker_done_rx,
         merger_agent_done_rx,
+        sidecar,
+        sidecar_done_rx,
         enki_dir,
         enki_session_id,
         poll_interval,

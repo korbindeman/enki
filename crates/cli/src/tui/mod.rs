@@ -201,6 +201,24 @@ impl Handler<FromCoordinator> for CoordinatorHandler<'_> {
                     Color::Cyan,
                 ));
             }
+            FromCoordinator::SidecarStarted { prompt } => {
+                let short = if prompt.len() > 60 { &prompt[..60] } else { &prompt };
+                cx.print(&lines::event(
+                    "⚡",
+                    &format!("Sidecar: {short}"),
+                    Color::DarkCyan,
+                ));
+            }
+            FromCoordinator::SidecarUpdate { .. } => {
+                // Sidecar activity updates are silent in TUI for now.
+            }
+            FromCoordinator::SidecarCompleted => {
+                cx.print(&lines::event(
+                    "✓",
+                    "Sidecar task completed",
+                    Color::Green,
+                ));
+            }
             FromCoordinator::Interrupted => {
                 cx.finish();
                 cx.clear_activity();

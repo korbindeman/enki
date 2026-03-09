@@ -6,6 +6,7 @@ use enki_core::types::{Id, MergeStatus, short_id};
 use tokio::sync::mpsc;
 
 use super::session::CoordinatorSession;
+use super::sidecar::SidecarSession;
 use super::workers::{self, MergerDone, try_dispatch_merge};
 use super::spawning::WorkerPrep;
 use super::{FromCoordinator, Runtime};
@@ -309,6 +310,7 @@ impl Runtime {
     pub(super) async fn poll_tick(
         &mut self,
         coord: &mut CoordinatorSession,
+        sidecar: &mut SidecarSession,
         enki_dir: &std::path::Path,
         merger_done_tx: &mpsc::UnboundedSender<MergerDone>,
         merge_in_progress: &mut bool,
@@ -320,6 +322,33 @@ impl Runtime {
             let _ = std::fs::remove_file(&stop_file);
             self.kill_all_workers();
             self.handle_command(Command::StopAll, coord).await;
+        }
+
+        // Intercept quick_task signal files BEFORE CheckSignals (which deletes all signal files).
+        let events_dir = enki_dir.join("events");
+        if let Ok(entries) = std::fs::read_dir(&events_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                // Peek at the content to check if it's a quick_task signal.
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    if let Ok(signal) = serde_json::from_str::<serde_json::Value>(&content) {
+                        if signal.get("type").and_then(|v| v.as_str()) == Some("quick_task") {
+                            // Consume the signal file before CheckSignals sees it.
+                            std::fs::remove_file(&path).ok();
+                            if let Some(prompt) = signal["prompt"].as_str() {
+                                tracing::info!("sidecar quick task dispatched");
+                                let _ = self.tx.send(FromCoordinator::SidecarStarted {
+                                    prompt: prompt.to_string(),
+                                });
+                                sidecar.dispatch(&self.mgr, prompt.to_string());
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Discover new work from DB (external MCP calls) + check signal files.

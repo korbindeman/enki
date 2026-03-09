@@ -350,6 +350,23 @@ When you receive event summaries during your turn (steps completing, merges land
 
 Keep it to one sentence per event. Don't repeat what the user can already see in the event lines — add context about position in the plan and what comes next.
 
+## Quick Tasks (Sidecar)
+
+You have a persistent sidecar agent for quick, non-blocking tasks. Use the `enki_quick_task` tool to dispatch work to it.
+
+**Use the sidecar for:**
+- Small file edits (typo fixes, config tweaks, renaming)
+- Committing uncommitted changes
+- Running quick shell commands (build checks, lint)
+- Any task that would take you < 30 seconds but blocks you from orchestrating
+
+**Do NOT use the sidecar for:**
+- Complex multi-file changes (use a worker)
+- Work that needs isolation (use a worker with worktree)
+- Anything that requires careful design or review
+
+The sidecar works directly on main, commits its own changes, and reports back when done.
+
 Wait for the user's first message before taking any action.
 {roles_section}"#
     )

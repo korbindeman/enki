@@ -3,6 +3,7 @@ mod init;
 mod merges;
 mod prompts;
 mod session;
+mod sidecar;
 mod spawning;
 mod tracker;
 mod workers;
@@ -112,6 +113,9 @@ pub enum FromCoordinator {
     },
     AllStopped { count: usize },
     WorkerCount(usize),
+    SidecarStarted { prompt: String },
+    SidecarUpdate { activity: WorkerActivity },
+    SidecarCompleted,
     Interrupted,
     Error(String),
 }
@@ -226,6 +230,7 @@ async fn coordinator_loop(
     let Some(init::InitState {
         mut rt, mut coord, mut prompt_done_rx,
         mut worker_done_rx, mut merger_agent_done_rx,
+        mut sidecar, mut sidecar_done_rx,
         enki_dir, enki_session_id, mut poll_interval,
     }) = init::initialize(cwd, db_path, enki_bin, agent_override, tx).await
     else {
@@ -259,8 +264,9 @@ async fn coordinator_loop(
                             coord.interrupt(&rt.mgr, &rt.tx).await;
                         }
                         ToCoordinator::Shutdown => {
-                            // Kill all workers before shutting down the coordinator session.
+                            // Kill all workers and sidecar before shutting down.
                             rt.kill_all_workers();
+                            sidecar.shutdown(&rt.mgr);
                             coord.shutdown(&rt.mgr);
                             break;
                         }
@@ -386,8 +392,17 @@ async fn coordinator_loop(
                     });
                 }
 
+                result = sidecar_done_rx.recv() => {
+                    if let Some((generation, result)) = result {
+                        if let Some(_prompt) = sidecar.handle_done(&rt.mgr, generation, result) {
+                            let _ = rt.tx.send(FromCoordinator::SidecarCompleted);
+                            coord.queue_event("- Sidecar quick task completed".to_string());
+                        }
+                    }
+                }
+
                 _ = poll_interval.tick() => {
-                    rt.poll_tick(&mut coord, &enki_dir, &merger_done_tx,
+                    rt.poll_tick(&mut coord, &mut sidecar, &enki_dir, &merger_done_tx,
                                  &mut merge_in_progress, &mut last_merge_statuses).await;
                 }
             }
