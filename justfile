@@ -33,7 +33,7 @@ release:
         n=$(echo "$tag" | grep -oE '[0-9]+$')
     fi
     version="${year}.${mmdd}.${n}"
-    sed -i '' "s/^version = \".*\"/version = \"${version}\"/" Cargo.toml
+    sed "s/^version = \".*\"/version = \"${version}\"/" Cargo.toml > Cargo.toml.tmp && mv Cargo.toml.tmp Cargo.toml
     cargo generate-lockfile --quiet
     git add Cargo.toml Cargo.lock
     git commit -m "release ${tag}"
