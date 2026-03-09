@@ -11,10 +11,15 @@ path = "src/main.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+enki = { path = "../cli" }
 enki-core = { path = "../core" }
 enki-acp = { path = "../acp" }
 tauri = { version = "2", features = [] }
+anyhow = "1"
+dirs = "6"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

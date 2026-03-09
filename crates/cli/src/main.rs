@@ -1,5 +1,6 @@
-mod commands;
 mod tui;
+
+use enki::commands;
 
 use clap::Parser;
 

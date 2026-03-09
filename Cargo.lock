@@ -1060,6 +1060,9 @@ dependencies = [
 name = "enki-desktop"
 version = "2026.308.0"
 dependencies = [
+ "anyhow",
+ "dirs",
+ "enki",
  "enki-acp",
  "enki-core",
  "serde",
@@ -1068,6 +1071,8 @@ dependencies = [
  "tauri-build",
  "tokio",
  "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
 ]
 
 [[package]]

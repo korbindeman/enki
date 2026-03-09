@@ -40,7 +40,7 @@ impl CoordinatorSession {
         mgr: &AgentManager,
         tx: &mpsc::UnboundedSender<FromCoordinator>,
         text: String,
-        images: Vec<enki_tui::ImageData>,
+        images: Vec<super::ImageData>,
     ) {
         if let Some(handle) = self.active_prompt.take() {
             let _ = mgr.cancel(&self.session_id).await;
@@ -117,7 +117,7 @@ impl CoordinatorSession {
 }
 
 /// Build ACP content blocks from text and optional images.
-fn build_content_blocks(text: String, images: Vec<enki_tui::ImageData>) -> Vec<acp::ContentBlock> {
+fn build_content_blocks(text: String, images: Vec<super::ImageData>) -> Vec<acp::ContentBlock> {
     let mut blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(text))];
     for image in images {
         let data = BASE64.encode(&image.bytes);

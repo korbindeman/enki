@@ -39,17 +39,23 @@ struct SessionStats {
     prompts_delivered: u32,
 }
 
-/// Messages sent from the TUI to the coordinator thread.
+/// Image attachment for prompts.
+pub struct ImageData {
+    pub bytes: Vec<u8>,
+    pub mime_type: String,
+}
+
+/// Messages sent to the coordinator thread.
 #[allow(dead_code)]
 pub enum ToCoordinator {
-    Prompt { text: String, images: Vec<enki_tui::ImageData> },
+    Prompt { text: String, images: Vec<ImageData> },
     Interrupt,
     Shutdown,
     /// Stop all running workers immediately.
     StopAll,
 }
 
-/// Messages sent from the coordinator thread back to the TUI.
+/// Messages sent from the coordinator thread back to the UI.
 #[derive(Debug)]
 #[allow(dead_code)]
 pub enum FromCoordinator {
@@ -110,11 +116,11 @@ pub enum FromCoordinator {
     Error(String),
 }
 
-/// Handle held by the TUI to communicate with the coordinator.
+/// Handle held by the caller to communicate with the coordinator.
 pub struct CoordinatorHandle {
     pub tx: mpsc::UnboundedSender<ToCoordinator>,
     pub rx: mpsc::UnboundedReceiver<FromCoordinator>,
-    pub(super) join_handle: Option<std::thread::JoinHandle<()>>,
+    pub join_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 /// Spawn the coordinator on a dedicated OS thread with its own tokio runtime + LocalSet.

@@ -1,21 +1,18 @@
-mod coordinator;
-
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use enki::coordinator::{self, FromCoordinator, ToCoordinator, WorkerActivity};
 use enki_tui::chat::{Chat, ChatContext, Handler, UserInput};
 use enki_tui::lines;
 use enki_tui::{Color, KeyCode, KeyModifiers};
 use tokio::sync::mpsc::error::TryRecvError;
-
-use coordinator::{FromCoordinator, ToCoordinator, WorkerActivity};
 
 const PROMPT: &str = "› ";
 
 /// Run the chat interface. This takes over terminal input (raw mode)
 /// with a pinned input bubble at the bottom.
 pub async fn run(_db: enki_core::db::Db, db_path: String, enki_bin: PathBuf) -> anyhow::Result<()> {
-    let project_cwd = crate::commands::project_root()?;
+    let project_cwd = enki::commands::project_root()?;
     let project_name = project_cwd
         .file_name()
         .unwrap_or_default()
@@ -225,7 +222,11 @@ impl Handler<FromCoordinator> for CoordinatorHandler<'_> {
     }
 
     fn on_submit(&mut self, input: UserInput, _cx: &mut ChatContext) {
-        let _ = self.tx.send(ToCoordinator::Prompt { text: input.text, images: input.images });
+        let images = input.images.into_iter().map(|img| coordinator::ImageData {
+            bytes: img.bytes,
+            mime_type: img.mime_type,
+        }).collect();
+        let _ = self.tx.send(ToCoordinator::Prompt { text: input.text, images });
     }
 
     fn on_interrupt(&mut self) {
