@@ -149,7 +149,9 @@ impl Orchestrator {
             };
             for dep in &step.needs {
                 if let Some(dep_task_id) = task_ids.get(&dep.step_id) {
-                    let _ = self.db.insert_dependency(task_id, dep_task_id);
+                    if let Err(e) = self.db.insert_dependency(task_id, dep_task_id) {
+                        tracing::warn!(task_id = %task_id, dep = %dep_task_id, error = %e, "failed to persist dependency");
+                    }
                 }
             }
         }
@@ -219,8 +221,14 @@ impl Orchestrator {
             status: ExecutionStatus::Running,
             created_at: now,
         };
-        let _ = self.db.insert_execution(&execution);
-        let _ = self.db.insert_execution_step(&exec_id, step_id, &task_id);
+        if let Err(e) = self.db.insert_execution(&execution) {
+            tracing::warn!(execution_id = %exec_id, error = %e, "failed to persist execution");
+            return vec![Event::StatusMessage(format!("failed to persist execution: {e}"))];
+        }
+        if let Err(e) = self.db.insert_execution_step(&exec_id, step_id, &task_id) {
+            tracing::warn!(execution_id = %exec_id, error = %e, "failed to persist execution step");
+            return vec![Event::StatusMessage(format!("failed to persist execution step: {e}"))];
+        }
 
         let dag = Dag::single(
             step_id,
@@ -298,7 +306,9 @@ impl Orchestrator {
             };
             for dep in &step.needs {
                 if let Some(dep_task_id) = all_task_ids.get(&dep.step_id) {
-                    let _ = self.db.insert_dependency(task_id, dep_task_id);
+                    if let Err(e) = self.db.insert_dependency(task_id, dep_task_id) {
+                        tracing::warn!(task_id = %task_id, dep = %dep_task_id, error = %e, "failed to persist dependency");
+                    }
                 }
             }
         }
@@ -347,7 +357,9 @@ impl Orchestrator {
             WorkerOutcome::Success { output } => {
                 // Store output.
                 if let Some(ref out) = output {
-                    let _ = self.db.insert_task_output(&result.task_id, out);
+                    if let Err(e) = self.db.insert_task_output(&result.task_id, out) {
+                        tracing::warn!(task_id = %result.task_id, error = %e, "failed to persist task output");
+                    }
                 }
                 self.monitor.clear_retries(&result.task_id.0);
 
@@ -374,8 +386,14 @@ impl Orchestrator {
                     started_at: None,
                     merged_at: None,
                 };
-                let _ = self.db.insert_merge_request(&mr);
-                let _ = self.db.update_task_status(&result.task_id, TaskStatus::Done);
+                if let Err(e) = self.db.insert_merge_request(&mr) {
+                    tracing::warn!(mr_id = %mr.id, task_id = %result.task_id, error = %e, "failed to persist merge request");
+                    events.push(Event::StatusMessage(format!("failed to persist merge request for task {}: {e}", result.task_id)));
+                }
+                if let Err(e) = self.db.update_task_status(&result.task_id, TaskStatus::Done) {
+                    tracing::warn!(task_id = %result.task_id, error = %e, "failed to update task status to Done");
+                    events.push(Event::StatusMessage(format!("failed to update task status: {e}")));
+                }
 
                 // Mark worker done in the DAG — enables Completed/Started edges.
                 // step_completed() is called later in merge_done() when the merge lands.
@@ -392,10 +410,15 @@ impl Orchestrator {
             WorkerOutcome::Artifact { output } => {
                 // Store output.
                 if let Some(ref out) = output {
-                    let _ = self.db.insert_task_output(&result.task_id, out);
+                    if let Err(e) = self.db.insert_task_output(&result.task_id, out) {
+                        tracing::warn!(task_id = %result.task_id, error = %e, "failed to persist task output");
+                    }
                 }
                 self.monitor.clear_retries(&result.task_id.0);
-                let _ = self.db.update_task_status(&result.task_id, TaskStatus::Done);
+                if let Err(e) = self.db.update_task_status(&result.task_id, TaskStatus::Done) {
+                    tracing::warn!(task_id = %result.task_id, error = %e, "failed to update task status to Done");
+                    events.push(Event::StatusMessage(format!("failed to update task status: {e}")));
+                }
 
                 // Artifact steps skip the merge — mark both worker_done and
                 // step_completed immediately so dependents can proceed.
@@ -447,9 +470,13 @@ impl Orchestrator {
                         error: format!("{error} (retrying)"),
                     });
                 } else {
-                    let _ = self
+                    if let Err(e) = self
                         .db
-                        .update_task_status(&result.task_id, TaskStatus::Failed);
+                        .update_task_status(&result.task_id, TaskStatus::Failed)
+                    {
+                        tracing::warn!(task_id = %result.task_id, error = %e, "failed to update task status to Failed");
+                        events.push(Event::StatusMessage(format!("failed to update task status: {e}")));
+                    }
 
                     events.push(Event::WorkerFailed {
                         task_id: result.task_id.0.clone(),
@@ -477,9 +504,13 @@ impl Orchestrator {
                         error: format!("{error} (retrying)"),
                     });
                 } else {
-                    let _ = self
+                    if let Err(e) = self
                         .db
-                        .update_task_status(&result.task_id, TaskStatus::Failed);
+                        .update_task_status(&result.task_id, TaskStatus::Failed)
+                    {
+                        tracing::warn!(task_id = %result.task_id, error = %e, "failed to update task status to Failed");
+                        events.push(Event::StatusMessage(format!("failed to update task status: {e}")));
+                    }
 
                     events.push(Event::WorkerFailed {
                         task_id: result.task_id.0.clone(),
@@ -546,11 +577,15 @@ impl Orchestrator {
                 }
             }
             MergeOutcome::Conflicted(ref detail) => {
-                let _ = self.db.update_merge_status(&mr.id, MergeStatus::Conflicted);
-                let _ = self.db.update_merge_review_note(&mr.id, detail);
-                let _ = self
-                    .db
-                    .update_task_status(&mr.task_id, TaskStatus::Blocked);
+                if let Err(e) = self.db.update_merge_status(&mr.id, MergeStatus::Conflicted) {
+                    tracing::warn!(mr_id = %mr.id, error = %e, "failed to update merge status to Conflicted");
+                }
+                if let Err(e) = self.db.update_merge_review_note(&mr.id, detail) {
+                    tracing::warn!(mr_id = %mr.id, error = %e, "failed to update merge review note");
+                }
+                if let Err(e) = self.db.update_task_status(&mr.task_id, TaskStatus::Blocked) {
+                    tracing::warn!(task_id = %mr.task_id, error = %e, "failed to update task status to Blocked");
+                }
                 if let (Some(eid), Some(sid)) = (&mr.execution_id, &mr.step_id) {
                     self.scheduler.step_failed(&eid.0, sid);
                 }
@@ -565,13 +600,17 @@ impl Orchestrator {
                 ref conflict_files,
                 ref conflict_diff,
             } => {
-                let _ = self.db.update_merge_status(&mr.id, MergeStatus::Resolving);
+                if let Err(e) = self.db.update_merge_status(&mr.id, MergeStatus::Resolving) {
+                    tracing::warn!(mr_id = %mr.id, error = %e, "failed to update merge status to Resolving");
+                }
                 let detail = format!(
                     "merge conflict in {} file(s): {}",
                     conflict_files.len(),
                     conflict_files.join(", ")
                 );
-                let _ = self.db.update_merge_review_note(&mr.id, &detail);
+                if let Err(e) = self.db.update_merge_review_note(&mr.id, &detail) {
+                    tracing::warn!(mr_id = %mr.id, error = %e, "failed to update merge review note");
+                }
                 events.push(Event::MergeNeedsResolution {
                     mr_id: mr.id.0.clone(),
                     task_id: mr.task_id.clone(),
@@ -582,11 +621,15 @@ impl Orchestrator {
                 });
             }
             MergeOutcome::VerifyFailed(ref detail) => {
-                let _ = self.db.update_merge_status(&mr.id, MergeStatus::Failed);
-                let _ = self.db.update_merge_review_note(&mr.id, detail);
-                let _ = self
-                    .db
-                    .update_task_status(&mr.task_id, TaskStatus::Failed);
+                if let Err(e) = self.db.update_merge_status(&mr.id, MergeStatus::Failed) {
+                    tracing::warn!(mr_id = %mr.id, error = %e, "failed to update merge status to Failed");
+                }
+                if let Err(e) = self.db.update_merge_review_note(&mr.id, detail) {
+                    tracing::warn!(mr_id = %mr.id, error = %e, "failed to update merge review note");
+                }
+                if let Err(e) = self.db.update_task_status(&mr.task_id, TaskStatus::Failed) {
+                    tracing::warn!(task_id = %mr.task_id, error = %e, "failed to update task status to Failed");
+                }
                 if let (Some(eid), Some(sid)) = (&mr.execution_id, &mr.step_id) {
                     self.scheduler.step_failed(&eid.0, sid);
                 }
@@ -598,11 +641,15 @@ impl Orchestrator {
                 });
             }
             MergeOutcome::Failed(ref detail) => {
-                let _ = self.db.update_merge_status(&mr.id, MergeStatus::Failed);
-                let _ = self.db.update_merge_review_note(&mr.id, detail);
-                let _ = self
-                    .db
-                    .update_task_status(&mr.task_id, TaskStatus::Failed);
+                if let Err(e) = self.db.update_merge_status(&mr.id, MergeStatus::Failed) {
+                    tracing::warn!(mr_id = %mr.id, error = %e, "failed to update merge status to Failed");
+                }
+                if let Err(e) = self.db.update_merge_review_note(&mr.id, detail) {
+                    tracing::warn!(mr_id = %mr.id, error = %e, "failed to update merge review note");
+                }
+                if let Err(e) = self.db.update_task_status(&mr.task_id, TaskStatus::Failed) {
+                    tracing::warn!(task_id = %mr.task_id, error = %e, "failed to update task status to Failed");
+                }
                 if let (Some(eid), Some(sid)) = (&mr.execution_id, &mr.step_id) {
                     self.scheduler.step_failed(&eid.0, sid);
                 }
@@ -622,7 +669,9 @@ impl Orchestrator {
 
     fn retry_task(&mut self, task_id: Id) -> Vec<Event> {
         // Reset the task to Pending in the DB.
-        let _ = self.db.update_task_status(&task_id, TaskStatus::Pending);
+        if let Err(e) = self.db.update_task_status(&task_id, TaskStatus::Pending) {
+            tracing::warn!(task_id = %task_id, error = %e, "failed to update task status to Pending for retry");
+        }
         self.monitor.clear_retries(&task_id.0);
 
         // Find the execution and step for this task, then retry in the DAG.
@@ -644,9 +693,12 @@ impl Orchestrator {
                 if let Ok(exec) = self.db.get_running_executions(None)
                     && let Some(e) = exec.iter().find(|e| e.id.0 == exec_id)
                 {
-                    let _ = self
+                    if let Err(e2) = self
                         .db
-                        .update_execution_status(&e.id, ExecutionStatus::Paused);
+                        .update_execution_status(&e.id, ExecutionStatus::Paused)
+                    {
+                        tracing::warn!(execution_id = %e.id, error = %e2, "failed to update execution status to Paused");
+                    }
                 }
             }
             Target::Node {
@@ -668,9 +720,12 @@ impl Orchestrator {
                 if let Ok(exec) = self.db.get_running_executions(None)
                     && let Some(e) = exec.iter().find(|e| e.id.0 == exec_id)
                 {
-                    let _ = self
+                    if let Err(e2) = self
                         .db
-                        .update_execution_status(&e.id, ExecutionStatus::Running);
+                        .update_execution_status(&e.id, ExecutionStatus::Running)
+                    {
+                        tracing::warn!(execution_id = %e.id, error = %e2, "failed to update execution status to Running");
+                    }
                 }
                 self.tick_scheduler()
             }
@@ -690,14 +745,19 @@ impl Orchestrator {
             Target::Execution(exec_id) => {
                 let to_kill = self.scheduler.cancel_execution(&exec_id);
                 for (task_id, session_id) in to_kill {
-                    let _ = self.db.update_task_status(&task_id, TaskStatus::Cancelled);
+                    if let Err(e) = self.db.update_task_status(&task_id, TaskStatus::Cancelled) {
+                        tracing::warn!(task_id = %task_id, error = %e, "failed to update task status to Cancelled");
+                    }
                     events.push(Event::KillSession { session_id });
                 }
                 // Update execution status.
                 let eid = Id(exec_id);
-                let _ = self
+                if let Err(e) = self
                     .db
-                    .update_execution_status(&eid, ExecutionStatus::Aborted);
+                    .update_execution_status(&eid, ExecutionStatus::Aborted)
+                {
+                    tracing::warn!(execution_id = %eid, error = %e, "failed to update execution status to Aborted");
+                }
             }
             Target::Node {
                 execution_id,
@@ -717,7 +777,9 @@ impl Orchestrator {
         let count = aborted.len();
         let mut events = Vec::new();
         for (_exec_id, _step_id, task_id) in &aborted {
-            let _ = self.db.update_task_status(task_id, TaskStatus::Failed);
+            if let Err(e) = self.db.update_task_status(task_id, TaskStatus::Failed) {
+                tracing::warn!(task_id = %task_id, error = %e, "failed to update task status to Failed during stop_all");
+            }
         }
         events.push(Event::AllStopped { count });
         events
@@ -781,8 +843,12 @@ impl Orchestrator {
                     status: ExecutionStatus::Running,
                     created_at: chrono::Utc::now(),
                 };
-                let _ = self.db.insert_execution(&execution);
-                let _ = self.db.insert_execution_step(&exec_id, step_id, &task.id);
+                if let Err(e) = self.db.insert_execution(&execution) {
+                    tracing::warn!(execution_id = %exec_id, error = %e, "failed to persist standalone execution");
+                }
+                if let Err(e) = self.db.insert_execution_step(&exec_id, step_id, &task.id) {
+                    tracing::warn!(execution_id = %exec_id, error = %e, "failed to persist standalone execution step");
+                }
 
                 self.scheduler.add_execution(
                     exec_id,
@@ -923,7 +989,10 @@ impl Orchestrator {
                     ..
                 } => {
                     // Update task status in DB.
-                    let _ = self.db.update_task_status(task_id, TaskStatus::Running);
+                    if let Err(e) = self.db.update_task_status(task_id, TaskStatus::Running) {
+                        tracing::warn!(task_id = %task_id, error = %e, "failed to update task status to Running");
+                        events.push(Event::StatusMessage(format!("failed to update task status: {e}")));
+                    }
 
                     events.push(Event::SpawnWorker {
                         task_id: task_id.clone(),
@@ -941,20 +1010,28 @@ impl Orchestrator {
                     execution_id: _,
                     step_id: _,
                 } => {
-                    let _ = self.db.update_task_status(task_id, TaskStatus::Blocked);
+                    if let Err(e) = self.db.update_task_status(task_id, TaskStatus::Blocked) {
+                        tracing::warn!(task_id = %task_id, error = %e, "failed to update task status to Blocked");
+                    }
                 }
                 SchedulerAction::ExecutionComplete { execution_id } => {
-                    let _ = self
+                    if let Err(e) = self
                         .db
-                        .update_execution_status(execution_id, ExecutionStatus::Done);
+                        .update_execution_status(execution_id, ExecutionStatus::Done)
+                    {
+                        tracing::warn!(execution_id = %execution_id, error = %e, "failed to update execution status to Done");
+                    }
                     events.push(Event::ExecutionComplete {
                         execution_id: execution_id.0.clone(),
                     });
                 }
                 SchedulerAction::ExecutionFailed { execution_id } => {
-                    let _ = self
+                    if let Err(e) = self
                         .db
-                        .update_execution_status(execution_id, ExecutionStatus::Failed);
+                        .update_execution_status(execution_id, ExecutionStatus::Failed)
+                    {
+                        tracing::warn!(execution_id = %execution_id, error = %e, "failed to update execution status to Failed");
+                    }
                     events.push(Event::ExecutionFailed {
                         execution_id: execution_id.0.clone(),
                     });
@@ -1048,7 +1125,9 @@ impl Orchestrator {
             return false;
         }
         let retry_count = self.monitor.record_retry(&task_id.0);
-        let _ = self.db.update_task_status(task_id, TaskStatus::Pending);
+        if let Err(e) = self.db.update_task_status(task_id, TaskStatus::Pending) {
+            tracing::warn!(task_id = %task_id, error = %e, "failed to update task status to Pending for retry");
+        }
 
         // Reset the DAG node from Failed back to Pending/Ready.
         if let (Some(eid), Some(sid)) = (execution_id, step_id) {
