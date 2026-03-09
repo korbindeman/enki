@@ -1,28 +1,18 @@
+import WorkerPanel from "./WorkerPanel";
+import TaskList from "./TaskList";
+
 function App() {
   return (
     <div class="flex h-screen bg-zinc-900 text-zinc-100">
       {/* Sidebar */}
       <aside class="w-[300px] shrink-0 border-r border-zinc-700 bg-zinc-950 flex flex-col">
-        <div class="p-4 border-b border-zinc-700">
+        <div class="px-4 py-3 border-b border-zinc-700">
           <h1 class="text-lg font-semibold">Enki</h1>
         </div>
-        <div class="flex-1 overflow-y-auto p-4">
-          <h2 class="text-sm font-medium text-zinc-400 uppercase tracking-wide mb-3">
-            Workers
-          </h2>
-          <div class="space-y-2">
-            <div class="rounded-lg bg-zinc-800 p-3 text-sm text-zinc-300">
-              No active workers
-            </div>
-          </div>
-          <h2 class="text-sm font-medium text-zinc-400 uppercase tracking-wide mt-6 mb-3">
-            Tasks
-          </h2>
-          <div class="space-y-2">
-            <div class="rounded-lg bg-zinc-800 p-3 text-sm text-zinc-300">
-              No tasks yet
-            </div>
-          </div>
+        <div class="flex-1 overflow-y-auto p-3 space-y-5">
+          <WorkerPanel />
+          <div class="border-t border-zinc-800" />
+          <TaskList />
         </div>
       </aside>
 

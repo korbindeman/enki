@@ -1,7 +1,7 @@
 import { createStore, produce } from "solid-js/store";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
-import type { CoordinatorEvent, Message, Worker } from "./types";
+import type { CoordinatorEvent, Message, Task, Worker } from "./types";
 
 // ---------------------------------------------------------------------------
 // State
@@ -16,6 +16,8 @@ export interface AppState {
   workers: Worker[];
   /** Total worker count (includes workers not yet in the list). */
   workerCount: number;
+  /** Persistent task list (survives worker lifecycle). */
+  tasks: Task[];
   /** Coordinator-level error, if any. */
   error: string | null;
 }
@@ -25,6 +27,7 @@ const [state, setState] = createStore<AppState>({
   messages: [],
   workers: [],
   workerCount: 0,
+  tasks: [],
   error: null,
 });
 
@@ -126,15 +129,82 @@ function handleEvent(event: CoordinatorEvent): void {
             tier: event.tier,
             activity: "Starting",
           });
+          // Add or update task entry.
+          {
+            const existing = s.tasks.find(
+              (t) => t.taskId === event.task_id,
+            );
+            if (existing) {
+              existing.status = "running";
+              existing.error = undefined;
+            } else {
+              s.tasks.push({
+                taskId: event.task_id,
+                title: event.title,
+                tier: event.tier,
+                status: "running",
+                mergeStatus: "none",
+              });
+            }
+          }
           break;
 
-        case "worker_completed":
-          s.workers = s.workers.filter((w) => w.taskId !== event.task_id);
+        case "worker_completed": {
+          // Mark worker as done, remove after brief delay.
+          const cw = s.workers.find(
+            (w) => w.taskId === event.task_id,
+          );
+          if (cw) {
+            cw.activity = "Done";
+          }
+          s.workers = s.workers.filter(
+            (w) => w.taskId !== event.task_id,
+          );
+          // Update task status.
+          {
+            const task = s.tasks.find(
+              (t) => t.taskId === event.task_id,
+            );
+            if (task) {
+              task.status = "completed";
+            }
+          }
           break;
+        }
 
-        case "worker_failed":
-          s.workers = s.workers.filter((w) => w.taskId !== event.task_id);
+        case "worker_failed": {
+          // Mark worker as failed briefly.
+          const fw = s.workers.find(
+            (w) => w.taskId === event.task_id,
+          );
+          if (fw) {
+            fw.failed = true;
+            fw.failError = event.error;
+            fw.activity = "Failed";
+          }
+          // Schedule removal after 2s.
+          const failTaskId = event.task_id;
+          setTimeout(() => {
+            setState(
+              produce((s2) => {
+                s2.workers = s2.workers.filter(
+                  (w) => w.taskId !== failTaskId,
+                );
+              }),
+            );
+          }, 2000);
+          // Update task status.
+          {
+            const task = s.tasks.find(
+              (t) => t.taskId === event.task_id,
+            );
+            if (task) {
+              task.status = "failed";
+              task.error = event.error;
+            }
+          }
           break;
+        }
 
         case "worker_update": {
           const worker = s.workers.find((w) => w.taskId === event.task_id);
@@ -167,6 +237,11 @@ function handleEvent(event: CoordinatorEvent): void {
         case "all_stopped":
           s.workers = [];
           s.workerCount = 0;
+          for (const task of s.tasks) {
+            if (task.status === "running") {
+              task.status = "failed";
+            }
+          }
           break;
 
         case "interrupted": {
@@ -187,14 +262,54 @@ function handleEvent(event: CoordinatorEvent): void {
           });
           break;
 
-        // Merge events, mail — displayed as system messages.
-        case "merge_queued":
-        case "merge_landed":
-        case "merge_failed":
-        case "merge_conflicted":
-        case "merge_progress":
+        case "merge_queued": {
+          const task = s.tasks.find(
+            (t) => t.taskId === event.task_id,
+          );
+          if (task) task.mergeStatus = "queued";
+          break;
+        }
+
+        case "merge_landed": {
+          const task = s.tasks.find(
+            (t) => t.taskId === event.task_id,
+          );
+          if (task) {
+            task.mergeStatus = "landed";
+            task.mergeFlashUntil = Date.now() + 2000;
+          }
+          break;
+        }
+
+        case "merge_failed": {
+          const task = s.tasks.find(
+            (t) => t.taskId === event.task_id,
+          );
+          if (task) {
+            task.mergeStatus = "failed";
+            task.error = event.reason;
+          }
+          break;
+        }
+
+        case "merge_conflicted": {
+          const task = s.tasks.find(
+            (t) => t.taskId === event.task_id,
+          );
+          if (task) task.mergeStatus = "conflicted";
+          break;
+        }
+
+        case "merge_progress": {
+          const task = s.tasks.find(
+            (t) => t.taskId === event.task_id,
+          );
+          if (task) task.mergeStatus = "merging";
+          break;
+        }
+
         case "mail":
-          // These can be surfaced in a future events panel.
+          // Mail events can be surfaced in a future events panel.
           break;
       }
     }),

@@ -68,4 +68,25 @@ export interface Worker {
   title: string;
   tier: string;
   activity: string;
+  /** Set briefly on failure before removal. */
+  failed?: boolean;
+  failError?: string;
+}
+
+/** Status of a persistent task entry. */
+export type TaskStatus = "pending" | "running" | "completed" | "failed";
+
+/** Merge state for a task. */
+export type MergeStatus = "none" | "queued" | "merging" | "landed" | "failed" | "conflicted";
+
+/** A persistent task entry shown in the task list. */
+export interface Task {
+  taskId: string;
+  title: string;
+  tier: string;
+  status: TaskStatus;
+  mergeStatus: MergeStatus;
+  error?: string;
+  /** Timestamp for flash animations (merge landed). */
+  mergeFlashUntil?: number;
 }

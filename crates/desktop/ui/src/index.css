@@ -1,1 +1,15 @@
 @import "tailwindcss";
+
+@keyframes flash-green {
+  0%,
+  100% {
+    background-color: transparent;
+  }
+  50% {
+    background-color: rgb(6 78 59 / 0.4);
+  }
+}
+
+.animate-flash {
+  animation: flash-green 0.6s ease-in-out 2;
+}
