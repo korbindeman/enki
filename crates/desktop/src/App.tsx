@@ -19,7 +19,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import { renderMarkdown } from "./markdown";
 import { invoke } from "@tauri-apps/api/core";
-import type { Message } from "./types";
+import type { ContentBlock, Message } from "./types";
 import WorkerPanel from "./WorkerPanel";
 import TaskList from "./TaskList";
 import TierBadge from "./TierBadge";
@@ -35,6 +35,7 @@ interface PendingImage {
 const AGENT_DISPLAY_NAMES: Record<string, string> = {
   claude: "Claude Code",
   codex: "OpenAI Codex",
+  opencode: "OpenCode",
 };
 
 const AGENT_KEYS = Object.keys(AGENT_DISPLAY_NAMES);
@@ -162,9 +163,78 @@ function WorkerCardView(props: { card: NonNullable<Message["workerCard"]> }) {
   );
 }
 
+function ToolCallPanel(props: { block: ContentBlock & { type: "tools" }; isLast: boolean; streaming: boolean }) {
+  const [userToggled, setUserToggled] = createSignal(false);
+  const [manualOpen, setManualOpen] = createSignal(false);
+
+  // Auto-expand when this is the active (last) tool group in a streaming message.
+  // Once it's no longer last (text appeared after), auto-collapse — unless user overrode.
+  const expanded = () => {
+    if (userToggled()) return manualOpen();
+    return props.isLast && props.streaming;
+  };
+
+  function toggle() {
+    setUserToggled(true);
+    setManualOpen(!expanded());
+  }
+
+  return (
+    <div class="my-2 border border-border-subtle rounded-lg bg-surface/30 overflow-hidden">
+      <button
+        onClick={toggle}
+        class="w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-surface/20 transition-colors"
+      >
+        <svg
+          class={`w-3 h-3 text-text-muted transition-transform ${expanded() ? "rotate-90" : ""}`}
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          viewBox="0 0 24 24"
+        >
+          <path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7" />
+        </svg>
+        <span class="text-[10px] uppercase tracking-wider text-text-muted font-medium">
+          Tool calls ({props.block.calls.length})
+        </span>
+      </button>
+      <Show when={expanded()}>
+        <div class="px-4 pb-2">
+          <For each={props.block.calls}>
+            {(tc) => (
+              <div class="flex items-center gap-2 py-0.5">
+                <span
+                  class={`inline-block w-1.5 h-1.5 rounded-full shrink-0 ${tc.done ? "bg-text-faint" : "bg-amber-500 animate-pulse"}`}
+                />
+                <span class="text-xs text-text-muted font-mono truncate">
+                  {tc.name}
+                </span>
+              </div>
+            )}
+          </For>
+        </div>
+      </Show>
+    </div>
+  );
+}
+
 function ChatMessage(props: { message: Message }) {
-  const activeToolCall = () =>
-    props.message.toolCalls.find((tc) => !tc.done);
+  const textContent = () => {
+    const b = props.message.blocks[0];
+    return b?.type === "text" ? b.content : "";
+  };
+
+  // For the streaming indicator: find any active tool call across all blocks
+  const activeToolCall = () => {
+    for (let i = props.message.blocks.length - 1; i >= 0; i--) {
+      const block = props.message.blocks[i];
+      if (block.type === "tools") {
+        const pending = block.calls.find((tc) => !tc.done);
+        if (pending) return pending;
+      }
+    }
+    return undefined;
+  };
 
   return (
     <Show
@@ -174,47 +244,40 @@ function ChatMessage(props: { message: Message }) {
       <Switch>
         <Match when={props.message.role === "system"}>
           <div class="text-xs text-text-muted text-center py-3">
-            {props.message.content}
+            {textContent()}
           </div>
         </Match>
         <Match when={props.message.role === "user"}>
           <div class="border-l-2 border-border pl-4 py-3">
             <div class="text-sm whitespace-pre-wrap text-text">
-              {props.message.content}
+              {textContent()}
             </div>
           </div>
         </Match>
         <Match when={props.message.role === "assistant"}>
           <div class="py-3">
-            <Show when={props.message.content}>
-              <div
-                class="prose"
-                innerHTML={renderMarkdown(
-                  props.message.content,
-                  props.message.streaming,
-                )}
-              />
-            </Show>
-            {/* Inline tool calls */}
-            <Show when={props.message.toolCalls.length > 0}>
-              <div class="mt-3 border border-border-subtle rounded-lg bg-surface/30 px-4 py-3">
-                <div class="text-[10px] uppercase tracking-wider text-text-muted font-medium mb-2">
-                  Tool calls ({props.message.toolCalls.length})
-                </div>
-                <For each={props.message.toolCalls}>
-                  {(tc) => (
-                    <div class="flex items-center gap-2 py-0.5">
-                      <span
-                        class={`inline-block w-1.5 h-1.5 rounded-full shrink-0 ${tc.done ? "bg-text-faint" : "bg-amber-500 animate-pulse"}`}
-                      />
-                      <span class="text-xs text-text-muted font-mono truncate">
-                        {tc.name}
-                      </span>
-                    </div>
-                  )}
-                </For>
-              </div>
-            </Show>
+            <For each={props.message.blocks}>
+              {(block, i) => (
+                <Switch>
+                  <Match when={block.type === "text"}>
+                    <div
+                      class="prose"
+                      innerHTML={renderMarkdown(
+                        (block as ContentBlock & { type: "text" }).content,
+                        props.message.streaming,
+                      )}
+                    />
+                  </Match>
+                  <Match when={block.type === "tools"}>
+                    <ToolCallPanel
+                      block={block as ContentBlock & { type: "tools" }}
+                      isLast={i() === props.message.blocks.length - 1}
+                      streaming={props.message.streaming}
+                    />
+                  </Match>
+                </Switch>
+              )}
+            </For>
             {/* Inline status indicator */}
             <Show when={props.message.streaming}>
               <div class="mt-2 flex items-center gap-2">
@@ -263,8 +326,14 @@ function App() {
   createEffect(() => {
     const len = state.messages.length;
     if (len > 0) {
-      // Access content to track streaming updates
-      void state.messages[len - 1].content;
+      const msg = state.messages[len - 1];
+      const blen = msg.blocks.length;
+      if (blen > 0) {
+        const last = msg.blocks[blen - 1];
+        // Access reactive properties to track streaming updates
+        if (last.type === "text") void last.content;
+        if (last.type === "tools") void last.calls.length;
+      }
     }
     messagesContainer?.scrollTo({
       top: messagesContainer.scrollHeight,

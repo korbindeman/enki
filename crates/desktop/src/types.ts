@@ -71,15 +71,19 @@ export interface WorkerCard {
   error?: string;
 }
 
+/** A content block within a message. */
+export type ContentBlock =
+  | { type: "text"; content: string }
+  | { type: "tools"; calls: ToolCall[] };
+
 /** A chat message displayed in the main panel. */
 export interface Message {
   id: string;
   role: "user" | "assistant" | "system";
-  content: string;
+  /** Ordered content blocks (text segments interleaved with tool call groups). */
+  blocks: ContentBlock[];
   /** Set to true while the assistant is still streaming. */
   streaming: boolean;
-  /** Tool calls accumulated during this assistant turn. */
-  toolCalls: ToolCall[];
   /** If present, render as a worker lifecycle card instead of text. */
   workerCard?: WorkerCard;
 }

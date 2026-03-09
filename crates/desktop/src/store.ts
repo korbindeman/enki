@@ -1,7 +1,7 @@
 import { createStore, produce } from "solid-js/store";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
-import type { CoordinatorEvent, Message, Task, Worker } from "./types";
+import type { ContentBlock, CoordinatorEvent, Message, Task, Worker } from "./types";
 
 // ---------------------------------------------------------------------------
 // State
@@ -59,9 +59,8 @@ export async function sendPrompt(
       s.messages.push({
         id: nextId(),
         role: "user",
-        content: text,
+        blocks: [{ type: "text", content: text }],
         streaming: false,
-        toolCalls: [],
       });
     }),
   );
@@ -113,9 +112,8 @@ function handleEvent(event: CoordinatorEvent): void {
           s.messages.push({
             id: nextId(),
             role: "system",
-            content: "Coordinator initializing...",
+            blocks: [{ type: "text", content: "Coordinator initializing..." }],
             streaming: false,
-            toolCalls: [],
           });
           break;
 
@@ -124,8 +122,9 @@ function handleEvent(event: CoordinatorEvent): void {
           // Update the init message in-place if it's the last system message.
           {
             const last = s.messages.findLast((m) => m.role === "system");
-            if (last && last.content === "Coordinator initializing...") {
-              last.content = "Coordinator ready.";
+            const tb = last?.blocks[0];
+            if (tb && tb.type === "text" && tb.content === "Coordinator initializing...") {
+              tb.content = "Coordinator ready.";
             }
           }
           break;
@@ -133,14 +132,18 @@ function handleEvent(event: CoordinatorEvent): void {
         case "text": {
           const last = s.messages.at(-1);
           if (last && last.role === "assistant" && last.streaming) {
-            last.content += event.content;
+            const lastBlock = last.blocks.at(-1);
+            if (lastBlock && lastBlock.type === "text") {
+              lastBlock.content += event.content;
+            } else {
+              last.blocks.push({ type: "text", content: event.content });
+            }
           } else {
             s.messages.push({
               id: nextId(),
               role: "assistant",
-              content: event.content,
+              blocks: [{ type: "text", content: event.content }],
               streaming: true,
-              toolCalls: [],
             });
           }
           break;
@@ -155,16 +158,20 @@ function handleEvent(event: CoordinatorEvent): void {
         }
 
         case "tool_call": {
-          const lastAsst = s.messages.findLast((m) => m.role === "assistant");
-          if (lastAsst) {
-            lastAsst.toolCalls.push({ name: event.name, done: false });
+          const last = s.messages.at(-1);
+          if (last && last.role === "assistant" && last.streaming) {
+            const lastBlock = last.blocks.at(-1);
+            if (lastBlock && lastBlock.type === "tools") {
+              lastBlock.calls.push({ name: event.name, done: false });
+            } else {
+              last.blocks.push({ type: "tools", calls: [{ name: event.name, done: false }] });
+            }
           } else {
             s.messages.push({
               id: nextId(),
               role: "assistant",
-              content: "",
+              blocks: [{ type: "tools", calls: [{ name: event.name, done: false }] }],
               streaming: true,
-              toolCalls: [{ name: event.name, done: false }],
             });
           }
           break;
@@ -173,8 +180,13 @@ function handleEvent(event: CoordinatorEvent): void {
         case "tool_call_done": {
           const lastAsst = s.messages.findLast((m) => m.role === "assistant");
           if (lastAsst) {
-            const pending = lastAsst.toolCalls.find((tc) => !tc.done);
-            if (pending) pending.done = true;
+            for (let i = lastAsst.blocks.length - 1; i >= 0; i--) {
+              const block = lastAsst.blocks[i];
+              if (block.type === "tools") {
+                const pending = block.calls.find((tc) => !tc.done);
+                if (pending) { pending.done = true; break; }
+              }
+            }
           }
           break;
         }
@@ -183,9 +195,8 @@ function handleEvent(event: CoordinatorEvent): void {
           s.messages.push({
             id: nextId(),
             role: "system",
-            content: "",
+            blocks: [],
             streaming: false,
-            toolCalls: [],
             workerCard: {
               taskId: event.task_id,
               title: event.title,
@@ -340,9 +351,8 @@ function handleEvent(event: CoordinatorEvent): void {
           s.messages.push({
             id: nextId(),
             role: "system",
-            content: `Error: ${event.message}`,
+            blocks: [{ type: "text", content: `Error: ${event.message}` }],
             streaming: false,
-            toolCalls: [],
           });
           break;
 

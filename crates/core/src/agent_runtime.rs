@@ -1,8 +1,8 @@
 //! Resolve agent binaries for ACP sessions.
 //!
-//! Built-in agents are installed via npm into `~/.enki/agents/<name>/` on
-//! first use. Custom agents specified in config are resolved from PATH or
-//! as absolute paths.
+//! Built-in agents are either npm packages (installed into `~/.enki/agents/<name>/`
+//! on first use) or standalone binaries resolved from PATH. Custom agents
+//! specified in config are resolved from PATH or as absolute paths.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -12,28 +12,49 @@ use crate::config::AgentConfig;
 
 /// A built-in agent that can be resolved by short name.
 struct BuiltinAgent {
-    /// Short name used in config and CLI (e.g. "claude", "codex").
+    /// Short name used in config and CLI (e.g. "claude", "codex", "opencode").
     name: &'static str,
-    /// npm package to install.
-    package: &'static str,
-    /// Entry point relative to the cache directory.
-    entry_point: &'static str,
-    /// Subdirectory name under `~/.enki/agents/`.
-    cache_name: &'static str,
+    /// How to resolve and launch this agent.
+    kind: BuiltinKind,
+}
+
+enum BuiltinKind {
+    /// npm package installed into `~/.enki/agents/<cache_name>/`.
+    Npm {
+        package: &'static str,
+        entry_point: &'static str,
+        cache_name: &'static str,
+    },
+    /// Standalone binary resolved from PATH.
+    Binary {
+        binary: &'static str,
+        default_args: &'static [&'static str],
+    },
 }
 
 const BUILTINS: &[BuiltinAgent] = &[
     BuiltinAgent {
         name: "claude",
-        package: "@zed-industries/claude-agent-acp",
-        entry_point: "node_modules/@zed-industries/claude-agent-acp/dist/index.js",
-        cache_name: "claude-agent-acp",
+        kind: BuiltinKind::Npm {
+            package: "@zed-industries/claude-agent-acp",
+            entry_point: "node_modules/@zed-industries/claude-agent-acp/dist/index.js",
+            cache_name: "claude-agent-acp",
+        },
     },
     BuiltinAgent {
         name: "codex",
-        package: "@zed-industries/codex-acp",
-        entry_point: "node_modules/@zed-industries/codex-acp/dist/index.js",
-        cache_name: "codex-acp",
+        kind: BuiltinKind::Npm {
+            package: "@zed-industries/codex-acp",
+            entry_point: "node_modules/@zed-industries/codex-acp/dist/index.js",
+            cache_name: "codex-acp",
+        },
+    },
+    BuiltinAgent {
+        name: "opencode",
+        kind: BuiltinKind::Binary {
+            binary: "opencode",
+            default_args: &["acp"],
+        },
     },
 ];
 
@@ -105,37 +126,62 @@ fn resolve_builtin(
     extra_args: &[String],
     env: &HashMap<String, String>,
 ) -> Result<AgentCommand, ResolveError> {
-    let node = find_node()?;
-    let cache = cache_dir(builtin.cache_name)?;
-    let entry = cache.join(builtin.entry_point);
+    match &builtin.kind {
+        BuiltinKind::Npm {
+            package,
+            entry_point,
+            cache_name,
+        } => {
+            let node = find_node()?;
+            let cache = cache_dir(cache_name)?;
+            let entry = cache.join(entry_point);
 
-    if !entry.exists() {
-        tracing::info!(package = builtin.package, path = %cache.display(), "installing agent package");
-        npm_install(&cache, builtin.package)?;
+            if !entry.exists() {
+                tracing::info!(package, path = %cache.display(), "installing agent package");
+                npm_install(&cache, package)?;
 
-        if !entry.exists() {
-            return Err(ResolveError::NpmInstallFailed(format!(
-                "entry point not found after install: {}",
-                entry.display()
-            )));
+                if !entry.exists() {
+                    return Err(ResolveError::NpmInstallFailed(format!(
+                        "entry point not found after install: {}",
+                        entry.display()
+                    )));
+                }
+            }
+
+            let mut args = vec![entry.to_string_lossy().into_owned()];
+            args.extend_from_slice(extra_args);
+
+            Ok(AgentCommand {
+                program: node,
+                args,
+                env: env.clone(),
+            })
+        }
+        BuiltinKind::Binary {
+            binary,
+            default_args,
+        } => {
+            let program = which::which(binary)
+                .map_err(|_| ResolveError::AgentNotFound(binary.to_string()))?;
+
+            let mut args: Vec<String> = default_args.iter().map(|s| s.to_string()).collect();
+            args.extend_from_slice(extra_args);
+
+            Ok(AgentCommand {
+                program,
+                args,
+                env: env.clone(),
+            })
         }
     }
-
-    let mut args = vec![entry.to_string_lossy().into_owned()];
-    args.extend_from_slice(extra_args);
-
-    Ok(AgentCommand {
-        program: node,
-        args,
-        env: env.clone(),
-    })
 }
 
 /// Resolve an agent command from config.
 ///
-/// If `command` matches a built-in name ("claude", "codex"), uses npm-based
-/// resolution. Also accepts the legacy value "claude-agent-acp" for backwards
-/// compatibility. Otherwise, resolves the command from PATH or as an absolute path.
+/// If `command` matches a built-in name ("claude", "codex", "opencode"), uses
+/// built-in resolution (npm or PATH depending on the agent). Also accepts the
+/// legacy value "claude-agent-acp" for backwards compatibility. Otherwise,
+/// resolves the command from PATH or as an absolute path.
 pub fn resolve_from_config(config: &AgentConfig) -> Result<AgentCommand, ResolveError> {
     // Backwards compat: "claude-agent-acp" → "claude"
     let name = if config.command == "claude-agent-acp" {
