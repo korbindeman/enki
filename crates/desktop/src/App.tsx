@@ -64,8 +64,26 @@ function AgentSelector() {
     }
   }
 
+  let containerRef!: HTMLDivElement;
+
+  function onClickOutside(e: MouseEvent) {
+    if (open() && !containerRef.contains(e.target as Node)) setOpen(false);
+  }
+  function onKeyDown(e: KeyboardEvent) {
+    if (open() && e.key === "Escape") setOpen(false);
+  }
+
+  onMount(() => {
+    document.addEventListener("mousedown", onClickOutside);
+    document.addEventListener("keydown", onKeyDown);
+  });
+  onCleanup(() => {
+    document.removeEventListener("mousedown", onClickOutside);
+    document.removeEventListener("keydown", onKeyDown);
+  });
+
   return (
-    <div class="relative">
+    <div ref={containerRef} class="relative">
       <button
         onClick={() => setOpen((v) => !v)}
         class="flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs text-text-muted hover:text-text hover:bg-surface/50 transition-colors"
