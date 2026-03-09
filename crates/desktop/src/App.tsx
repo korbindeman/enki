@@ -189,8 +189,12 @@ function App() {
             </button>
           </div>
           <Show when={state.projectCwd}>
-            <div class="text-xs text-zinc-500 truncate mt-0.5" title={state.projectCwd!}>
-              {state.projectCwd!.split("/").pop()}
+            <div class="text-xs text-zinc-500 truncate mt-0.5 flex items-center gap-1.5">
+              <span title={state.projectCwd!}>{state.projectCwd!.split("/").pop()}</span>
+              <Show when={state.currentBranch}>
+                <span class="text-zinc-600">/</span>
+                <span class="text-zinc-400">{state.currentBranch}</span>
+              </Show>
             </div>
           </Show>
         </div>

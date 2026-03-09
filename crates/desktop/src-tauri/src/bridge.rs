@@ -74,6 +74,23 @@ pub fn get_project_dir(state: tauri::State<CoordinatorState>) -> String {
 }
 
 #[tauri::command]
+pub fn get_current_branch(state: tauri::State<CoordinatorState>) -> Result<String, String> {
+    let cwd = state.cwd.lock().unwrap().clone();
+    if cwd.is_empty() {
+        return Err("no project open".into());
+    }
+    let output = std::process::Command::new("git")
+        .args(["symbolic-ref", "--short", "HEAD"])
+        .current_dir(&cwd)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err("not on a branch".into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+#[tauri::command]
 pub async fn open_project(
     path: String,
     state: tauri::State<'_, CoordinatorState>,

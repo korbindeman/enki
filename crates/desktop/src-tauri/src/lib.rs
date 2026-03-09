@@ -14,6 +14,7 @@ pub fn run() {
             bridge::stop_all,
             bridge::set_agent,
             bridge::get_project_dir,
+            bridge::get_current_branch,
             bridge::open_project,
             bridge::load_config,
             bridge::save_config,

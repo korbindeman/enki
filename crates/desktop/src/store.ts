@@ -24,6 +24,8 @@ export interface AppState {
   error: string | null;
   /** Name of the tool currently being called by the planner, if any. */
   activeToolCall: string | null;
+  /** Current git branch name. */
+  currentBranch: string | null;
 }
 
 const [state, setState] = createStore<AppState>({
@@ -35,6 +37,7 @@ const [state, setState] = createStore<AppState>({
   tasks: [],
   error: null,
   activeToolCall: null,
+  currentBranch: null,
 });
 
 export { state };
@@ -75,6 +78,15 @@ export async function stopAll(): Promise<void> {
   await invoke("stop_all");
 }
 
+export async function fetchBranch(): Promise<void> {
+  try {
+    const branch = await invoke<string>("get_current_branch");
+    setState("currentBranch", branch);
+  } catch {
+    setState("currentBranch", null);
+  }
+}
+
 export async function openProject(path: string): Promise<void> {
   // Reset all state before switching.
   setState({
@@ -85,9 +97,11 @@ export async function openProject(path: string): Promise<void> {
     tasks: [],
     error: null,
     activeToolCall: null,
+    currentBranch: null,
     projectCwd: path,
   });
   await invoke("open_project", { path });
+  fetchBranch();
 }
 
 // ---------------------------------------------------------------------------
@@ -305,6 +319,8 @@ function handleEvent(event: CoordinatorEvent): void {
             task.mergeStatus = "landed";
             task.mergeFlashUntil = Date.now() + 2000;
           }
+          // Branch may have changed after merge.
+          fetchBranch();
           break;
         }
 
@@ -354,5 +370,8 @@ export async function initStore(): Promise<void> {
   });
 
   const cwd = await invoke<string>("get_project_dir");
-  if (cwd) setState("projectCwd", cwd);
+  if (cwd) {
+    setState("projectCwd", cwd);
+    fetchBranch();
+  }
 }
