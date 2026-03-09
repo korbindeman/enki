@@ -29,7 +29,7 @@ use workers::{
 /// Messages sent from the TUI to the coordinator thread.
 #[allow(dead_code)]
 pub enum ToCoordinator {
-    Prompt(String),
+    Prompt { text: String, images: Vec<enki_tui::ImageData> },
     Interrupt,
     Shutdown,
     /// Stop all running workers immediately.
@@ -218,8 +218,8 @@ async fn coordinator_loop(
             msg = rx.recv() => {
                 let Some(msg) = msg else { break };
                 match msg {
-                    ToCoordinator::Prompt(text) => {
-                        coord.deliver_prompt(&rt.mgr, &rt.tx, text).await;
+                    ToCoordinator::Prompt { text, images } => {
+                        coord.deliver_prompt(&rt.mgr, &rt.tx, text, images).await;
                     }
                     ToCoordinator::Interrupt => {
                         coord.interrupt(&rt.mgr, &rt.tx).await;

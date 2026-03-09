@@ -127,7 +127,10 @@ impl Runtime {
         let sid_for_done = session_id.clone();
 
         tokio::task::spawn_local(async move {
-            let result = mgr_clone.prompt(&session_id, &prompt).await;
+            let content = vec![enki_acp::acp_schema::ContentBlock::Text(
+                enki_acp::acp_schema::TextContent::new(prompt),
+            )];
+            let result = mgr_clone.prompt(&session_id, content).await;
             tracker_clone.borrow_mut().remove(&session_id);
             mgr_clone.kill_session(&session_id);
             let _ = done_tx.send(super::workers::WorkerDone {

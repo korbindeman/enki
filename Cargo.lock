@@ -527,6 +527,7 @@ version = "2026.308.0"
 dependencies = [
  "anyhow",
  "ascii-dag",
+ "base64",
  "chrono",
  "clap",
  "dirs",
@@ -548,6 +549,7 @@ version = "2026.308.0"
 dependencies = [
  "agent-client-protocol",
  "async-trait",
+ "base64",
  "chrono",
  "dirs",
  "enki-core",

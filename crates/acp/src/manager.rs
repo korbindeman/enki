@@ -272,8 +272,8 @@ impl AgentManager {
 
     /// Send a prompt to an existing session and wait for completion.
     /// Returns the stop reason as a string.
-    pub async fn prompt(&self, session_id: &str, text: &str) -> Result<String> {
-        tracing::debug!(session_id, chars = text.len(), "sending prompt to agent");
+    pub async fn prompt(&self, session_id: &str, content: Vec<acp::ContentBlock>) -> Result<String> {
+        tracing::debug!(session_id, blocks = content.len(), "sending prompt to agent");
         let conn = {
             let sessions = self.sessions.borrow();
             let entry = sessions
@@ -286,9 +286,7 @@ impl AgentManager {
             conn.as_ref(),
             acp::PromptRequest::new(
                 acp::SessionId::from(session_id.to_string()),
-                vec![acp::ContentBlock::Text(acp::TextContent::new(
-                    text.to_string(),
-                ))],
+                content,
             ),
         )
         .await?;

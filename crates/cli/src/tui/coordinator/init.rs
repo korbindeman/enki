@@ -194,7 +194,10 @@ pub(super) async fn initialize(
 
     // Send system prompt (updates suppressed during this phase).
     let system_prompt = build_system_prompt(&cwd, &roles);
-    match mgr.prompt(&coord.session_id, &system_prompt).await {
+    let content = vec![enki_acp::acp_schema::ContentBlock::Text(
+        enki_acp::acp_schema::TextContent::new(system_prompt),
+    )];
+    match mgr.prompt(&coord.session_id, content).await {
         Ok(_) => {
             coord.forward_updates.set(true);
             let _ = tx.send(FromCoordinator::Ready);

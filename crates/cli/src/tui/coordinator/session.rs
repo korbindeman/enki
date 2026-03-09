@@ -1,3 +1,6 @@
+use enki_acp::acp_schema as acp;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use enki_acp::AgentManager;
 use tokio::sync::mpsc;
 
@@ -37,6 +40,7 @@ impl CoordinatorSession {
         mgr: &AgentManager,
         tx: &mpsc::UnboundedSender<FromCoordinator>,
         text: String,
+        images: Vec<enki_tui::ImageData>,
     ) {
         if let Some(handle) = self.active_prompt.take() {
             let _ = mgr.cancel(&self.session_id).await;
@@ -51,7 +55,8 @@ impl CoordinatorSession {
             format!("[worker status updates]\n{events_text}\n\n[user message]\n{text}")
         };
 
-        self.spawn_prompt(mgr, full_text);
+        let content = build_content_blocks(full_text, images);
+        self.spawn_prompt(mgr, content);
     }
 
     pub fn handle_prompt_done(
@@ -94,18 +99,29 @@ impl CoordinatorSession {
         }
         let events_text = std::mem::take(&mut self.pending_events).join("\n");
         let msg = format!("[worker status updates]\n{events_text}");
-        self.spawn_prompt(mgr, msg);
+        let content = vec![acp::ContentBlock::Text(acp::TextContent::new(msg))];
+        self.spawn_prompt(mgr, content);
     }
 
-    fn spawn_prompt(&mut self, mgr: &AgentManager, text: String) {
+    fn spawn_prompt(&mut self, mgr: &AgentManager, content: Vec<acp::ContentBlock>) {
         self.prompt_generation += 1;
         let generation = self.prompt_generation;
         let mgr = mgr.clone();
         let sid = self.session_id.clone();
         let done_tx = self.prompt_done_tx.clone();
         self.active_prompt = Some(tokio::task::spawn_local(async move {
-            let result = mgr.prompt(&sid, &text).await;
+            let result = mgr.prompt(&sid, content).await;
             let _ = done_tx.send((generation, result.map_err(|e| e.to_string())));
         }));
     }
+}
+
+/// Build ACP content blocks from text and optional images.
+fn build_content_blocks(text: String, images: Vec<enki_tui::ImageData>) -> Vec<acp::ContentBlock> {
+    let mut blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(text))];
+    for image in images {
+        let data = BASE64.encode(&image.bytes);
+        blocks.push(acp::ContentBlock::Image(acp::ImageContent::new(data, image.mime_type)));
+    }
+    blocks
 }

@@ -225,7 +225,7 @@ impl Handler<FromCoordinator> for CoordinatorHandler<'_> {
     }
 
     fn on_submit(&mut self, input: UserInput, _cx: &mut ChatContext) {
-        let _ = self.tx.send(ToCoordinator::Prompt(input.text));
+        let _ = self.tx.send(ToCoordinator::Prompt { text: input.text, images: input.images });
     }
 
     fn on_interrupt(&mut self) {
