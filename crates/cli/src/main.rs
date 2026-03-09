@@ -7,6 +7,11 @@ use clap::Parser;
 #[derive(Parser)]
 #[command(name = "enki", about = "Multi-agent orchestrator for ACP coding agents")]
 struct Cli {
+    /// Agent to use (e.g. "claude", "codex", or a custom command/path).
+    /// Overrides [agent] command in config.
+    #[arg(long)]
+    agent: Option<String>,
+
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -59,7 +64,7 @@ async fn main() {
                 let db = commands::open_db()?;
                 Ok((db, db_path_str))
             }) {
-                Ok((db, db_path_str)) => tui::run(db, db_path_str, enki_bin).await,
+                Ok((db, db_path_str)) => tui::run(db, db_path_str, enki_bin, cli.agent).await,
                 Err(e) => {
                     eprintln!("error: {e}");
                     std::process::exit(1);

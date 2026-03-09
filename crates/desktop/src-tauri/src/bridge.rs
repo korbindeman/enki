@@ -91,7 +91,7 @@ pub async fn open_project(
     // Spawn new coordinator for the selected project.
     let enki_bin = find_enki_bin();
     let CoordinatorHandle { tx, rx, join_handle } =
-        enki::coordinator::spawn(cwd, db_path.to_str().unwrap().to_string(), enki_bin);
+        enki::coordinator::spawn(cwd, db_path.to_str().unwrap().to_string(), enki_bin, None);
 
     *state.tx.lock().unwrap() = tx;
     *state.join_handle.lock().unwrap() = join_handle;
@@ -315,7 +315,7 @@ pub fn setup(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         let enki_bin = find_enki_bin();
 
         let CoordinatorHandle { tx, rx, join_handle } =
-            enki::coordinator::spawn(cwd, db_path_str, enki_bin);
+            enki::coordinator::spawn(cwd, db_path_str, enki_bin, None);
 
         app.manage(CoordinatorState {
             tx: Mutex::new(tx),

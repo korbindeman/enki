@@ -39,7 +39,7 @@ impl Default for Config {
                 sonnet_only: false,
             },
             agent: AgentConfig {
-                command: "claude-agent-acp".into(),
+                command: "claude".into(),
                 args: vec![],
                 env: HashMap::new(),
             },
@@ -151,7 +151,7 @@ mod tests {
         assert_eq!(config.git.commit_suffix, "created by enki");
         assert_eq!(config.workers.limits.max_workers, 10);
         assert!(!config.workers.sonnet_only);
-        assert_eq!(config.agent.command, "claude-agent-acp");
+        assert_eq!(config.agent.command, "claude");
     }
 
     #[test]
@@ -173,7 +173,7 @@ max_heavy = 2
         assert_eq!(config.workers.limits.max_heavy, 2);
         // Unset fields keep defaults
         assert_eq!(config.workers.limits.max_workers, 10);
-        assert_eq!(config.agent.command, "claude-agent-acp");
+        assert_eq!(config.agent.command, "claude");
     }
 
     #[test]

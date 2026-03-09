@@ -1,5 +1,8 @@
 mod bridge;
 
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
+use tauri::Emitter;
+
 pub fn run() {
     init_logging();
 
@@ -14,6 +17,51 @@ pub fn run() {
             bridge::load_config,
             bridge::save_config,
         ])
+        .menu(|app| {
+            let open_project = MenuItem::with_id(
+                app,
+                "open_project",
+                "Open Project...",
+                true,
+                Some("CmdOrCtrl+O"),
+            )?;
+            Menu::with_items(app, &[
+                &Submenu::with_items(app, "Enki", true, &[
+                    &PredefinedMenuItem::about(app, None, None)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::services(app, None)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::hide(app, None)?,
+                    &PredefinedMenuItem::hide_others(app, None)?,
+                    &PredefinedMenuItem::show_all(app, None)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::quit(app, None)?,
+                ])?,
+                &Submenu::with_items(app, "File", true, &[
+                    &open_project,
+                ])?,
+                &Submenu::with_items(app, "Edit", true, &[
+                    &PredefinedMenuItem::undo(app, None)?,
+                    &PredefinedMenuItem::redo(app, None)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::cut(app, None)?,
+                    &PredefinedMenuItem::copy(app, None)?,
+                    &PredefinedMenuItem::paste(app, None)?,
+                    &PredefinedMenuItem::select_all(app, None)?,
+                ])?,
+                &Submenu::with_items(app, "Window", true, &[
+                    &PredefinedMenuItem::minimize(app, None)?,
+                    &PredefinedMenuItem::maximize(app, None)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::close_window(app, None)?,
+                ])?,
+            ])
+        })
+        .on_menu_event(|app, event| {
+            if event.id().as_ref() == "open_project" {
+                let _ = app.emit("menu-open-project", ());
+            }
+        })
         .setup(|app| {
             bridge::setup(app.handle())?;
             Ok(())

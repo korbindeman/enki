@@ -124,7 +124,7 @@ pub struct CoordinatorHandle {
 }
 
 /// Spawn the coordinator on a dedicated OS thread with its own tokio runtime + LocalSet.
-pub fn spawn(cwd: PathBuf, db_path: String, enki_bin: PathBuf) -> CoordinatorHandle {
+pub fn spawn(cwd: PathBuf, db_path: String, enki_bin: PathBuf, agent_override: Option<String>) -> CoordinatorHandle {
     let (to_coord_tx, to_coord_rx) = mpsc::unbounded_channel::<ToCoordinator>();
     let (from_coord_tx, from_coord_rx) = mpsc::unbounded_channel::<FromCoordinator>();
 
@@ -143,7 +143,7 @@ pub fn spawn(cwd: PathBuf, db_path: String, enki_bin: PathBuf) -> CoordinatorHan
                 rt.block_on(async {
                     let local = tokio::task::LocalSet::new();
                     local
-                        .run_until(coordinator_loop(cwd, db_path, enki_bin, to_coord_rx, from_coord_tx))
+                        .run_until(coordinator_loop(cwd, db_path, enki_bin, agent_override, to_coord_rx, from_coord_tx))
                         .await;
                 });
             }));
@@ -219,6 +219,7 @@ async fn coordinator_loop(
     cwd: PathBuf,
     db_path: String,
     enki_bin: PathBuf,
+    agent_override: Option<String>,
     mut rx: mpsc::UnboundedReceiver<ToCoordinator>,
     tx: mpsc::UnboundedSender<FromCoordinator>,
 ) {
@@ -226,7 +227,7 @@ async fn coordinator_loop(
         mut rt, mut coord, mut prompt_done_rx,
         mut worker_done_rx, mut merger_agent_done_rx,
         enki_dir, enki_session_id, mut poll_interval,
-    }) = init::initialize(cwd, db_path, enki_bin, tx).await
+    }) = init::initialize(cwd, db_path, enki_bin, agent_override, tx).await
     else {
         return;
     };

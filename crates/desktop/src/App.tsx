@@ -16,6 +16,7 @@ import {
   openProject,
 } from "./store";
 import { open } from "@tauri-apps/plugin-dialog";
+import { listen } from "@tauri-apps/api/event";
 import { renderMarkdown } from "./markdown";
 import type { Message } from "./types";
 import WorkerPanel from "./WorkerPanel";
@@ -62,48 +63,11 @@ function ChatMessage(props: { message: Message }) {
   );
 }
 
-function ContextMenu(props: {
-  x: number;
-  y: number;
-  onClose: () => void;
-  items: { label: string; action: () => void }[];
-}) {
-  function handleClickOutside(e: MouseEvent) {
-    props.onClose();
-  }
-
-  onMount(() => window.addEventListener("click", handleClickOutside));
-  onCleanup(() => window.removeEventListener("click", handleClickOutside));
-
-  return (
-    <div
-      class="fixed z-50 min-w-[160px] py-1 bg-zinc-800 border border-zinc-700/50 rounded-xl shadow-lg"
-      style={{ left: `${props.x}px`, top: `${props.y}px` }}
-    >
-      <For each={props.items}>
-        {(item) => (
-          <button
-            class="w-full text-left px-3 py-1.5 text-sm text-zinc-200 hover:bg-zinc-700"
-            onClick={(e) => {
-              e.stopPropagation();
-              props.onClose();
-              item.action();
-            }}
-          >
-            {item.label}
-          </button>
-        )}
-      </For>
-    </div>
-  );
-}
-
 function App() {
   let messagesContainer!: HTMLDivElement;
   let textareaRef!: HTMLTextAreaElement;
   const [input, setInput] = createSignal("");
   const [pendingImages, setPendingImages] = createSignal<PendingImage[]>([]);
-  const [contextMenu, setContextMenu] = createSignal<{ x: number; y: number } | null>(null);
   const [settingsOpen, setSettingsOpen] = createSignal(false);
 
   const isStreaming = () => {
@@ -114,6 +78,7 @@ function App() {
 
   onMount(() => {
     initStore();
+    listen("menu-open-project", () => handleOpenProject());
   });
 
   // Auto-scroll on new messages or streaming content updates
@@ -198,11 +163,6 @@ function App() {
     el.style.height = Math.min(el.scrollHeight, 200) + "px";
   }
 
-  function handleSidebarContextMenu(e: MouseEvent) {
-    e.preventDefault();
-    setContextMenu({ x: e.clientX, y: e.clientY });
-  }
-
   async function handleOpenProject() {
     const folder = await open({ directory: true });
     if (folder) {
@@ -214,7 +174,7 @@ function App() {
     <div class="flex h-screen bg-zinc-900 text-zinc-100">
       {/* Sidebar */}
       <aside class="w-[260px] shrink-0 border-r border-zinc-800 bg-zinc-950 flex flex-col">
-        <div class="px-4 py-3" onContextMenu={handleSidebarContextMenu}>
+        <div class="px-4 py-3">
           <div class="flex items-center justify-between">
             <h1 class="text-lg font-semibold">Enki</h1>
             <button
@@ -248,7 +208,7 @@ function App() {
             <div class="flex-1 flex items-center justify-center">
               <div class="text-center space-y-4">
                 <h2 class="text-lg font-semibold text-zinc-300">No project open</h2>
-                <p class="text-sm text-zinc-500">Right-click the sidebar to open a project, or click below.</p>
+                <p class="text-sm text-zinc-500">Use File &gt; Open Project, or click below.</p>
                 <button
                   onClick={handleOpenProject}
                   class="rounded-lg bg-zinc-700 px-5 py-2.5 text-sm font-medium hover:bg-zinc-600 transition-colors"
@@ -354,17 +314,6 @@ function App() {
           </div>
         </Show>
       </main>
-
-      <Show when={contextMenu()}>
-        {(menu) => (
-          <ContextMenu
-            x={menu().x}
-            y={menu().y}
-            onClose={() => setContextMenu(null)}
-            items={[{ label: "Open Project...", action: handleOpenProject }]}
-          />
-        )}
-      </Show>
 
       <Settings open={settingsOpen()} onClose={() => setSettingsOpen(false)} />
     </div>

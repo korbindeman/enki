@@ -31,6 +31,7 @@ pub(super) async fn initialize(
     cwd: PathBuf,
     db_path: String,
     enki_bin: PathBuf,
+    agent_override: Option<String>,
     tx: mpsc::UnboundedSender<FromCoordinator>,
 ) -> Option<InitState> {
     let init_start = Instant::now();
@@ -59,7 +60,10 @@ pub(super) async fn initialize(
     tracing::info!(session_id = %enki_session_id, "new session created");
 
     // Load config: ~/.config/enki.toml → .enki/enki.toml
-    let config = enki_core::config::load_config(&cwd);
+    let mut config = enki_core::config::load_config(&cwd);
+    if let Some(agent) = agent_override {
+        config.agent.command = agent;
+    }
     tracing::info!(?config.agent.command, sonnet_only = config.workers.sonnet_only, "loaded config");
 
     let mut orch = Orchestrator::new(db, config.workers.limits.clone(), enki_session_id.clone());

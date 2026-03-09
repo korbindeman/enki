@@ -2,7 +2,7 @@
 
 Multi-agent coding orchestrator. Spawns [ACP](https://github.com/agentclientprotocol/agent-client-protocol) agents in isolated copies of your project, runs them as a DAG, and merges their work back.
 
-Enki doesn't make LLM API calls. It orchestrates agent processes and manages state. Currently only supports Claude Code. More agents coming, plus a way to bring your own.
+Enki doesn't make LLM API calls. It orchestrates agent processes and manages state. Supports [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and [OpenAI Codex](https://openai.com/index/codex/) out of the box, with support for any ACP-compatible agent.
 
 ## How it works
 
@@ -16,8 +16,8 @@ Works in any folder, git or not. In a git repo, enki commits each task on a bran
 ## Requirements
 
 - [Git](https://git-scm.com/)
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code): the agent enki orchestrates
-- [Node.js](https://nodejs.org/): used to install and run the ACP agent
+- [Node.js](https://nodejs.org/): used to install and run ACP agents
+- An API key for your chosen agent (Anthropic for Claude, OpenAI for Codex)
 - [Rust](https://rustup.rs/): if building from source
 
 ## Install
@@ -56,10 +56,18 @@ cargo install --path crates/cli
 ## Usage
 
 ```bash
-enki
+enki                  # uses Claude (default)
+enki --agent codex    # uses OpenAI Codex
 ```
 
-Opens the TUI. Sets up the project on first run.
+Opens the TUI. Sets up the project on first run. The `--agent` flag selects which agent to use. Built-in options are `claude` and `codex`. You can also pass a custom command or path to any ACP-compatible agent.
+
+To set the agent permanently, add to `.enki/enki.toml` or `~/.config/enki.toml`:
+
+```toml
+[agent]
+command = "codex"
+```
 
 Some notes:
  - Enki bypasses all tool permissions for the agents it spawns. An orchestrator that asks before every file write wouldn't be useful. If this causes trouble, we can add safety features later.

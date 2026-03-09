@@ -11,7 +11,7 @@ const PROMPT: &str = "› ";
 
 /// Run the chat interface. This takes over terminal input (raw mode)
 /// with a pinned input bubble at the bottom.
-pub async fn run(_db: enki_core::db::Db, db_path: String, enki_bin: PathBuf) -> anyhow::Result<()> {
+pub async fn run(_db: enki_core::db::Db, db_path: String, enki_bin: PathBuf, agent_override: Option<String>) -> anyhow::Result<()> {
     let project_cwd = std::env::current_dir()?;
     let project_name = project_cwd
         .file_name()
@@ -19,14 +19,15 @@ pub async fn run(_db: enki_core::db::Db, db_path: String, enki_bin: PathBuf) -> 
         .to_string_lossy()
         .to_string();
     let config = enki_core::config::load_config(&project_cwd);
+    let agent_name = agent_override.as_deref().unwrap_or(&config.agent.command);
     let status_msg = if config.workers.sonnet_only {
-        format!("{project_name} (sonnet mode)")
+        format!("{project_name} ({agent_name}, sonnet mode)")
     } else {
-        project_name
+        format!("{project_name} ({agent_name})")
     };
 
     // Spawn coordinator
-    let mut coord_handle = coordinator::spawn(project_cwd.clone(), db_path, enki_bin);
+    let mut coord_handle = coordinator::spawn(project_cwd.clone(), db_path, enki_bin, agent_override);
 
     let app = CoordinatorHandler {
         tx: &coord_handle.tx,
