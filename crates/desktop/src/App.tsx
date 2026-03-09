@@ -22,6 +22,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { Message } from "./types";
 import WorkerPanel from "./WorkerPanel";
 import TaskList from "./TaskList";
+import TierBadge from "./TierBadge";
 import Settings from "./Settings";
 
 interface PendingImage {
@@ -96,77 +97,129 @@ function AgentSelector() {
   );
 }
 
+function WorkerCardView(props: { card: NonNullable<Message["workerCard"]> }) {
+  const statusDotClass = () => {
+    switch (props.card.status) {
+      case "running": return "bg-emerald-400 animate-pulse";
+      case "done": return "bg-blue-400";
+      case "merging": return "bg-blue-400 animate-pulse";
+      case "merged": return "bg-emerald-400";
+      case "conflicted": return "bg-amber-400";
+      default: return "bg-red-400";
+    }
+  };
+
+  const statusText = () => {
+    switch (props.card.status) {
+      case "running": return "Running";
+      case "done": return "Done";
+      case "merging": return "Merging";
+      case "merged": return "Merged";
+      case "conflicted": return "Conflict";
+      default: return "Failed";
+    }
+  };
+
+  const statusTextClass = () => {
+    switch (props.card.status) {
+      case "merged": return "text-emerald-400";
+      case "failed": return "text-red-400";
+      case "conflicted": return "text-amber-400";
+      default: return "text-zinc-500";
+    }
+  };
+
+  return (
+    <div class="my-2 rounded-lg border border-zinc-700/50 bg-zinc-800/30 px-4 py-3">
+      <div class="flex items-center gap-3">
+        <span class={`inline-block w-2 h-2 rounded-full shrink-0 ${statusDotClass()}`} />
+        <span class="text-sm text-zinc-200 flex-1 truncate">{props.card.title}</span>
+        <TierBadge tier={props.card.tier} />
+        <span class={`text-xs ${statusTextClass()}`}>{statusText()}</span>
+      </div>
+      <Show when={props.card.error}>
+        <div class="mt-2 text-xs text-red-400 truncate">{props.card.error}</div>
+      </Show>
+    </div>
+  );
+}
+
 function ChatMessage(props: { message: Message }) {
   const activeToolCall = () =>
     props.message.toolCalls.find((tc) => !tc.done);
 
   return (
-    <Switch>
-      <Match when={props.message.role === "system"}>
-        <div class="text-xs text-text-muted text-center py-3">
-          {props.message.content}
-        </div>
-      </Match>
-      <Match when={props.message.role === "user"}>
-        <div class="border-l-2 border-border pl-4 py-3">
-          <div class="text-sm whitespace-pre-wrap text-text">
+    <Show
+      when={!props.message.workerCard}
+      fallback={<WorkerCardView card={props.message.workerCard!} />}
+    >
+      <Switch>
+        <Match when={props.message.role === "system"}>
+          <div class="text-xs text-text-muted text-center py-3">
             {props.message.content}
           </div>
-        </div>
-      </Match>
-      <Match when={props.message.role === "assistant"}>
-        <div class="py-3">
-          <Show when={props.message.content}>
-            <div
-              class="prose"
-              innerHTML={renderMarkdown(
-                props.message.content,
-                props.message.streaming,
-              )}
-            />
-          </Show>
-          {/* Inline tool calls */}
-          <Show when={props.message.toolCalls.length > 0}>
-            <div class="mt-3 border border-border-subtle rounded-lg bg-surface/30 px-4 py-3">
-              <div class="text-[10px] uppercase tracking-wider text-text-muted font-medium mb-2">
-                Tool calls ({props.message.toolCalls.length})
-              </div>
-              <For each={props.message.toolCalls}>
-                {(tc) => (
-                  <div class="flex items-center gap-2 py-0.5">
-                    <span
-                      class={`inline-block w-1.5 h-1.5 rounded-full shrink-0 ${tc.done ? "bg-text-faint" : "bg-amber-500 animate-pulse"}`}
-                    />
-                    <span class="text-xs text-text-muted font-mono truncate">
-                      {tc.name}
-                    </span>
-                  </div>
+        </Match>
+        <Match when={props.message.role === "user"}>
+          <div class="border-l-2 border-border pl-4 py-3">
+            <div class="text-sm whitespace-pre-wrap text-text">
+              {props.message.content}
+            </div>
+          </div>
+        </Match>
+        <Match when={props.message.role === "assistant"}>
+          <div class="py-3">
+            <Show when={props.message.content}>
+              <div
+                class="prose"
+                innerHTML={renderMarkdown(
+                  props.message.content,
+                  props.message.streaming,
                 )}
-              </For>
-            </div>
-          </Show>
-          {/* Inline status indicator */}
-          <Show when={props.message.streaming}>
-            <div class="mt-2 flex items-center gap-2">
-              <Show
-                when={activeToolCall()}
-                fallback={
-                  <>
-                    <span class="inline-block w-1.5 h-1.5 rounded-full bg-text-muted animate-pulse" />
-                    <span class="text-xs text-text-muted">Responding...</span>
-                  </>
-                }
-              >
-                <span class="inline-block w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
-                <span class="text-xs text-text-muted">
-                  Using {activeToolCall()!.name}
-                </span>
-              </Show>
-            </div>
-          </Show>
-        </div>
-      </Match>
-    </Switch>
+              />
+            </Show>
+            {/* Inline tool calls */}
+            <Show when={props.message.toolCalls.length > 0}>
+              <div class="mt-3 border border-border-subtle rounded-lg bg-surface/30 px-4 py-3">
+                <div class="text-[10px] uppercase tracking-wider text-text-muted font-medium mb-2">
+                  Tool calls ({props.message.toolCalls.length})
+                </div>
+                <For each={props.message.toolCalls}>
+                  {(tc) => (
+                    <div class="flex items-center gap-2 py-0.5">
+                      <span
+                        class={`inline-block w-1.5 h-1.5 rounded-full shrink-0 ${tc.done ? "bg-text-faint" : "bg-amber-500 animate-pulse"}`}
+                      />
+                      <span class="text-xs text-text-muted font-mono truncate">
+                        {tc.name}
+                      </span>
+                    </div>
+                  )}
+                </For>
+              </div>
+            </Show>
+            {/* Inline status indicator */}
+            <Show when={props.message.streaming}>
+              <div class="mt-2 flex items-center gap-2">
+                <Show
+                  when={activeToolCall()}
+                  fallback={
+                    <>
+                      <span class="inline-block w-1.5 h-1.5 rounded-full bg-text-muted animate-pulse" />
+                      <span class="text-xs text-text-muted">Responding...</span>
+                    </>
+                  }
+                >
+                  <span class="inline-block w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
+                  <span class="text-xs text-text-muted">
+                    Using {activeToolCall()!.name}
+                  </span>
+                </Show>
+              </div>
+            </Show>
+          </div>
+        </Match>
+      </Switch>
+    </Show>
   );
 }
 

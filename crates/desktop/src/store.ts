@@ -180,6 +180,19 @@ function handleEvent(event: CoordinatorEvent): void {
         }
 
         case "worker_spawned":
+          s.messages.push({
+            id: nextId(),
+            role: "system",
+            content: "",
+            streaming: false,
+            toolCalls: [],
+            workerCard: {
+              taskId: event.task_id,
+              title: event.title,
+              tier: event.tier,
+              status: "running",
+            },
+          });
           s.workers.push({
             taskId: event.task_id,
             title: event.title,
@@ -207,6 +220,12 @@ function handleEvent(event: CoordinatorEvent): void {
           break;
 
         case "worker_completed": {
+          const cardMsg = s.messages.find(
+            (m) => m.workerCard?.taskId === event.task_id,
+          );
+          if (cardMsg?.workerCard) {
+            cardMsg.workerCard.status = "done";
+          }
           // Mark worker as done, remove after brief delay.
           const cw = s.workers.find(
             (w) => w.taskId === event.task_id,
@@ -230,6 +249,13 @@ function handleEvent(event: CoordinatorEvent): void {
         }
 
         case "worker_failed": {
+          const cardMsg = s.messages.find(
+            (m) => m.workerCard?.taskId === event.task_id,
+          );
+          if (cardMsg?.workerCard) {
+            cardMsg.workerCard.status = "failed";
+            cardMsg.workerCard.error = event.error;
+          }
           // Mark worker as failed briefly.
           const fw = s.workers.find(
             (w) => w.taskId === event.task_id,
@@ -321,6 +347,12 @@ function handleEvent(event: CoordinatorEvent): void {
           break;
 
         case "merge_queued": {
+          const cardMsg = s.messages.find(
+            (m) => m.workerCard?.taskId === event.task_id,
+          );
+          if (cardMsg?.workerCard) {
+            cardMsg.workerCard.status = "merging";
+          }
           const task = s.tasks.find(
             (t) => t.taskId === event.task_id,
           );
@@ -329,6 +361,12 @@ function handleEvent(event: CoordinatorEvent): void {
         }
 
         case "merge_landed": {
+          const cardMsg = s.messages.find(
+            (m) => m.workerCard?.taskId === event.task_id,
+          );
+          if (cardMsg?.workerCard) {
+            cardMsg.workerCard.status = "merged";
+          }
           const task = s.tasks.find(
             (t) => t.taskId === event.task_id,
           );
@@ -342,6 +380,13 @@ function handleEvent(event: CoordinatorEvent): void {
         }
 
         case "merge_failed": {
+          const cardMsg = s.messages.find(
+            (m) => m.workerCard?.taskId === event.task_id,
+          );
+          if (cardMsg?.workerCard) {
+            cardMsg.workerCard.status = "failed";
+            cardMsg.workerCard.error = event.reason;
+          }
           const task = s.tasks.find(
             (t) => t.taskId === event.task_id,
           );
@@ -353,6 +398,12 @@ function handleEvent(event: CoordinatorEvent): void {
         }
 
         case "merge_conflicted": {
+          const cardMsg = s.messages.find(
+            (m) => m.workerCard?.taskId === event.task_id,
+          );
+          if (cardMsg?.workerCard) {
+            cardMsg.workerCard.status = "conflicted";
+          }
           const task = s.tasks.find(
             (t) => t.taskId === event.task_id,
           );
@@ -361,6 +412,12 @@ function handleEvent(event: CoordinatorEvent): void {
         }
 
         case "merge_progress": {
+          const cardMsg = s.messages.find(
+            (m) => m.workerCard?.taskId === event.task_id,
+          );
+          if (cardMsg?.workerCard) {
+            cardMsg.workerCard.status = "merging";
+          }
           const task = s.tasks.find(
             (t) => t.taskId === event.task_id,
           );

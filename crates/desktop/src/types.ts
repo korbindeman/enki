@@ -59,6 +59,18 @@ export interface ToolCall {
   done: boolean;
 }
 
+/** Lifecycle state of an inline worker card. */
+export type WorkerCardStatus = "running" | "done" | "merging" | "merged" | "failed" | "conflicted";
+
+/** An inline worker lifecycle card in the chat stream. */
+export interface WorkerCard {
+  taskId: string;
+  title: string;
+  tier: string;
+  status: WorkerCardStatus;
+  error?: string;
+}
+
 /** A chat message displayed in the main panel. */
 export interface Message {
   id: string;
@@ -68,6 +80,8 @@ export interface Message {
   streaming: boolean;
   /** Tool calls accumulated during this assistant turn. */
   toolCalls: ToolCall[];
+  /** If present, render as a worker lifecycle card instead of text. */
+  workerCard?: WorkerCard;
 }
 
 /** A tracked worker shown in the sidebar. */
