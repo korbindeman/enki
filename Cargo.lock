@@ -1001,7 +1001,7 @@ checksum = "4ef6b89e5b37196644d8796de5268852ff179b44e96276cf4290264843743bb7"
 
 [[package]]
 name = "enki"
-version = "2026.308.0"
+version = "2026.309.0"
 dependencies = [
  "anyhow",
  "ascii-dag",
@@ -1023,7 +1023,7 @@ dependencies = [
 
 [[package]]
 name = "enki-acp"
-version = "2026.308.0"
+version = "2026.309.0"
 dependencies = [
  "agent-client-protocol",
  "async-trait",
@@ -1041,7 +1041,7 @@ dependencies = [
 
 [[package]]
 name = "enki-core"
-version = "2026.308.0"
+version = "2026.309.0"
 dependencies = [
  "chrono",
  "dirs",
@@ -1058,7 +1058,7 @@ dependencies = [
 
 [[package]]
 name = "enki-desktop"
-version = "2026.308.0"
+version = "2026.309.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1080,7 +1080,7 @@ dependencies = [
 
 [[package]]
 name = "enki-tui"
-version = "2026.308.0"
+version = "2026.309.0"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -5703,18 +5703,18 @@ dependencies = [
 
 [[package]]
 name = "zerocopy"
-version = "0.8.40"
+version = "0.8.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a789c6e490b576db9f7e6b6d661bcc9799f7c0ac8352f56ea20193b2681532e5"
+checksum = "f2578b716f8a7a858b7f02d5bd870c14bf4ddbbcf3a4c05414ba6503640505e3"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.40"
+version = "0.8.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f65c489a7071a749c849713807783f70672b28094011623e200cb86dcb835953"
+checksum = "7e6cc098ea4d3bd6246687de65af3f920c430e236bee1e3bf2e441463f08a02f"
 dependencies = [
  "proc-macro2",
  "quote",
