@@ -59,10 +59,12 @@ body {
 
 /* Shiki dual theme: switch to dark colors in dark mode */
 @media (prefers-color-scheme: dark) {
+  .shiki {
+    background-color: var(--shiki-dark-bg) !important;
+  }
   .shiki,
   .shiki span {
     color: var(--shiki-dark) !important;
-    background-color: var(--shiki-dark-bg) !important;
   }
 }
 
@@ -195,7 +197,7 @@ body {
   font-family: ui-monospace, "SF Mono", "Cascadia Code", "Segoe UI Mono",
     Menlo, Monaco, Consolas, monospace;
   font-size: 0.8125rem;
-  line-height: 1.5;
+  line-height: 1.35;
   background: none !important;
   border: none;
   padding: 0;
