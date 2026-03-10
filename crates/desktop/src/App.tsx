@@ -290,6 +290,7 @@ function App() {
   const [input, setInput] = createSignal("");
   const [pendingImages, setPendingImages] = createSignal<PendingImage[]>([]);
   const [settingsOpen, setSettingsOpen] = createSignal(false);
+  const [stickToBottom, setStickToBottom] = createSignal(true);
 
   const isStreaming = () => {
     const msgs = state.messages;
@@ -301,6 +302,25 @@ function App() {
     initStore();
     listen("menu-open-project", () => handleOpenProject());
   });
+
+  // Track scroll position to detect user scrolling away from bottom
+  function handleScroll() {
+    if (!messagesContainer) return;
+    const { scrollTop, scrollHeight, clientHeight } = messagesContainer;
+    const distanceFromBottom = scrollHeight - scrollTop - clientHeight;
+    setStickToBottom(distanceFromBottom < 50);
+  }
+
+  onMount(() => messagesContainer?.addEventListener("scroll", handleScroll));
+  onCleanup(() => messagesContainer?.removeEventListener("scroll", handleScroll));
+
+  function scrollToBottom() {
+    messagesContainer?.scrollTo({
+      top: messagesContainer.scrollHeight,
+      behavior: "smooth",
+    });
+    setStickToBottom(true);
+  }
 
   // Auto-scroll on new messages or streaming content updates
   createEffect(() => {
@@ -315,10 +335,12 @@ function App() {
         if (last.type === "tools") void last.calls.length;
       }
     }
-    messagesContainer?.scrollTo({
-      top: messagesContainer.scrollHeight,
-      behavior: "smooth",
-    });
+    if (stickToBottom()) {
+      messagesContainer?.scrollTo({
+        top: messagesContainer.scrollHeight,
+        behavior: "smooth",
+      });
+    }
   });
 
   // Global Ctrl+C to interrupt
@@ -450,17 +472,30 @@ function App() {
           }
         >
           {/* Messages */}
-          <div ref={messagesContainer} class="flex-1 overflow-y-auto">
-            <div class="max-w-3xl mx-auto py-8 px-6">
-              <Show when={state.messages.length === 0}>
-                <div class="text-text-muted text-sm pt-20 text-center">
-                  Start a conversation to begin orchestrating...
-                </div>
-              </Show>
-              <For each={state.messages}>
-                {(msg) => <ChatMessage message={msg} />}
-              </For>
+          <div class="relative flex-1 overflow-hidden">
+            <div ref={messagesContainer} class="h-full overflow-y-auto">
+              <div class="max-w-3xl mx-auto py-8 px-6">
+                <Show when={state.messages.length === 0}>
+                  <div class="text-text-muted text-sm pt-20 text-center">
+                    Start a conversation to begin orchestrating...
+                  </div>
+                </Show>
+                <For each={state.messages}>
+                  {(msg) => <ChatMessage message={msg} />}
+                </For>
+              </div>
             </div>
+            <Show when={!stickToBottom()}>
+              <button
+                onClick={scrollToBottom}
+                class="back-to-bottom absolute top-3 left-1/2 -translate-x-1/2 z-10 flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs text-text-muted bg-surface/90 border border-border-subtle backdrop-blur-sm hover:text-text hover:bg-surface transition-colors cursor-pointer"
+              >
+                <svg class="w-3 h-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" d="M19 14l-7 7-7-7M12 21V3" />
+                </svg>
+                Back to latest
+              </button>
+            </Show>
           </div>
 
           {/* Input area */}
