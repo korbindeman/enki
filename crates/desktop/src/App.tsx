@@ -25,6 +25,7 @@ import WorkerPanel from "./WorkerPanel";
 import TaskList from "./TaskList";
 import TierBadge from "./TierBadge";
 import Settings from "./Settings";
+import { Check, GitMerge, AlertTriangle, XCircle, Loader2, Wrench } from "lucide-solid";
 
 interface PendingImage {
   id: string;
@@ -118,47 +119,24 @@ function AgentSelector() {
 }
 
 function WorkerCardView(props: { card: NonNullable<Message["workerCard"]> }) {
-  const statusDotClass = () => {
+  const statusIcon = () => {
     switch (props.card.status) {
-      case "running": return "bg-emerald-400 animate-pulse";
-      case "done": return "bg-blue-400";
-      case "merging": return "bg-blue-400 animate-pulse";
-      case "merged": return "bg-emerald-400";
-      case "conflicted": return "bg-amber-400";
-      default: return "bg-red-400";
-    }
-  };
-
-  const statusText = () => {
-    switch (props.card.status) {
-      case "running": return "Running";
-      case "done": return "Done";
-      case "merging": return "Merging";
-      case "merged": return "Merged";
-      case "conflicted": return "Conflict";
-      default: return "Failed";
-    }
-  };
-
-  const statusTextClass = () => {
-    switch (props.card.status) {
-      case "merged": return "text-emerald-400";
-      case "failed": return "text-red-400";
-      case "conflicted": return "text-amber-400";
-      default: return "text-zinc-500";
+      case "running": return <Loader2 class="w-3.5 h-3.5 text-text-muted animate-spin" />;
+      case "done": return <Check class="w-3.5 h-3.5 text-emerald-400" />;
+      case "merging": return <GitMerge class="w-3.5 h-3.5 text-blue-400 animate-pulse" />;
+      case "merged": return <GitMerge class="w-3.5 h-3.5 text-emerald-400" />;
+      case "conflicted": return <AlertTriangle class="w-3.5 h-3.5 text-amber-400" />;
+      default: return <XCircle class="w-3.5 h-3.5 text-red-400" />;
     }
   };
 
   return (
-    <div class="my-2 rounded-lg border border-zinc-700/50 bg-zinc-800/30 px-4 py-3">
-      <div class="flex items-center gap-3">
-        <span class={`inline-block w-2 h-2 rounded-full shrink-0 ${statusDotClass()}`} />
-        <span class="text-sm text-zinc-200 flex-1 truncate">{props.card.title}</span>
-        <TierBadge tier={props.card.tier} />
-        <span class={`text-xs ${statusTextClass()}`}>{statusText()}</span>
-      </div>
+    <div class="my-1.5 flex items-center gap-2.5 px-1 py-1 text-xs text-text-muted">
+      <span class="shrink-0">{statusIcon()}</span>
+      <span class="text-text truncate">{props.card.title}</span>
+      <TierBadge tier={props.card.tier} />
       <Show when={props.card.error}>
-        <div class="mt-2 text-xs text-red-400 truncate">{props.card.error}</div>
+        <span class="text-red-400 truncate">{props.card.error}</span>
       </Show>
     </div>
   );
@@ -186,8 +164,12 @@ function ToolCallPanel(props: { block: ContentBlock & { type: "tools" }; isLast:
         onClick={toggle}
         class="w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-surface/20 transition-colors"
       >
+        <Wrench class="w-3 h-3 text-text-muted" />
+        <span class="text-[10px] uppercase tracking-wider text-text-muted font-medium">
+          Tool calls ({props.block.calls.length})
+        </span>
         <svg
-          class={`w-3 h-3 text-text-muted transition-transform ${expanded() ? "rotate-90" : ""}`}
+          class={`w-3 h-3 text-text-faint transition-transform ml-auto ${expanded() ? "rotate-90" : ""}`}
           fill="none"
           stroke="currentColor"
           stroke-width="2"
@@ -195,9 +177,6 @@ function ToolCallPanel(props: { block: ContentBlock & { type: "tools" }; isLast:
         >
           <path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7" />
         </svg>
-        <span class="text-[10px] uppercase tracking-wider text-text-muted font-medium">
-          Tool calls ({props.block.calls.length})
-        </span>
       </button>
       <Show when={expanded()}>
         <div class="px-4 pb-2">
@@ -423,8 +402,7 @@ function App() {
       {/* Sidebar */}
       <aside class="w-[260px] shrink-0 border-r border-border bg-paper flex flex-col">
         <div class="px-4 py-3">
-          <div class="flex items-center justify-between">
-            <h1 class="text-lg font-semibold">Enki</h1>
+          <div class="flex items-center justify-end">
             <button
               onClick={() => setSettingsOpen(true)}
               class="text-text-muted hover:text-text transition-colors"
@@ -489,7 +467,7 @@ function App() {
           <div class="relative">
             <div class="absolute top-0 left-0 right-0 -translate-y-full h-8 pointer-events-none" style="background: linear-gradient(to top, var(--color-background), transparent)" />
             <div class="px-6 py-3 pb-5">
-              <div class="max-w-3xl mx-auto rounded-2xl bg-surface/50 border border-border-subtle focus-within:border-text-muted transition-colors">
+              <div class="max-w-3xl mx-auto rounded-2xl bg-surface/50 border border-border-subtle focus-within:border-border transition-colors">
                 {/* Pending images */}
                 <Show when={pendingImages().length > 0}>
                   <div class="px-4 pt-3 flex gap-2 flex-wrap">
@@ -529,10 +507,10 @@ function App() {
                       : "Connecting..."
                   }
                   rows={1}
-                  class="w-full resize-none bg-transparent px-4 py-3 text-sm text-text placeholder-text-muted focus:outline-none disabled:opacity-50 disabled:cursor-not-allowed"
+                  class="w-full resize-none bg-transparent px-5 pt-4 pb-3 text-sm text-text placeholder-text-muted focus:outline-none disabled:opacity-50 disabled:cursor-not-allowed"
                 />
                 {/* Bottom toolbar */}
-                <div class="flex items-center justify-between px-3 py-2">
+                <div class="flex items-center justify-between px-4 py-2">
                   {/* Agent selector */}
                   <AgentSelector />
                   {/* Send / Stop button */}

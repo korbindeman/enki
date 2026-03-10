@@ -204,18 +204,7 @@ function handleEvent(event: CoordinatorEvent): void {
         }
 
         case "worker_spawned":
-          s.messages.push({
-            id: nextId(),
-            role: "system",
-            blocks: [],
-            streaming: false,
-            workerCard: {
-              taskId: event.task_id,
-              title: event.title,
-              tier: event.tier,
-              status: "running",
-            },
-          });
+          // No chat card on spawn — card appears on completion instead.
           s.workers.push({
             taskId: event.task_id,
             title: event.title,
@@ -243,13 +232,21 @@ function handleEvent(event: CoordinatorEvent): void {
           break;
 
         case "worker_completed": {
-          const cardMsg = s.messages.find(
-            (m) => m.workerCard?.taskId === event.task_id,
-          );
-          if (cardMsg?.workerCard) {
-            cardMsg.workerCard.status = "done";
-          }
-          // Mark worker as done, remove after brief delay.
+          // Create card at current chat position (bottom) on completion.
+          const tier = s.tasks.find((t) => t.taskId === event.task_id)?.tier ?? "standard";
+          s.messages.push({
+            id: nextId(),
+            role: "system",
+            blocks: [],
+            streaming: false,
+            workerCard: {
+              taskId: event.task_id,
+              title: event.title,
+              tier,
+              status: "done",
+            },
+          });
+          // Mark worker as done, remove from sidebar.
           const cw = s.workers.find(
             (w) => w.taskId === event.task_id,
           );
@@ -272,13 +269,21 @@ function handleEvent(event: CoordinatorEvent): void {
         }
 
         case "worker_failed": {
-          const cardMsg = s.messages.find(
-            (m) => m.workerCard?.taskId === event.task_id,
-          );
-          if (cardMsg?.workerCard) {
-            cardMsg.workerCard.status = "failed";
-            cardMsg.workerCard.error = event.error;
-          }
+          // Create failed card at current chat position.
+          const failTier = s.tasks.find((t) => t.taskId === event.task_id)?.tier ?? "standard";
+          s.messages.push({
+            id: nextId(),
+            role: "system",
+            blocks: [],
+            streaming: false,
+            workerCard: {
+              taskId: event.task_id,
+              title: event.title,
+              tier: failTier,
+              status: "failed",
+              error: event.error,
+            },
+          });
           // Mark worker as failed briefly.
           const fw = s.workers.find(
             (w) => w.taskId === event.task_id,
