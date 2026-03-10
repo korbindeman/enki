@@ -216,6 +216,7 @@ impl Runtime {
                         let sonnet_only = self.config.workers.sonnet_only;
                         let agent_program = prep_result.agent_program.clone();
                         let agent_args = prep_result.agent_args.clone();
+                        let agent_env = prep_result.agent_env.clone();
 
                         let handle = tokio::task::spawn_local(async move {
                             let worker_mcp = vec![enki_acp::acp_schema::McpServer::Stdio(
@@ -226,6 +227,7 @@ impl Runtime {
                             mgr.start_session_with_mcp(
                                 &agent_program, &args_ref,
                                 copy_path, worker_mcp, &task_label, sonnet_only,
+                                &agent_env,
                             ).await
                         });
 

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use enki_core::types::Id;
@@ -31,6 +32,7 @@ pub(super) struct PrepResult {
     pub artifact: bool,
     pub agent_program: String,
     pub agent_args: Vec<String>,
+    pub agent_env: HashMap<String, String>,
     pub mcp_args: Vec<String>,
 }
 
@@ -65,7 +67,7 @@ impl Runtime {
         }
 
         let agent_cmd =
-            enki_core::agent_runtime::resolve_from_config(&self.config.agent)
+            enki_core::agent_runtime::resolve_from_config(&self.config.agent_for_role("worker"))
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         Ok(PrepResult {
@@ -75,6 +77,7 @@ impl Runtime {
             artifact,
             agent_program: agent_cmd.program.to_str().unwrap().to_string(),
             agent_args: agent_cmd.args,
+            agent_env: agent_cmd.env,
             mcp_args,
         })
     }

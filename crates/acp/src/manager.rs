@@ -71,13 +71,17 @@ impl AgentManager {
         cwd: PathBuf,
         label: &str,
     ) -> Result<String> {
-        self.start_session_with_mcp(agent_cmd, agent_args, cwd, vec![], label, false).await
+        self.start_session_with_mcp(agent_cmd, agent_args, cwd, vec![], label, false, &HashMap::new()).await
     }
 
     /// Spawn a new agent process with MCP servers configured.
     ///
     /// If `sonnet_only` is true, attempts to set the model to sonnet via
     /// `set_session_config_option` after session creation.
+    ///
+    /// `agent_env` contains role-specific environment variables from the agent config.
+    /// These are merged on top of the base env (from `set_env()`), so role-specific
+    /// values take precedence.
     pub async fn start_session_with_mcp(
         &self,
         agent_cmd: &str,
@@ -86,6 +90,7 @@ impl AgentManager {
         mcp_servers: Vec<acp::McpServer>,
         label: &str,
         sonnet_only: bool,
+        agent_env: &HashMap<String, String>,
     ) -> Result<String> {
         tracing::debug!(cmd = agent_cmd, args = ?agent_args, cwd = %cwd.display(), "spawning agent process");
         // Spawn agent subprocess
@@ -99,7 +104,11 @@ impl AgentManager {
         // Clear CLAUDECODE so the agent doesn't think it's nested inside
         // another Claude Code session and refuse to start.
         cmd.env_remove("CLAUDECODE");
+        // Base env (ENKI_* vars) first, then role-specific agent env on top.
         for (k, v) in self.extra_env.iter() {
+            cmd.env(k, v);
+        }
+        for (k, v) in agent_env {
             cmd.env(k, v);
         }
         let mut child = cmd.spawn()?;

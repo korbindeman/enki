@@ -24,13 +24,15 @@ impl Runtime {
         )];
 
         let agent_cmd =
-            enki_core::agent_runtime::resolve_from_config(&self.config.agent).map_err(|e| anyhow::anyhow!("{e}"))?;
+            enki_core::agent_runtime::resolve_from_config(&self.config.agent_for_role("worker"))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
         let args_ref: Vec<&str> = agent_cmd.args.iter().map(|s| s.as_str()).collect();
         let session_id = self.mgr
             .start_session_with_mcp(
                 agent_cmd.program.to_str().unwrap(), &args_ref,
                 temp_dir.to_path_buf(), merger_mcp, &format!("merger-{mr_id}"),
                 self.config.workers.sonnet_only,
+                &agent_cmd.env,
             )
             .await?;
 

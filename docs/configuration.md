@@ -21,9 +21,16 @@ max_light = 10
 sonnet_only = false
 
 [agent]
-command = "claude-agent-acp"
+command = "claude"
 args = []
 env = {}
+
+[agent.worker]
+command = "opencode"
+env = { OLLAMA_HOST = "http://192.168.1.x:11434" }
+
+[agent.sidecar]
+command = "claude"
 ```
 
 ## Reference
@@ -51,6 +58,30 @@ env = {}
 | `command` | string | `"claude-agent-acp"` | Agent binary. The built-in `claude-agent-acp` is auto-installed via npm. Any other value is resolved from PATH or as an absolute path. |
 | `args` | string[] | `[]` | Extra CLI arguments passed to the agent binary. |
 | `env` | table | `{}` | Environment variables set on the agent process. Enki's own env vars (`ENKI_BIN`, `ENKI_DIR`, `ENKI_SESSION_ID`) take precedence. |
+
+### `[agent.coordinator]`, `[agent.worker]`, `[agent.sidecar]`
+
+Optional per-role overrides. Each supports the same fields as `[agent]`: `command`, `args`, `env`. Unset fields inherit from `[agent]`.
+
+| Role | Used for |
+|------|----------|
+| `coordinator` | The planner/coordinator session |
+| `worker` | Worker and merger sessions |
+| `sidecar` | The quick-task sidecar session |
+
+```toml
+[agent]
+command = "claude"
+
+[agent.worker]
+command = "opencode"                # workers use opencode
+env = { OLLAMA_HOST = "http://..." }
+
+[agent.coordinator]
+args = ["--extra-flag"]             # coordinator gets extra args, same command
+```
+
+Env merging order: Enki base env (`ENKI_BIN`, etc.) → base `[agent].env` → role-specific `[agent.<role>].env`. Later values win.
 
 ## Custom agents
 

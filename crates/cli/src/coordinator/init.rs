@@ -80,10 +80,6 @@ pub(super) async fn initialize(
         env.insert("ENKI_BIN".to_string(), enki_bin.display().to_string());
         env.insert("ENKI_DIR".to_string(), enki_dir.display().to_string());
         env.insert("ENKI_SESSION_ID".to_string(), enki_session_id.clone());
-        // Merge agent-specific env from config (enki vars take precedence).
-        for (k, v) in &config.agent.env {
-            env.entry(k.clone()).or_insert_with(|| v.clone());
-        }
         env
     };
 
@@ -95,12 +91,13 @@ pub(super) async fn initialize(
     let mut mgr = AgentManager::new();
     mgr.set_env(enki_env);
 
-    // Resolve agent binary from config.
-    let agent_cmd = match enki_core::agent_runtime::resolve_from_config(&config.agent) {
+    // Resolve coordinator agent binary from config.
+    let coord_agent_cfg = config.agent_for_role("coordinator");
+    let coord_cmd = match enki_core::agent_runtime::resolve_from_config(&coord_agent_cfg) {
         Ok(cmd) => cmd,
         Err(e) => {
             let _ = tx.send(FromCoordinator::Error(format!(
-                "failed to resolve agent binary: {e}"
+                "failed to resolve coordinator agent: {e}"
             )));
             return None;
         }
@@ -111,15 +108,16 @@ pub(super) async fn initialize(
         enki_acp::acp_schema::McpServerStdio::new("enki", &enki_bin)
             .args(vec!["mcp".into(), "--role".into(), "planner".into()]),
     )];
-    let args_ref: Vec<&str> = agent_cmd.args.iter().map(|s| s.as_str()).collect();
+    let args_ref: Vec<&str> = coord_cmd.args.iter().map(|s| s.as_str()).collect();
     let coord_session_id = match mgr
         .start_session_with_mcp(
-            agent_cmd.program.to_str().unwrap(),
+            coord_cmd.program.to_str().unwrap(),
             &args_ref,
             cwd.clone(),
             planner_mcp,
             "coordinator",
             false, // planner doesn't use sonnet_only
+            &coord_cmd.env,
         )
         .await
     {
@@ -137,20 +135,33 @@ pub(super) async fn initialize(
 
     let (coord, prompt_done_rx) = CoordinatorSession::new(coord_session_id);
 
+    // Resolve sidecar agent (may differ from coordinator).
+    let sidecar_agent_cfg = config.agent_for_role("sidecar");
+    let sidecar_cmd = match enki_core::agent_runtime::resolve_from_config(&sidecar_agent_cfg) {
+        Ok(cmd) => cmd,
+        Err(e) => {
+            let _ = tx.send(FromCoordinator::Error(format!(
+                "failed to resolve sidecar agent: {e}"
+            )));
+            return None;
+        }
+    };
+
     // Create sidecar ACP session (works in project root, no worktree).
     let sidecar_mcp = vec![enki_acp::acp_schema::McpServer::Stdio(
         enki_acp::acp_schema::McpServerStdio::new("enki", &enki_bin)
             .args(vec!["mcp".into(), "--role".into(), "sidecar".into()]),
     )];
-
+    let sidecar_args_ref: Vec<&str> = sidecar_cmd.args.iter().map(|s| s.as_str()).collect();
     let sidecar_session_id = match mgr
         .start_session_with_mcp(
-            agent_cmd.program.to_str().unwrap(),
-            &args_ref,
+            sidecar_cmd.program.to_str().unwrap(),
+            &sidecar_args_ref,
             cwd.clone(),
             sidecar_mcp,
             "sidecar",
             true, // sonnet_only — fast and cheap for quick tasks
+            &sidecar_cmd.env,
         )
         .await
     {
