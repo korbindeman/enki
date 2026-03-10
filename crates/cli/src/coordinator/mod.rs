@@ -54,6 +54,8 @@ pub enum ToCoordinator {
     Shutdown,
     /// Stop all running workers immediately.
     StopAll,
+    /// Stop a single worker by task_id.
+    StopWorker { task_id: String },
 }
 
 /// Messages sent from the coordinator thread back to the UI.
@@ -209,6 +211,16 @@ impl Runtime {
         t.current_tool.clear();
     }
 
+    fn kill_worker(&self, task_id: &str) {
+        let session_id = self.tracker.borrow().task_to_session(task_id);
+        if let Some(sid) = session_id {
+            tracing::info!(task_id, session_id = %sid, "stopping worker");
+            self.mgr.kill_session(&sid);
+        } else {
+            tracing::warn!(task_id, "stop_worker: no active session for task");
+        }
+    }
+
     async fn handle_command(&mut self, cmd: Command, coord: &mut CoordinatorSession) {
         let events = self.orch.handle(cmd);
         self.process_events(events, coord).await;
@@ -273,6 +285,9 @@ async fn coordinator_loop(
                         ToCoordinator::StopAll => {
                             rt.kill_all_workers();
                             rt.handle_command(Command::StopAll, &mut coord).await;
+                        }
+                        ToCoordinator::StopWorker { task_id } => {
+                            rt.kill_worker(&task_id);
                         }
                     }
                 }

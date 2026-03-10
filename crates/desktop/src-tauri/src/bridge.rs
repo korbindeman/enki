@@ -62,6 +62,13 @@ pub fn stop_all(state: tauri::State<CoordinatorState>) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub fn stop_worker(task_id: String, state: tauri::State<CoordinatorState>) -> Result<(), String> {
+    state.tx.lock().unwrap()
+        .send(ToCoordinator::StopWorker { task_id })
+        .map_err(|_| "coordinator channel closed".to_string())
+}
+
+#[tauri::command]
 pub async fn set_agent(
     agent: String,
     state: tauri::State<'_, CoordinatorState>,

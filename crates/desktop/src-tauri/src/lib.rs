@@ -12,6 +12,7 @@ pub fn run() {
             bridge::send_prompt,
             bridge::interrupt,
             bridge::stop_all,
+            bridge::stop_worker,
             bridge::set_agent,
             bridge::get_project_dir,
             bridge::get_current_branch,

@@ -54,6 +54,14 @@ impl WorkerTracker {
             .collect()
     }
 
+    /// Reverse lookup: find the session_id for a given task_id.
+    pub fn task_to_session(&self, task_id: &str) -> Option<String> {
+        self.session_to_task
+            .iter()
+            .find(|(_, tid)| tid.as_str() == task_id)
+            .map(|(sid, _)| sid.clone())
+    }
+
     pub fn worker_count(&self) -> usize {
         self.session_to_task.len()
     }
