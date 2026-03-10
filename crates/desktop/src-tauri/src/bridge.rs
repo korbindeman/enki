@@ -180,6 +180,8 @@ pub struct ConfigPayload {
     pub max_standard: usize,
     pub max_light: usize,
     pub sonnet_only: bool,
+    pub local_workers: bool,
+    pub ollama_host: String,
     pub agent_command: String,
 }
 
@@ -192,6 +194,16 @@ fn global_config_path() -> PathBuf {
 #[tauri::command]
 pub fn load_config() -> Result<ConfigPayload, String> {
     let config = enki_core::config::load_config(&PathBuf::from("/dev/null"));
+    let worker_override = config.agent.overrides.get("worker");
+    let local_workers = worker_override
+        .and_then(|w| w.command.as_deref())
+        .map(|cmd| cmd == "opencode")
+        .unwrap_or(false);
+    let ollama_host = worker_override
+        .and_then(|w| w.env.as_ref())
+        .and_then(|env| env.get("OLLAMA_HOST"))
+        .cloned()
+        .unwrap_or_default();
     Ok(ConfigPayload {
         commit_suffix: config.git.commit_suffix,
         max_workers: config.workers.limits.max_workers,
@@ -199,6 +211,8 @@ pub fn load_config() -> Result<ConfigPayload, String> {
         max_standard: config.workers.limits.max_standard,
         max_light: config.workers.limits.max_light,
         sonnet_only: config.workers.sonnet_only,
+        local_workers,
+        ollama_host,
         agent_command: config.agent.command,
     })
 }
@@ -245,6 +259,15 @@ pub fn save_config(config: ConfigPayload) -> Result<(), String> {
     // [agent]
     if config.agent_command != default.agent.command {
         sections.push(format!("[agent]\ncommand = {:?}", config.agent_command));
+    }
+
+    // [agent.worker]
+    if config.local_workers {
+        let mut worker_fields = vec![format!("command = {:?}", "opencode")];
+        if !config.ollama_host.is_empty() {
+            worker_fields.push(format!("env = {{ OLLAMA_HOST = {:?} }}", config.ollama_host));
+        }
+        sections.push(format!("[agent.worker]\n{}", worker_fields.join("\n")));
     }
 
     let content = if sections.is_empty() {

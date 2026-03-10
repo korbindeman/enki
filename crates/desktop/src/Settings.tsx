@@ -8,6 +8,8 @@ interface ConfigPayload {
   max_standard: number;
   max_light: number;
   sonnet_only: boolean;
+  local_workers: boolean;
+  ollama_host: string;
   agent_command: string;
 }
 
@@ -18,6 +20,8 @@ const DEFAULTS: ConfigPayload = {
   max_standard: 5,
   max_light: 10,
   sonnet_only: false,
+  local_workers: false,
+  ollama_host: "",
   agent_command: "claude-agent-acp",
 };
 
@@ -25,6 +29,7 @@ type SettingConfig =
   | { type: "number"; key: keyof ConfigPayload; label: string; min: number; max: number }
   | { type: "text"; key: keyof ConfigPayload; label: string }
   | { type: "boolean"; key: keyof ConfigPayload; label: string }
+  | { type: "conditional-text"; key: keyof ConfigPayload; label: string; condition: keyof ConfigPayload; placeholder?: string }
   | { type: "separator" }
   | { type: "heading"; label: string };
 
@@ -35,6 +40,8 @@ const settingsConfig: SettingConfig[] = [
   { type: "number", key: "max_standard", label: "Max Standard", min: 0, max: 50 },
   { type: "number", key: "max_light", label: "Max Light", min: 0, max: 50 },
   { type: "boolean", key: "sonnet_only", label: "Sonnet Only" },
+  { type: "boolean", key: "local_workers", label: "Local Workers" },
+  { type: "conditional-text", key: "ollama_host", label: "Ollama Host", condition: "local_workers", placeholder: "http://localhost:11434" },
   { type: "separator" },
   { type: "heading", label: "Git" },
   { type: "text", key: "commit_suffix", label: "Commit Suffix" },
@@ -212,6 +219,35 @@ export default function Settings(props: { open: boolean; onClose: () => void }) 
                           >
                             ✓
                           </button>
+                        </div>
+                      </div>
+                    );
+                  }
+
+                  if (setting.type === "conditional-text") {
+                    if (!current[setting.condition]) return null;
+                    const value = current[setting.key] as string;
+                    const defaultValue = DEFAULTS[setting.key] as string;
+                    const hasChanged = value !== defaultValue;
+                    return (
+                      <div class="flex items-center justify-between pl-4">
+                        <label class="text-sm text-text">{setting.label}</label>
+                        <div class="flex items-center gap-2">
+                          <Show when={hasChanged}>
+                            <button
+                              class="text-xs text-text-muted hover:text-text hover:underline"
+                              onClick={() => resetField(setting.key)}
+                            >
+                              Reset
+                            </button>
+                          </Show>
+                          <input
+                            type="text"
+                            class="w-48 h-7 px-2 text-sm bg-input-bg border border-border rounded text-text focus:outline-none focus:border-text-muted"
+                            value={value}
+                            placeholder={setting.placeholder}
+                            onInput={(e) => updateField(setting.key, e.currentTarget.value)}
+                          />
                         </div>
                       </div>
                     );
