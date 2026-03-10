@@ -61,6 +61,7 @@ export async function sendPrompt(
         role: "user",
         blocks: [{ type: "text", content: text }],
         streaming: false,
+        images: images?.map((i) => `data:${i.mime_type};base64,${i.data}`),
       });
     }),
   );

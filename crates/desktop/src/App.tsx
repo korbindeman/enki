@@ -230,6 +230,15 @@ function ChatMessage(props: { message: Message }) {
         <Match when={props.message.role === "user"}>
           <div class="flex justify-end py-3">
             <div class="max-w-[85%] rounded-2xl bg-surface px-4 py-2.5 text-sm whitespace-pre-wrap text-text">
+              <Show when={props.message.images?.length}>
+                <div class="flex gap-2 flex-wrap mb-2">
+                  <For each={props.message.images}>
+                    {(url) => (
+                      <img src={url} alt="" class="w-32 h-32 rounded-lg object-cover" />
+                    )}
+                  </For>
+                </div>
+              </Show>
               {textContent()}
             </div>
           </div>
@@ -512,7 +521,7 @@ function App() {
                           <img
                             src={img.url}
                             alt=""
-                            class="h-20 rounded-lg border border-border object-cover"
+                            class="w-20 h-20 rounded-lg border border-border object-cover"
                           />
                           <button
                             onClick={() => removeImage(img.id)}

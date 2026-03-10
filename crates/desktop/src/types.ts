@@ -86,6 +86,8 @@ export interface Message {
   streaming: boolean;
   /** If present, render as a worker lifecycle card instead of text. */
   workerCard?: WorkerCard;
+  /** Image data URLs attached to user messages. */
+  images?: string[];
 }
 
 /** A tracked worker shown in the sidebar. */
