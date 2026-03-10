@@ -45,7 +45,7 @@ const BUILTINS: &[BuiltinAgent] = &[
         name: "codex",
         kind: BuiltinKind::Npm {
             package: "@zed-industries/codex-acp",
-            entry_point: "node_modules/@zed-industries/codex-acp/dist/index.js",
+            entry_point: "node_modules/@zed-industries/codex-acp/bin/codex-acp.js",
             cache_name: "codex-acp",
         },
     },
