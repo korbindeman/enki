@@ -75,6 +75,10 @@ export async function stopAll(): Promise<void> {
   await invoke("stop_all");
 }
 
+export async function stopWorker(taskId: string): Promise<void> {
+  await invoke("stop_worker", { taskId });
+}
+
 export async function fetchBranch(): Promise<void> {
   try {
     const branch = await invoke<string>("get_current_branch");

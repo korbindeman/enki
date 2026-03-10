@@ -1,5 +1,5 @@
 import { For, Show } from "solid-js";
-import { state } from "./store";
+import { state, stopWorker, stopAll } from "./store";
 import TierBadge from "./TierBadge";
 
 function WorkerCard(props: {
@@ -11,7 +11,7 @@ function WorkerCard(props: {
 }) {
   return (
     <div
-      class="rounded-lg p-2.5 text-sm transition-colors"
+      class="group rounded-lg p-2.5 text-sm transition-colors"
       classList={{
         "bg-red-950/50 border border-red-800/50": props.failed,
         "bg-surface/50": !props.failed,
@@ -30,6 +30,15 @@ function WorkerCard(props: {
           {props.title}
         </span>
         <TierBadge tier={props.tier} />
+        <Show when={!props.failed}>
+          <button
+            class="opacity-0 group-hover:opacity-60 hover:!opacity-100 text-text-muted hover:text-red-400 transition-opacity text-xs leading-none px-0.5"
+            title="Stop worker"
+            onClick={() => stopWorker(props.taskId)}
+          >
+            ×
+          </button>
+        </Show>
       </div>
       <div
         class="text-xs truncate pl-4"
@@ -50,8 +59,15 @@ export default function WorkerPanel() {
       <h2 class="text-[11px] font-medium text-text-muted tracking-wide mb-2 flex items-center justify-between">
         <span>Workers</span>
         <Show when={state.workerCount > 0}>
-          <span class="text-text-muted normal-case tracking-normal font-normal">
+          <span class="text-text-muted normal-case tracking-normal font-normal flex items-center gap-2">
             {state.workerCount} active
+            <button
+              class="text-text-faint hover:text-red-400 transition-colors"
+              title="Stop all workers"
+              onClick={() => stopAll()}
+            >
+              Stop all
+            </button>
           </span>
         </Show>
       </h2>
