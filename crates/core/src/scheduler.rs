@@ -293,6 +293,21 @@ impl Scheduler {
         actions
     }
 
+    /// Revert a SpawnWorker action that the runtime couldn't execute.
+    /// Moves the node from Running back to Ready and decrements the tier count.
+    pub fn revert_spawn(&mut self, execution_id: &str, step_id: &str) {
+        if let Some(exec) = self.executions.get_mut(execution_id) {
+            if exec.dag.revert_running(step_id) {
+                let tier = exec
+                    .dag
+                    .get(step_id)
+                    .map(|n| n.tier.unwrap_or(Tier::Standard))
+                    .unwrap_or(Tier::Standard);
+                self.running.decrement(tier);
+            }
+        }
+    }
+
     /// Notify the scheduler that a worker has finished (but merge hasn't landed yet).
     /// Decrements the tier count (worker process is gone), stores output, and
     /// transitions the DAG node to WorkerDone (fires Completed/Started edges).

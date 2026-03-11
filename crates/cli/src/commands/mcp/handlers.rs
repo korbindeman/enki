@@ -475,7 +475,7 @@ pub(super) fn tool_task_retry(args: &Value) -> Result<String, String> {
     // Reset the execution status to running so the poll loop rediscovers it.
     db.update_execution_status(&exec_id, ExecutionStatus::Running).map_err(|e| e.to_string())?;
 
-    write_signal_file(&json!({"type": "task_created", "task_id": task_id_str}))?;
+    write_signal_file(&json!({"type": "retry_task", "task_id": task_id.0}))?;
 
     let mut result = format!("Task {} reset to pending.", task_id_str);
     if unblocked > 0 {

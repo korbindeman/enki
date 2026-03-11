@@ -307,6 +307,18 @@ impl Dag {
         false
     }
 
+    /// Revert a Running node back to Ready (e.g. when the runtime can't
+    /// actually spawn the worker yet). Returns true if the revert happened.
+    pub fn revert_running(&mut self, id: &str) -> bool {
+        if let Some(&idx) = self.index.get(id)
+            && self.nodes[idx].status == NodeStatus::Running
+        {
+            self.nodes[idx].status = NodeStatus::Ready;
+            return true;
+        }
+        false
+    }
+
     /// Mark a running node as worker-done (worker finished, merge pending).
     pub fn mark_worker_done(&mut self, id: &str) -> bool {
         if let Some(&idx) = self.index.get(id)

@@ -36,6 +36,11 @@ impl Orchestrator {
                         "execution_created" | "task_created" | "steps_added" => {
                             found = true;
                         }
+                        "retry_task" => {
+                            if let Some(task_id) = signal.get("task_id").and_then(|v| v.as_str()) {
+                                events.extend(self.retry_task(crate::types::Id(task_id.to_string())));
+                            }
+                        }
                         "resume" => {
                             let target = parse_signal_target(&signal);
                             if let Some(t) = target {

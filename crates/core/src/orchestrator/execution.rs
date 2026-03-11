@@ -323,7 +323,7 @@ impl Orchestrator {
     }
 
     /// Register an execution created externally (via MCP) with the in-memory scheduler.
-    fn register_execution_from_db(&mut self, execution_id: &Id) {
+    pub(super) fn register_execution_from_db(&mut self, execution_id: &Id) {
         let steps = match self.db.get_execution_steps(execution_id) {
             Ok(s) => s,
             Err(e) => {

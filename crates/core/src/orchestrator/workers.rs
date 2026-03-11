@@ -188,6 +188,20 @@ impl Orchestrator {
 
         // Find the execution and step for this task, then retry in the DAG.
         // This resets the Failed node and un-blocks its transitive dependents.
+        if self.scheduler.find_task(&task_id).is_none() {
+            // Execution was already cleaned up (ExecutionFailed/Complete removed it).
+            // Re-register it from DB so the scheduler has the DAG back in memory.
+            if let Ok(Some((exec_id, _step_id))) = self.db.get_execution_for_task(&task_id) {
+                if !self.scheduler.has_execution(&exec_id.0) {
+                    // Ensure execution is marked Running so future polls keep tracking it.
+                    if let Err(e) = self.db.update_execution_status(&exec_id, ExecutionStatus::Running) {
+                        tracing::warn!(execution_id = %exec_id, error = %e, "failed to reset execution status for retry");
+                    }
+                    self.register_execution_from_db(&exec_id);
+                }
+            }
+        }
+
         if let Some((exec_id, step_id)) = self.scheduler.find_task(&task_id) {
             let exec_id = exec_id.to_string();
             let step_id = step_id.to_string();

@@ -252,6 +252,15 @@ impl Orchestrator {
         }
         events
     }
+    /// Revert SpawnWorker events that the runtime couldn't execute.
+    /// Moves nodes from Running back to Ready so the next tick re-emits them.
+    pub fn revert_spawns(&mut self, spawns: &[(Id, String)]) {
+        for (execution_id, step_id) in spawns {
+            self.scheduler.revert_spawn(&execution_id.0, step_id);
+        }
+        self.persist_dags();
+    }
+
     pub fn set_step_session(&mut self, execution_id: &str, step_id: &str, session_id: String) {
         self.scheduler
             .set_step_session(execution_id, step_id, session_id);

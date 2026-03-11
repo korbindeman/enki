@@ -178,6 +178,31 @@ impl Runtime {
                 }
             }
 
+            // --- Dirty working tree gate ---
+            // If the source repo has uncommitted changes, workers can't be spawned
+            // (merges would fail later). Revert the scheduler state and tell the
+            // coordinator agent to commit first.
+            if !spawn_events.is_empty() && self.copy_mgr.is_source_dirty() {
+                tracing::warn!("source working tree is dirty — holding back {} worker spawn(s)", spawn_events.len());
+                let reverts: Vec<_> = spawn_events.iter()
+                    .map(|(task_id, _, _, _, exec_id, step_id, _, _)| {
+                        // Revert DB task status from Running back to Pending.
+                        let _ = self.orch.db().update_task_status(
+                            task_id, enki_core::types::TaskStatus::Pending,
+                        );
+                        (exec_id.clone(), step_id.clone())
+                    })
+                    .collect();
+                self.orch.revert_spawns(&reverts);
+                coord.queue_event(
+                    "- BLOCKED: The project working tree has uncommitted changes. \
+                     Workers cannot start until the tree is clean. \
+                     Please commit or stash the outstanding changes so the execution can proceed."
+                        .to_string(),
+                );
+                spawn_events.clear();
+            }
+
             // --- Parallel SpawnWorker processing ---
             // Phase 1: Sequential sync prep (worktree creation, DB writes).
             // Phase 2: Parallel ACP session creation (spawn_local runs concurrently).

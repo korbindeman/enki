@@ -409,6 +409,13 @@ impl CopyManager {
     pub fn git_identity(&self) -> &GitIdentity {
         &self.git_identity
     }
+
+    /// Check whether the source repo's working tree has uncommitted changes
+    /// (staged, unstaged, or untracked files).
+    pub fn is_source_dirty(&self) -> bool {
+        git_ok(&self.project_root, &["status", "--porcelain"])
+            .is_some_and(|s| !s.is_empty())
+    }
 }
 
 #[cfg(test)]
