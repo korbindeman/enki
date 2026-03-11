@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::time::Instant;
 
 use crate::dag::EdgeCondition;
 use crate::refinery::MergeOutcome;
@@ -109,10 +108,6 @@ pub enum Command {
     Cancel(Target),
     /// Stop all running workers immediately.
     StopAll,
-    /// Periodic health check on active workers.
-    MonitorTick {
-        workers: Vec<(String, String, Instant)>,
-    },
     /// Discover new executions/tasks in DB created by external processes (MCP).
     DiscoverFromDb,
     /// Add steps to a running execution.
@@ -180,14 +175,6 @@ pub enum Event {
     ExecutionFailed { execution_id: String },
     /// All workers were stopped.
     AllStopped { count: usize },
-    /// Monitor detected a stale worker — cancel it.
-    MonitorCancel {
-        session_id: String,
-        task_id: String,
-        stale_secs: u64,
-    },
-    /// Monitor escalation message.
-    MonitorEscalation(String),
     /// A task is being retried after failure.
     TaskRetrying {
         task_id: String,

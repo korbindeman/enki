@@ -40,7 +40,6 @@ impl Runtime {
                     Event::KillSession { session_id } => {
                         self.mgr.kill_session(&session_id);
                         self.tracker.borrow_mut().remove(&session_id);
-                        self.orch.session_ended(&session_id);
                     }
                     Event::QueueMerge(mr) => {
                         let _ = self.tx.send(FromCoordinator::MergeQueued {
@@ -143,9 +142,6 @@ impl Runtime {
                     }
                     Event::AllStopped { count } => {
                         let _ = self.tx.send(FromCoordinator::AllStopped { count });
-                    }
-                    Event::MonitorCancel { .. } | Event::MonitorEscalation(_) => {
-                        // Handled directly in poll_tick.
                     }
                     Event::TaskRetrying { task_id, title, attempt, max } => {
                         coord.queue_event(format!(
@@ -373,21 +369,6 @@ impl Runtime {
         // Worker count sync.
         let _ = self.tx.send(FromCoordinator::WorkerCount(self.tracker.borrow().worker_count()));
 
-        // Monitor patrol.
-        let workers = self.tracker.borrow().worker_list();
-        let events = self.orch.handle(Command::MonitorTick { workers });
-        for event in &events {
-            if let Event::MonitorCancel { session_id, task_id, stale_secs } = event {
-                tracing::warn!(session_id, task_id, stale_secs, "monitor: worker stale, cancelling");
-                let _ = self.mgr.cancel(session_id).await;
-                coord.queue_event(format!(
-                    "- Task ({}) worker stuck (no activity for {stale_secs}s) — cancel sent", short_id(task_id)
-                ));
-            }
-            if let Event::MonitorEscalation(msg) = event {
-                coord.queue_event(msg.clone());
-            }
-        }
 
         // Dispatch queued merge requests.
         if !*merge_in_progress {

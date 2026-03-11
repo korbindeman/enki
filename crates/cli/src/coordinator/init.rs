@@ -210,9 +210,6 @@ pub(super) async fn initialize(
                 let _ = tx_updates.send(FromCoordinator::SidecarUpdate { activity });
             } else {
                 let mut t = tracker_cb.borrow_mut();
-                t.last_activity
-                    .insert(session_id.to_string(), Instant::now());
-
                 let Some(task_id) = t.session_to_task.get(session_id).cloned() else {
                     return;
                 };

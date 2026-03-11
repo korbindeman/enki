@@ -207,7 +207,6 @@ impl Runtime {
         drop(t);
         let mut t = self.tracker.borrow_mut();
         t.session_to_task.clear();
-        t.last_activity.clear();
         t.current_tool.clear();
     }
 
@@ -305,7 +304,6 @@ async fn coordinator_loop(
 
                     let worker_duration_ms = done.session_id.as_ref().and_then(|sid| {
                         let spawn_time = rt.tracker.borrow_mut().remove(sid);
-                        rt.orch.session_ended(sid);
                         spawn_time.map(|t| t.elapsed().as_millis() as u64)
                     });
                     let _ = rt.orch.db().update_task_activity(&done.task_id, None);
@@ -368,7 +366,6 @@ async fn coordinator_loop(
                 done = merger_agent_done_rx.recv() => {
                     let Some(done) = done else { continue };
                     rt.tracker.borrow_mut().remove(&done.session_id);
-                    rt.orch.session_ended(&done.session_id);
 
                     // Run finish_merge in a blocking thread (it does git operations).
                     let mr_id = done.mr_id.clone();

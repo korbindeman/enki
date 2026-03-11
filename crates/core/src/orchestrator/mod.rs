@@ -9,7 +9,7 @@ pub use types::*;
 use std::path::PathBuf;
 
 use crate::db::Db;
-use crate::monitor::{MonitorAction, MonitorState};
+use crate::monitor::MonitorState;
 use crate::scheduler::{Limits, Scheduler, SchedulerAction};
 use crate::types::*;
 
@@ -63,7 +63,6 @@ impl Orchestrator {
             Command::Resume(target) => self.resume(target),
             Command::Cancel(target) => self.cancel(target),
             Command::StopAll => self.stop_all(),
-            Command::MonitorTick { workers } => self.monitor_tick(workers),
             Command::AddSteps {
                 execution_id,
                 steps,
@@ -184,30 +183,6 @@ impl Orchestrator {
         events
     }
 
-    fn monitor_tick(&mut self, workers: Vec<(String, String, std::time::Instant)>) -> Vec<Event> {
-        let actions = self.monitor.tick(&workers);
-        let mut events = Vec::new();
-        for action in actions {
-            match action {
-                MonitorAction::CancelSession {
-                    session_id,
-                    task_id,
-                    stale_secs,
-                } => {
-                    events.push(Event::MonitorCancel {
-                        session_id,
-                        task_id,
-                        stale_secs,
-                    });
-                }
-                MonitorAction::Escalation(msg) => {
-                    events.push(Event::MonitorEscalation(msg));
-                }
-            }
-        }
-        events
-    }
-
     fn tick_scheduler(&mut self) -> Vec<Event> {
         let actions = self.scheduler.tick();
         let mut events = Vec::new();
@@ -280,10 +255,6 @@ impl Orchestrator {
     pub fn set_step_session(&mut self, execution_id: &str, step_id: &str, session_id: String) {
         self.scheduler
             .set_step_session(execution_id, step_id, session_id);
-    }
-
-    pub fn session_ended(&mut self, session_id: &str) {
-        self.monitor.session_ended(session_id);
     }
 
     pub fn worker_counts(&self) -> (usize, usize, usize, usize) {

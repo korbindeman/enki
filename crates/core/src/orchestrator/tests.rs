@@ -1,5 +1,4 @@
 use super::*;
-use crate::monitor;
 
 fn test_orchestrator() -> Orchestrator {
     let db = crate::db::Db::open_in_memory().unwrap();
@@ -332,22 +331,6 @@ fn stop_all_aborts_everything() {
     assert!(events
         .iter()
         .any(|e| matches!(e, Event::AllStopped { count } if *count > 0)));
-}
-
-#[test]
-fn monitor_tick_produces_cancel() {
-    let mut orch = test_orchestrator();
-    let stale_time =
-        std::time::Instant::now() - std::time::Duration::from_secs(monitor::STALE_CANCEL_SECS + 10);
-    let workers = vec![("sess-1".into(), "task-1".into(), stale_time)];
-
-    let events = orch.handle(Command::MonitorTick { workers });
-    assert!(events.iter().any(|e| matches!(
-        e,
-        Event::MonitorCancel {
-            session_id, ..
-        } if session_id == "sess-1"
-    )));
 }
 
 #[test]
