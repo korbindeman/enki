@@ -10,9 +10,9 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agent-client-protocol"
-version = "0.10.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a17e8937ef8c3fa38978b79354462bd10152014a1101d00ed6d26b120e9f4655"
+checksum = "15f65e37006da8f297dc2bceabaf7b2edec133bd08b6f410e83bfcfe18475026"
 dependencies = [
  "agent-client-protocol-schema",
  "anyhow",
@@ -27,9 +27,9 @@ dependencies = [
 
 [[package]]
 name = "agent-client-protocol-schema"
-version = "0.11.0"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f833f2ec0d0ac6d68cbd0c1e2e02642876291048f45fb9772ff617ac5c34ef3"
+checksum = "3f9f70c0a60a589f06e6025e748472c3903c08222c0fefc27b1f79eaf595d248"
 dependencies = [
  "anyhow",
  "derive_more 2.1.1",
@@ -1029,7 +1029,7 @@ checksum = "4ef6b89e5b37196644d8796de5268852ff179b44e96276cf4290264843743bb7"
 
 [[package]]
 name = "enki"
-version = "2026.310.1"
+version = "2026.311.0"
 dependencies = [
  "anyhow",
  "ascii-dag",
@@ -1051,7 +1051,7 @@ dependencies = [
 
 [[package]]
 name = "enki-acp"
-version = "2026.310.1"
+version = "2026.311.0"
 dependencies = [
  "agent-client-protocol",
  "async-trait",
@@ -1069,7 +1069,7 @@ dependencies = [
 
 [[package]]
 name = "enki-core"
-version = "2026.310.1"
+version = "2026.311.0"
 dependencies = [
  "chrono",
  "dirs",
@@ -1086,7 +1086,7 @@ dependencies = [
 
 [[package]]
 name = "enki-desktop"
-version = "2026.310.1"
+version = "2026.311.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1108,7 +1108,7 @@ dependencies = [
 
 [[package]]
 name = "enki-tui"
-version = "2026.310.1"
+version = "2026.311.0"
 dependencies = [
  "anyhow",
  "crossterm",
