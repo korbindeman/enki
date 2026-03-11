@@ -87,6 +87,7 @@ body {
   font-size: 0.875rem;
   line-height: 1.625;
   color: var(--color-text);
+  overflow-wrap: break-word;
 }
 
 .prose p {
@@ -273,6 +274,7 @@ body {
   border-radius: 0.25rem;
   padding: 0.125em 0.375em;
   color: var(--color-text);
+  white-space: nowrap;
 }
 
 .prose hr {
