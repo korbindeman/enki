@@ -518,5 +518,8 @@ export async function initStore(): Promise<void> {
   if (cwd) {
     setState("projectCwd", cwd);
     fetchBranch();
+    setInterval(() => {
+      fetchBranch();
+    }, 5000);
   }
 }
