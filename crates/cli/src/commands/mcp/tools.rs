@@ -415,5 +415,73 @@ pub(super) fn all_tool_definitions() -> Vec<Value> {
                 "required": ["prompt"]
             }
         }),
+        json!({
+            "name": "enki_backlog_add",
+            "description": "Add an item to the backlog for later processing.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "body": {
+                        "type": "string",
+                        "description": "The backlog item content."
+                    }
+                },
+                "required": ["body"]
+            }
+        }),
+        json!({
+            "name": "enki_backlog_list",
+            "description": "List all backlog items for the current session.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
+        json!({
+            "name": "enki_backlog_update",
+            "description": "Update the body of an existing backlog item.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "Backlog item ID."
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "New body content."
+                    }
+                },
+                "required": ["id", "body"]
+            }
+        }),
+        json!({
+            "name": "enki_backlog_remove",
+            "description": "Remove a backlog item.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "Backlog item ID."
+                    }
+                },
+                "required": ["id"]
+            }
+        }),
+        json!({
+            "name": "enki_backlog_pick",
+            "description": "Pick a backlog item: removes it from the backlog and returns the full body text for processing.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "Backlog item ID."
+                    }
+                },
+                "required": ["id"]
+            }
+        }),
     ]
 }

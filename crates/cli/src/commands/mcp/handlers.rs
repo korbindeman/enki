@@ -5,7 +5,7 @@ use chrono::Utc;
 use enki_core::dag::EdgeCondition;
 use enki_core::orchestrator::{StepDef, StepDep};
 use enki_core::types::{
-    Execution, ExecutionStatus, Id, Message, MessagePriority, MessageStatus, MessageType, Task, TaskStatus, Tier,
+    BacklogItem, Execution, ExecutionStatus, Id, Message, MessagePriority, MessageStatus, MessageType, Task, TaskStatus, Tier,
 };
 use serde_json::{Value, json};
 
@@ -610,6 +610,78 @@ pub(super) fn tool_quick_task(args: &Value) -> Result<String, String> {
     }))?;
 
     Ok("queued".to_string())
+}
+
+// --- Backlog tool implementations ---
+
+pub(super) fn tool_backlog_add(args: &Value) -> Result<String, String> {
+    let body = args["body"].as_str().ok_or("missing required parameter: body")?;
+    let db = open_db().map_err(|e| e.to_string())?;
+    let session_id = std::env::var("ENKI_SESSION_ID")
+        .map_err(|_| "ENKI_SESSION_ID not set".to_string())?;
+    let now = Utc::now();
+
+    let item = BacklogItem {
+        id: Id::new("bl"),
+        session_id,
+        body: body.to_string(),
+        created_at: now,
+        updated_at: now,
+    };
+    db.insert_backlog_item(&item).map_err(|e| e.to_string())?;
+    Ok(format!("backlog: added {}", item.id))
+}
+
+pub(super) fn tool_backlog_list() -> Result<String, String> {
+    let db = open_db().map_err(|e| e.to_string())?;
+    let session_id = std::env::var("ENKI_SESSION_ID")
+        .map_err(|_| "ENKI_SESSION_ID not set".to_string())?;
+    let items = db.list_backlog_items(&session_id).map_err(|e| e.to_string())?;
+
+    if items.is_empty() {
+        return Ok("No backlog items.".into());
+    }
+
+    let lines: Vec<String> = items
+        .iter()
+        .map(|item| {
+            let short = item.id.short();
+            let truncated: String = if item.body.len() > 100 {
+                format!("{}...", &item.body[..100])
+            } else {
+                item.body.clone()
+            };
+            let ts = item.created_at.format("%Y-%m-%d %H:%M");
+            format!("{short} | {truncated} | {ts}")
+        })
+        .collect();
+    Ok(lines.join("\n"))
+}
+
+pub(super) fn tool_backlog_update(args: &Value) -> Result<String, String> {
+    let id_str = args["id"].as_str().ok_or("missing required parameter: id")?;
+    let body = args["body"].as_str().ok_or("missing required parameter: body")?;
+    let db = open_db().map_err(|e| e.to_string())?;
+    let id = Id(id_str.to_string());
+    db.update_backlog_item(&id, body).map_err(|e| e.to_string())?;
+    Ok(format!("backlog: updated {id_str}"))
+}
+
+pub(super) fn tool_backlog_remove(args: &Value) -> Result<String, String> {
+    let id_str = args["id"].as_str().ok_or("missing required parameter: id")?;
+    let db = open_db().map_err(|e| e.to_string())?;
+    let id = Id(id_str.to_string());
+    db.delete_backlog_item(&id).map_err(|e| e.to_string())?;
+    Ok(format!("backlog: removed {id_str}"))
+}
+
+pub(super) fn tool_backlog_pick(args: &Value) -> Result<String, String> {
+    let id_str = args["id"].as_str().ok_or("missing required parameter: id")?;
+    let db = open_db().map_err(|e| e.to_string())?;
+    let id = Id(id_str.to_string());
+    let item = db.get_backlog_item(&id).map_err(|e| e.to_string())?;
+    db.delete_backlog_item(&id).map_err(|e| e.to_string())?;
+    Ok(item.body)
 }
 
 // --- Mail helpers ---

@@ -25,6 +25,11 @@ const PLANNER_TOOLS: &[&str] = &[
     "enki_mail_inbox",
     "enki_mail_reply",
     "enki_mail_thread",
+    "enki_backlog_add",
+    "enki_backlog_list",
+    "enki_backlog_update",
+    "enki_backlog_remove",
+    "enki_backlog_pick",
 ];
 
 const WORKER_TOOLS: &[&str] = &[
@@ -192,6 +197,11 @@ fn handle_tools_call(id: Option<Value>, params: &Value, role: &str, task_id: Opt
         "enki_mail_reply" => tool_mail_reply(args, &my_addr),
         "enki_mail_thread" => tool_mail_thread(args),
         "enki_quick_task" => tool_quick_task(args),
+        "enki_backlog_add" => tool_backlog_add(args),
+        "enki_backlog_list" => tool_backlog_list(),
+        "enki_backlog_update" => tool_backlog_update(args),
+        "enki_backlog_remove" => tool_backlog_remove(args),
+        "enki_backlog_pick" => tool_backlog_pick(args),
         _ => Err(format!("unknown tool: {tool_name}")),
     };
 
