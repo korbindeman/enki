@@ -23,6 +23,9 @@ pub fn run() {
             bridge::backlog_list,
             bridge::backlog_update,
             bridge::backlog_remove,
+            bridge::list_directory,
+            bridge::read_text_file,
+            bridge::read_image_file,
         ])
         .menu(|app| {
             let open_project = MenuItem::with_id(

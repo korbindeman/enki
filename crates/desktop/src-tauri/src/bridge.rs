@@ -234,6 +234,254 @@ pub fn backlog_remove(id: String, state: tauri::State<CoordinatorState>) -> Resu
 }
 
 // ---------------------------------------------------------------------------
+// File explorer commands
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FileEntry {
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+    pub child_count: Option<u32>,
+    pub is_hidden: bool,
+    pub is_gitignored: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DirectoryListing {
+    pub path: String,
+    pub entries: Vec<FileEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TextFileContent {
+    pub content: String,
+    pub language: String,
+    pub is_markdown: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ImageFileContent {
+    pub data: String,
+    pub mime_type: String,
+}
+
+fn build_gitignore(dir: &std::path::Path) -> Option<ignore::gitignore::Gitignore> {
+    // Walk up to find the git repo root (directory containing .git).
+    let mut root = dir.to_path_buf();
+    loop {
+        if root.join(".git").exists() {
+            break;
+        }
+        if !root.pop() {
+            return None;
+        }
+    }
+    let gitignore_path = root.join(".gitignore");
+    if !gitignore_path.exists() {
+        return None;
+    }
+    let (gi, err) = ignore::gitignore::Gitignore::new(&gitignore_path);
+    if let Some(e) = err {
+        tracing::debug!("gitignore parse error: {e}");
+    }
+    Some(gi)
+}
+
+#[tauri::command]
+pub fn list_directory(path: String) -> Result<DirectoryListing, String> {
+    let dir = std::path::Path::new(&path);
+    if !dir.is_dir() {
+        return Err(format!("{path} is not a directory"));
+    }
+    let abs_path = dir.canonicalize().map_err(|e| e.to_string())?;
+    let gitignore = build_gitignore(&abs_path);
+
+    let mut entries = Vec::new();
+    let read_dir = std::fs::read_dir(&abs_path).map_err(|e| e.to_string())?;
+
+    for entry in read_dir {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let name = entry.file_name().to_string_lossy().to_string();
+        let metadata = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let is_dir = metadata.is_dir();
+        let size = if is_dir { 0 } else { metadata.len() };
+        let is_hidden = name.starts_with('.');
+
+        let child_count = if is_dir {
+            match std::fs::read_dir(entry.path()) {
+                Ok(rd) => Some(rd.count() as u32),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        let is_gitignored = gitignore.as_ref().is_some_and(|gi| {
+            gi.matched_path_or_any_parents(entry.path(), is_dir)
+                .is_ignore()
+        });
+
+        entries.push(FileEntry { name, is_dir, size, child_count, is_hidden, is_gitignored });
+    }
+
+    // Sort: directories first, then alphabetical case-insensitive.
+    entries.sort_by(|a, b| {
+        b.is_dir.cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+
+    Ok(DirectoryListing {
+        path: abs_path.to_string_lossy().to_string(),
+        entries,
+    })
+}
+
+fn language_from_extension(ext: &str) -> &'static str {
+    match ext {
+        "rs" => "rust",
+        "ts" | "tsx" => "typescript",
+        "js" | "jsx" => "javascript",
+        "py" => "python",
+        "toml" => "toml",
+        "json" => "json",
+        "yaml" | "yml" => "yaml",
+        "css" => "css",
+        "scss" => "scss",
+        "html" | "htm" => "html",
+        "sql" => "sql",
+        "sh" | "bash" | "zsh" => "bash",
+        "fish" => "fish",
+        "md" | "mdx" => "markdown",
+        "xml" => "xml",
+        "c" => "c",
+        "cpp" | "cc" | "cxx" => "cpp",
+        "h" | "hpp" => "cpp",
+        "go" => "go",
+        "java" => "java",
+        "kt" | "kts" => "kotlin",
+        "swift" => "swift",
+        "rb" => "ruby",
+        "php" => "php",
+        "lua" => "lua",
+        "r" => "r",
+        "dart" => "dart",
+        "zig" => "zig",
+        "vue" => "vue",
+        "svelte" => "svelte",
+        "graphql" | "gql" => "graphql",
+        "proto" => "protobuf",
+        "dockerfile" => "dockerfile",
+        "tf" => "hcl",
+        "nix" => "nix",
+        "el" | "lisp" | "cl" => "lisp",
+        "ex" | "exs" => "elixir",
+        "erl" => "erlang",
+        "hs" => "haskell",
+        "ml" | "mli" => "ocaml",
+        "csv" => "csv",
+        "ini" | "cfg" => "ini",
+        "diff" | "patch" => "diff",
+        "log" => "log",
+        "txt" => "plaintext",
+        _ => "plaintext",
+    }
+}
+
+#[tauri::command]
+pub fn read_text_file(path: String) -> Result<TextFileContent, String> {
+    let file_path = std::path::Path::new(&path);
+
+    let metadata = std::fs::metadata(file_path).map_err(|e| e.to_string())?;
+    if metadata.len() > 1_000_000 {
+        return Err("file is too large to display (>1MB)".into());
+    }
+
+    let bytes = std::fs::read(file_path).map_err(|e| e.to_string())?;
+
+    // Check for binary content (null bytes in first 8KB).
+    let check_len = bytes.len().min(8192);
+    if bytes[..check_len].contains(&0) {
+        return Err("file appears to be binary".into());
+    }
+
+    let content = String::from_utf8(bytes)
+        .map_err(|_| "file is not valid UTF-8".to_string())?;
+
+    let ext = file_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    // Handle extensionless files by name.
+    let language = if ext.is_empty() {
+        let name = file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        match name.as_str() {
+            "dockerfile" => "dockerfile",
+            "makefile" | "gnumakefile" => "makefile",
+            "justfile" => "just",
+            _ => "plaintext",
+        }
+    } else {
+        language_from_extension(&ext)
+    };
+
+    let is_markdown = ext == "md" || ext == "mdx";
+
+    Ok(TextFileContent { content, language: language.to_string(), is_markdown })
+}
+
+fn mime_from_extension(ext: &str) -> Option<&'static str> {
+    match ext {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "svg" => Some("image/svg+xml"),
+        "webp" => Some("image/webp"),
+        "ico" => Some("image/x-icon"),
+        "bmp" => Some("image/bmp"),
+        _ => None,
+    }
+}
+
+#[tauri::command]
+pub fn read_image_file(path: String) -> Result<ImageFileContent, String> {
+    let file_path = std::path::Path::new(&path);
+
+    let ext = file_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    let mime_type = mime_from_extension(&ext)
+        .ok_or_else(|| format!("unsupported image format: .{ext}"))?;
+
+    let metadata = std::fs::metadata(file_path).map_err(|e| e.to_string())?;
+    if metadata.len() > 10_000_000 {
+        return Err("image is too large to display (>10MB)".into());
+    }
+
+    let bytes = std::fs::read(file_path).map_err(|e| e.to_string())?;
+
+    use base64::Engine;
+    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+
+    Ok(ImageFileContent { data, mime_type: mime_type.to_string() })
+}
+
+// ---------------------------------------------------------------------------
 // Config commands (settings UI)
 // ---------------------------------------------------------------------------
 

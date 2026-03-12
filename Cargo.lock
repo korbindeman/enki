@@ -1095,6 +1095,7 @@ dependencies = [
  "enki",
  "enki-acp",
  "enki-core",
+ "ignore",
  "serde",
  "serde_json",
  "tauri",
