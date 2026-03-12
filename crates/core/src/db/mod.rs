@@ -711,6 +711,16 @@ impl Db {
             .map_err(DbError::Sqlite)
     }
 
+    pub fn list_all_backlog_items(&self) -> Result<Vec<BacklogItem>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, body, created_at, updated_at
+             FROM backlog_items ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([], row_to_backlog_item)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(DbError::Sqlite)
+    }
+
     pub fn get_backlog_item(&self, id: &Id) -> Result<BacklogItem> {
         self.conn
             .query_row(

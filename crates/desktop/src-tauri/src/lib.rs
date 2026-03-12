@@ -19,6 +19,10 @@ pub fn run() {
             bridge::open_project,
             bridge::load_config,
             bridge::save_config,
+            bridge::backlog_add,
+            bridge::backlog_list,
+            bridge::backlog_update,
+            bridge::backlog_remove,
         ])
         .menu(|app| {
             let open_project = MenuItem::with_id(

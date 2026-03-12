@@ -168,6 +168,72 @@ pub async fn open_project(
 }
 
 // ---------------------------------------------------------------------------
+// Backlog commands (direct SQLite CRUD)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BacklogItemPayload {
+    pub id: String,
+    pub body: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+fn open_project_db(state: &CoordinatorState) -> Result<enki_core::db::Db, String> {
+    let cwd = state.cwd.lock().unwrap().clone();
+    if cwd.is_empty() {
+        return Err("no project open".into());
+    }
+    let db_path = PathBuf::from(&cwd).join(".enki").join("db.sqlite");
+    enki_core::db::Db::open(db_path.to_str().unwrap()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn backlog_add(body: String, state: tauri::State<CoordinatorState>) -> Result<String, String> {
+    let db = open_project_db(&state)?;
+    let session_id = std::env::var("ENKI_SESSION_ID").unwrap_or_else(|_| "desktop".into());
+    let now = chrono::Utc::now();
+    let item = enki_core::types::BacklogItem {
+        id: enki_core::types::Id::new("bl"),
+        session_id,
+        body,
+        created_at: now,
+        updated_at: now,
+    };
+    db.insert_backlog_item(&item).map_err(|e| e.to_string())?;
+    Ok(item.id.0)
+}
+
+#[tauri::command]
+pub fn backlog_list(state: tauri::State<CoordinatorState>) -> Result<Vec<BacklogItemPayload>, String> {
+    let db = open_project_db(&state)?;
+    let items = db.list_all_backlog_items().map_err(|e| e.to_string())?;
+    Ok(items
+        .into_iter()
+        .map(|item| BacklogItemPayload {
+            id: item.id.0,
+            body: item.body,
+            created_at: item.created_at.to_rfc3339(),
+            updated_at: item.updated_at.to_rfc3339(),
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub fn backlog_update(id: String, body: String, state: tauri::State<CoordinatorState>) -> Result<(), String> {
+    let db = open_project_db(&state)?;
+    db.update_backlog_item(&enki_core::types::Id(id), &body)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn backlog_remove(id: String, state: tauri::State<CoordinatorState>) -> Result<(), String> {
+    let db = open_project_db(&state)?;
+    db.delete_backlog_item(&enki_core::types::Id(id))
+        .map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
 // Config commands (settings UI)
 // ---------------------------------------------------------------------------
 

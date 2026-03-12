@@ -1090,6 +1090,7 @@ version = "2026.311.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "chrono",
  "dirs",
  "enki",
  "enki-acp",
