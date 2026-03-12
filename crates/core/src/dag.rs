@@ -56,7 +56,11 @@ impl NodeStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
+    /// Globally unique identifier (task_id).
     pub id: String,
+    /// Short step identifier (for display/logging, not for lookup).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_id: Option<String>,
     pub title: String,
     pub description: String,
     pub tier: Option<Tier>,
@@ -80,12 +84,13 @@ pub struct Dag {
 
 impl Dag {
     /// Build a single-node DAG for a standalone task.
-    pub fn single(step_id: &str, title: &str, description: &str, tier: Option<Tier>) -> Self {
+    pub fn single(id: &str, title: &str, description: &str, tier: Option<Tier>) -> Self {
         let mut index = HashMap::new();
-        index.insert(step_id.to_string(), 0);
+        index.insert(id.to_string(), 0);
         Dag {
             nodes: vec![Node {
-                id: step_id.to_string(),
+                id: id.to_string(),
+                step_id: None,
                 title: title.to_string(),
                 description: description.to_string(),
                 tier,
@@ -107,10 +112,11 @@ impl Dag {
         let mut nodes = Vec::with_capacity(steps.len());
         let mut index = HashMap::new();
 
-        for (i, (step_id, title, description, tier, _)) in steps.iter().enumerate() {
-            index.insert(step_id.clone(), i);
+        for (i, (id, title, description, tier, _)) in steps.iter().enumerate() {
+            index.insert(id.clone(), i);
             nodes.push(Node {
-                id: step_id.clone(),
+                id: id.clone(),
+                step_id: None,
                 title: title.clone(),
                 description: description.clone(),
                 tier: *tier,
@@ -122,8 +128,8 @@ impl Dag {
             });
         }
 
-        for (step_id, _, _, _, dep_ids) in steps {
-            let node_idx = index[step_id];
+        for (id, _, _, _, dep_ids) in steps {
+            let node_idx = index[id];
             for dep_id in dep_ids {
                 if let Some(&dep_idx) = index.get(dep_id) {
                     nodes[node_idx].deps.push(Edge {
@@ -157,12 +163,13 @@ impl Dag {
         let mut nodes = Vec::with_capacity(steps.len());
         let mut index = HashMap::new();
 
-        for (i, (step_id, title, description, tier, checkpoint, role, _)) in
+        for (i, (id, title, description, tier, checkpoint, role, _)) in
             steps.iter().enumerate()
         {
-            index.insert(step_id.clone(), i);
+            index.insert(id.clone(), i);
             nodes.push(Node {
-                id: step_id.clone(),
+                id: id.clone(),
+                step_id: None,
                 title: title.clone(),
                 description: description.clone(),
                 tier: *tier,
@@ -174,8 +181,8 @@ impl Dag {
             });
         }
 
-        for (step_id, _, _, _, _, _, dep_list) in steps {
-            let node_idx = index[step_id];
+        for (id, _, _, _, _, _, dep_list) in steps {
+            let node_idx = index[id];
             for (dep_id, condition) in dep_list {
                 if let Some(&dep_idx) = index.get(dep_id) {
                     nodes[node_idx].deps.push(Edge {
@@ -238,6 +245,7 @@ impl Dag {
             self.index.insert(id.clone(), idx);
             self.nodes.push(Node {
                 id: id.clone(),
+                step_id: None,
                 title: title.clone(),
                 description: description.clone(),
                 tier: *tier,
@@ -504,6 +512,57 @@ impl Dag {
     /// Public re-evaluation (used after crash recovery to promote pending nodes).
     pub fn reevaluate(&mut self) {
         self.evaluate_ready();
+    }
+
+    /// Absorb nodes from another DAG, remapping IDs.
+    /// `id_map` maps each node ID in `other` to its new ID in `self`.
+    /// Statuses are preserved. Deps referencing IDs already in `self`
+    /// (cross-DAG deps) are wired up if they exist.
+    pub fn absorb(&mut self, other: &Dag, id_map: &HashMap<String, String>) -> std::result::Result<(), String> {
+        for node in &other.nodes {
+            let new_id = id_map.get(&node.id).unwrap_or(&node.id);
+            if self.index.contains_key(new_id) {
+                return Err(format!("node '{}' already exists in DAG", new_id));
+            }
+        }
+
+        let base_idx = self.nodes.len();
+
+        // Add nodes with remapped IDs, preserving status.
+        for (i, node) in other.nodes.iter().enumerate() {
+            let new_id = id_map.get(&node.id).cloned().unwrap_or_else(|| node.id.clone());
+            self.index.insert(new_id.clone(), base_idx + i);
+            self.nodes.push(Node {
+                id: new_id,
+                step_id: Some(node.id.clone()),
+                title: node.title.clone(),
+                description: node.description.clone(),
+                tier: node.tier,
+                status: node.status,
+                checkpoint: node.checkpoint,
+                role: node.role.clone(),
+                deps: Vec::new(),
+                dependents: Vec::new(),
+            });
+        }
+
+        // Rewire deps using remapped IDs.
+        for (i, node) in other.nodes.iter().enumerate() {
+            let self_idx = base_idx + i;
+            for edge in &node.deps {
+                let dep_old_id = &other.nodes[edge.target].id;
+                let dep_new_id = id_map.get(dep_old_id).unwrap_or(dep_old_id);
+                if let Some(&dep_self_idx) = self.index.get(dep_new_id.as_str()) {
+                    self.nodes[self_idx].deps.push(Edge {
+                        target: dep_self_idx,
+                        condition: edge.condition,
+                    });
+                    self.nodes[dep_self_idx].dependents.push(self_idx);
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Check if all dep edges for a node are satisfied per their conditions.

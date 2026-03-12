@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::dag::{Dag, EdgeCondition, NodeStatus};
 use crate::types::*;
@@ -68,30 +68,33 @@ pub enum SchedulerAction {
     },
 }
 
-/// Tracks in-flight executions and decides what to run next.
+/// Tracks a single global task DAG and decides what to run next.
+/// Executions are soft grouping labels over tasks in the DAG.
 pub struct Scheduler {
     limits: Limits,
-    /// Active DAGs keyed by execution ID.
-    executions: HashMap<String, ExecutionState>,
+    /// Single global DAG. Nodes are keyed by task_id.
+    dag: Dag,
+    /// Execution groups: execution_id → group state.
+    groups: HashMap<String, GroupState>,
+    /// task_id → execution_id (reverse lookup).
+    task_groups: HashMap<String, String>,
+    /// task_id → step_id (display metadata).
+    task_steps: HashMap<String, String>,
+    /// task_id → ACP session_id for running tasks.
+    task_sessions: HashMap<String, String>,
+    /// Captured outputs from completed tasks, keyed by task_id.
+    task_outputs: HashMap<String, String>,
+    /// Task IDs already reported as blocked (dedup across ticks).
+    reported_blocked: HashSet<String>,
     /// How many workers are currently running per tier.
     running: TierCounts,
 }
 
 #[derive(Debug, Clone)]
-struct ExecutionState {
+struct GroupState {
     execution_id: Id,
     project_id: Id,
-    dag: Dag,
-    /// Maps step_id -> task_id for tasks we've created.
-    step_tasks: HashMap<String, Id>,
-    /// Maps step_id -> agent session_id for running steps.
-    step_sessions: HashMap<String, String>,
-    /// Captured outputs from completed steps, keyed by step_id.
-    step_outputs: HashMap<String, String>,
-    /// Step IDs that have already been reported as blocked via TaskBlocked actions.
-    /// Prevents emitting duplicate TaskBlocked actions across ticks.
-    reported_blocked: std::collections::HashSet<String>,
-    /// When true, `tick()` skips this execution entirely.
+    task_ids: HashSet<String>,
     paused: bool,
 }
 
@@ -139,18 +142,25 @@ impl Scheduler {
     pub fn new(limits: Limits) -> Self {
         Self {
             limits,
-            executions: HashMap::new(),
+            dag: Dag::from_steps(&[]),
+            groups: HashMap::new(),
+            task_groups: HashMap::new(),
+            task_steps: HashMap::new(),
+            task_sessions: HashMap::new(),
+            task_outputs: HashMap::new(),
+            reported_blocked: HashSet::new(),
             running: TierCounts::default(),
         }
     }
 
-    /// Check whether an execution is already tracked by this scheduler.
+    /// Check whether an execution group is already tracked.
     pub fn has_execution(&self, execution_id: &str) -> bool {
-        self.executions.contains_key(execution_id)
+        self.groups.contains_key(execution_id)
     }
 
-    /// Register a new execution with its DAG.
-    /// `step_tasks` maps step IDs to their corresponding task IDs in the DB.
+    /// Register a new execution by absorbing its DAG into the global graph.
+    /// The incoming `dag` uses step_ids as node IDs. `step_tasks` maps
+    /// step_id → task_id. Nodes are re-keyed to task_ids in the global DAG.
     pub fn add_execution(
         &mut self,
         execution_id: Id,
@@ -158,212 +168,292 @@ impl Scheduler {
         dag: Dag,
         step_tasks: HashMap<String, Id>,
     ) {
-        self.executions.insert(
+        // Build step_id → task_id string map for absorb.
+        let id_map: HashMap<String, String> = step_tasks
+            .iter()
+            .map(|(step_id, task_id)| (step_id.clone(), task_id.0.clone()))
+            .collect();
+
+        if let Err(e) = self.dag.absorb(&dag, &id_map) {
+            tracing::warn!(execution_id = %execution_id, error = %e, "failed to absorb DAG");
+            return;
+        }
+
+        // Register group.
+        let mut task_id_set = HashSet::new();
+        for (step_id, task_id) in &step_tasks {
+            task_id_set.insert(task_id.0.clone());
+            self.task_groups
+                .insert(task_id.0.clone(), execution_id.0.clone());
+            self.task_steps
+                .insert(task_id.0.clone(), step_id.clone());
+        }
+
+        self.groups.insert(
             execution_id.0.clone(),
-            ExecutionState {
+            GroupState {
                 execution_id,
                 project_id,
-                dag,
-                step_tasks,
-                step_sessions: HashMap::new(),
-                step_outputs: HashMap::new(),
-                reported_blocked: std::collections::HashSet::new(),
+                task_ids: task_id_set,
                 paused: false,
             },
         );
+    }
+
+    /// Resolve a (execution_id, step_id) pair to a task_id in the global DAG.
+    fn resolve_task_id(&self, execution_id: &str, step_id: &str) -> Option<&str> {
+        let group = self.groups.get(execution_id)?;
+        for tid in &group.task_ids {
+            if self.task_steps.get(tid).is_some_and(|s| s == step_id) {
+                return Some(tid);
+            }
+        }
+        None
     }
 
     /// One scheduling pass. Returns actions for the runtime to execute.
     pub fn tick(&mut self) -> Vec<SchedulerAction> {
         let mut actions = Vec::new();
 
-        let exec_keys: Vec<String> = self.executions.keys().cloned().collect();
-
-        for key in exec_keys {
-            let exec = self.executions.get_mut(&key).unwrap();
-
-            // Skip paused executions entirely.
-            if exec.paused {
+        // Emit TaskBlocked for newly blocked nodes.
+        let blocked: Vec<String> = self
+            .dag
+            .blocked_nodes()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        for task_id in blocked {
+            if !self.reported_blocked.insert(task_id.clone()) {
                 continue;
             }
-
-            // Emit TaskBlocked for newly blocked nodes
-            let blocked: Vec<String> = exec
-                .dag
-                .blocked_nodes()
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
-            for step_id in blocked {
-                if exec.reported_blocked.insert(step_id.clone())
-                    && let Some(task_id) = exec.step_tasks.get(&step_id) {
-                        actions.push(SchedulerAction::TaskBlocked {
-                            task_id: task_id.clone(),
-                            execution_id: exec.execution_id.clone(),
-                            step_id,
-                        });
-                    }
-            }
-
-            // Check for ready nodes we can assign
-            let ready: Vec<String> = exec
-                .dag
-                .ready_nodes()
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
-
-            for step_id in ready {
-                let (title, description, tier, role, upstream_outputs) = {
-                    let node = exec.dag.get(&step_id).unwrap();
-                    let tier = node.tier.unwrap_or(Tier::Standard);
-
-                    // Collect outputs from all completed upstream deps
-                    let upstream: Vec<(String, String)> = node
-                        .deps
-                        .iter()
-                        .filter_map(|edge| {
-                            let dep = &exec.dag.nodes()[edge.target];
-                            exec.step_outputs
-                                .get(&dep.id)
-                                .map(|out| (dep.title.clone(), out.clone()))
-                        })
-                        .collect();
-
-                    (node.title.clone(), node.description.clone(), tier, node.role.clone(), upstream)
-                };
-
-                if !self.running.can_run(tier, &self.limits) {
-                    continue;
-                }
-
-                exec.dag.mark_running(&step_id);
-                self.running.increment(tier);
-
-                let task_id = exec
-                    .step_tasks
-                    .get(&step_id)
+            if let Some(exec_id) = self.task_groups.get(&task_id) {
+                let step_id = self
+                    .task_steps
+                    .get(&task_id)
                     .cloned()
-                    .unwrap_or_else(|| Id::new("task"));
-
-                actions.push(SchedulerAction::SpawnWorker {
-                    task_id,
-                    project_id: exec.project_id.clone(),
-                    title,
-                    description,
-                    tier,
-                    execution_id: exec.execution_id.clone(),
-                    step_id: step_id.clone(),
-                    upstream_outputs,
-                    role,
-                });
-            }
-
-            // Check for completed/failed executions
-            if exec.dag.is_complete() {
-                actions.push(SchedulerAction::ExecutionComplete {
-                    execution_id: exec.execution_id.clone(),
-                });
-            } else if exec.dag.has_failures() {
-                let has_in_progress = exec
-                    .dag
-                    .nodes()
-                    .iter()
-                    .any(|n| matches!(n.status, NodeStatus::Running | NodeStatus::WorkerDone));
-                let has_ready = !exec.dag.ready_nodes().is_empty();
-                if !has_in_progress && !has_ready {
-                    actions.push(SchedulerAction::ExecutionFailed {
-                        execution_id: exec.execution_id.clone(),
+                    .unwrap_or_default();
+                if let Some(group) = self.groups.get(exec_id) {
+                    actions.push(SchedulerAction::TaskBlocked {
+                        task_id: Id(task_id),
+                        execution_id: group.execution_id.clone(),
+                        step_id,
                     });
                 }
             }
         }
 
-        // Clean up completed/failed executions
-        for action in &actions {
-            match action {
-                SchedulerAction::ExecutionComplete { execution_id }
-                | SchedulerAction::ExecutionFailed { execution_id } => {
-                    self.executions.remove(&execution_id.0);
+        // Check for ready nodes we can assign.
+        let ready: Vec<String> = self
+            .dag
+            .ready_nodes()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        for task_id in ready {
+            // Skip if the task's group is paused.
+            if let Some(exec_id) = self.task_groups.get(&task_id) {
+                if self.groups.get(exec_id).is_some_and(|g| g.paused) {
+                    continue;
                 }
-                _ => {}
             }
+
+            let (title, description, tier, role, upstream_outputs) = {
+                let node = self.dag.get(&task_id).unwrap();
+                let tier = node.tier.unwrap_or(Tier::Standard);
+
+                // Collect outputs from all completed upstream deps.
+                let upstream: Vec<(String, String)> = node
+                    .deps
+                    .iter()
+                    .filter_map(|edge| {
+                        let dep = &self.dag.nodes()[edge.target];
+                        self.task_outputs
+                            .get(&dep.id)
+                            .map(|out| (dep.title.clone(), out.clone()))
+                    })
+                    .collect();
+
+                (
+                    node.title.clone(),
+                    node.description.clone(),
+                    tier,
+                    node.role.clone(),
+                    upstream,
+                )
+            };
+
+            if !self.running.can_run(tier, &self.limits) {
+                continue;
+            }
+
+            self.dag.mark_running(&task_id);
+            self.running.increment(tier);
+
+            let exec_id = self
+                .task_groups
+                .get(&task_id)
+                .cloned()
+                .unwrap_or_default();
+            let step_id = self
+                .task_steps
+                .get(&task_id)
+                .cloned()
+                .unwrap_or_default();
+            let project_id = self
+                .groups
+                .get(&exec_id)
+                .map(|g| g.project_id.clone())
+                .unwrap_or_else(|| Id("project".into()));
+
+            actions.push(SchedulerAction::SpawnWorker {
+                task_id: Id(task_id),
+                project_id,
+                title,
+                description,
+                tier,
+                execution_id: Id(exec_id),
+                step_id,
+                upstream_outputs,
+                role,
+            });
+        }
+
+        // Check group completion/failure.
+        let group_keys: Vec<String> = self.groups.keys().cloned().collect();
+        let mut completed_groups = Vec::new();
+
+        for gk in group_keys {
+            let group = self.groups.get(&gk).unwrap();
+            if group.paused {
+                continue;
+            }
+
+            let all_terminal = group.task_ids.iter().all(|tid| {
+                self.dag
+                    .get(tid)
+                    .is_some_and(|n| matches!(n.status, NodeStatus::Done | NodeStatus::Cancelled))
+            });
+
+            if all_terminal {
+                actions.push(SchedulerAction::ExecutionComplete {
+                    execution_id: group.execution_id.clone(),
+                });
+                completed_groups.push(gk);
+                continue;
+            }
+
+            let has_failure = group.task_ids.iter().any(|tid| {
+                self.dag
+                    .get(tid)
+                    .is_some_and(|n| n.status == NodeStatus::Failed)
+            });
+            if has_failure {
+                let has_in_progress = group.task_ids.iter().any(|tid| {
+                    self.dag.get(tid).is_some_and(|n| {
+                        matches!(n.status, NodeStatus::Running | NodeStatus::WorkerDone)
+                    })
+                });
+                let has_ready = group.task_ids.iter().any(|tid| {
+                    self.dag
+                        .get(tid)
+                        .is_some_and(|n| n.status == NodeStatus::Ready)
+                });
+                if !has_in_progress && !has_ready {
+                    actions.push(SchedulerAction::ExecutionFailed {
+                        execution_id: group.execution_id.clone(),
+                    });
+                    completed_groups.push(gk);
+                }
+            }
+        }
+
+        // Clean up completed/failed groups.
+        // Nodes stay in the global DAG (other groups may depend on them).
+        for gk in completed_groups {
+            self.groups.remove(&gk);
         }
 
         actions
     }
 
     /// Revert a SpawnWorker action that the runtime couldn't execute.
-    /// Moves the node from Running back to Ready and decrements the tier count.
     pub fn revert_spawn(&mut self, execution_id: &str, step_id: &str) {
-        if let Some(exec) = self.executions.get_mut(execution_id) {
-            if exec.dag.revert_running(step_id) {
-                let tier = exec
-                    .dag
-                    .get(step_id)
-                    .map(|n| n.tier.unwrap_or(Tier::Standard))
-                    .unwrap_or(Tier::Standard);
-                self.running.decrement(tier);
-            }
+        let Some(task_id) = self.resolve_task_id(execution_id, step_id) else {
+            return;
+        };
+        let task_id = task_id.to_string();
+        if self.dag.revert_running(&task_id) {
+            let tier = self
+                .dag
+                .get(&task_id)
+                .map(|n| n.tier.unwrap_or(Tier::Standard))
+                .unwrap_or(Tier::Standard);
+            self.running.decrement(tier);
         }
     }
 
     /// Notify the scheduler that a worker has finished (but merge hasn't landed yet).
-    /// Decrements the tier count (worker process is gone), stores output, and
-    /// transitions the DAG node to WorkerDone (fires Completed/Started edges).
+    /// Decrements the tier count, stores output, transitions node to WorkerDone.
     pub fn step_worker_done(
         &mut self,
         execution_id: &str,
         step_id: &str,
         output: Option<String>,
     ) {
-        if let Some(exec) = self.executions.get_mut(execution_id) {
-            let tier = exec
-                .dag
-                .get(step_id)
-                .map(|n| n.tier.unwrap_or(Tier::Standard))
-                .unwrap_or(Tier::Standard);
-            exec.dag.mark_worker_done(step_id);
-            exec.step_sessions.remove(step_id);
-            if let Some(out) = output {
-                exec.step_outputs.insert(step_id.to_string(), out);
-            }
-            self.running.decrement(tier);
+        let Some(task_id) = self.resolve_task_id(execution_id, step_id) else {
+            return;
+        };
+        let task_id = task_id.to_string();
+        let tier = self
+            .dag
+            .get(&task_id)
+            .map(|n| n.tier.unwrap_or(Tier::Standard))
+            .unwrap_or(Tier::Standard);
+        self.dag.mark_worker_done(&task_id);
+        self.task_sessions.remove(&task_id);
+        if let Some(out) = output {
+            self.task_outputs.insert(task_id, out);
         }
+        self.running.decrement(tier);
     }
 
     /// Notify the scheduler that a merge has landed (step fully complete).
-    /// Transitions the DAG node from WorkerDone to Done (fires Merged edges).
-    /// Does NOT decrement tier count — that was done in `step_worker_done`.
+    /// Transitions node from WorkerDone to Done. Does NOT decrement tier count.
     pub fn step_completed(
         &mut self,
         execution_id: &str,
         step_id: &str,
         output: Option<String>,
     ) {
-        if let Some(exec) = self.executions.get_mut(execution_id) {
-            exec.dag.mark_done(step_id);
-            if let Some(out) = output {
-                exec.step_outputs.insert(step_id.to_string(), out);
-            }
+        let Some(task_id) = self.resolve_task_id(execution_id, step_id) else {
+            return;
+        };
+        let task_id = task_id.to_string();
+        self.dag.mark_done(&task_id);
+        if let Some(out) = output {
+            self.task_outputs.insert(task_id, out);
         }
     }
 
     /// Notify the scheduler that a step has failed.
     pub fn step_failed(&mut self, execution_id: &str, step_id: &str) {
-        if let Some(exec) = self.executions.get_mut(execution_id) {
-            let tier = exec
-                .dag
-                .get(step_id)
-                .map(|n| n.tier.unwrap_or(Tier::Standard))
-                .unwrap_or(Tier::Standard);
-            exec.dag.mark_failed(step_id);
-            exec.step_sessions.remove(step_id);
-            self.running.decrement(tier);
-        }
+        let Some(task_id) = self.resolve_task_id(execution_id, step_id) else {
+            return;
+        };
+        let task_id = task_id.to_string();
+        let tier = self
+            .dag
+            .get(&task_id)
+            .map(|n| n.tier.unwrap_or(Tier::Standard))
+            .unwrap_or(Tier::Standard);
+        self.dag.mark_failed(&task_id);
+        self.task_sessions.remove(&task_id);
+        self.running.decrement(tier);
     }
 
     /// Add new steps to a running execution's DAG.
+    /// Steps use step_ids; `new_step_tasks` maps step_id → task_id.
     #[allow(clippy::type_complexity)]
     pub fn add_steps_to_execution(
         &mut self,
@@ -379,40 +469,85 @@ impl Scheduler {
         )],
         new_step_tasks: HashMap<String, Id>,
     ) -> std::result::Result<(), String> {
-        let exec = self
-            .executions
+        let group = self
+            .groups
             .get_mut(execution_id)
             .ok_or_else(|| format!("execution not found: {}", execution_id))?;
-        exec.dag.add_steps(steps)?;
-        exec.step_tasks.extend(new_step_tasks);
+
+        // Build a combined step_id → task_id map (existing + new).
+        let mut all_step_to_task: HashMap<&str, &str> = HashMap::new();
+        for tid in &group.task_ids {
+            if let Some(sid) = self.task_steps.get(tid) {
+                all_step_to_task.insert(sid, tid);
+            }
+        }
+        for (sid, tid) in &new_step_tasks {
+            all_step_to_task.insert(sid, &tid.0);
+        }
+
+        // Remap step data to use task_ids.
+        let remapped: Vec<_> = steps
+            .iter()
+            .map(|(id, title, desc, tier, checkpoint, role, deps)| {
+                let task_id = all_step_to_task
+                    .get(id.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| id.clone());
+                let remapped_deps: Vec<(String, EdgeCondition)> = deps
+                    .iter()
+                    .map(|(dep_id, cond)| {
+                        let dep_task_id = all_step_to_task
+                            .get(dep_id.as_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| dep_id.clone());
+                        (dep_task_id, *cond)
+                    })
+                    .collect();
+                (
+                    task_id,
+                    title.clone(),
+                    desc.clone(),
+                    *tier,
+                    *checkpoint,
+                    role.clone(),
+                    remapped_deps,
+                )
+            })
+            .collect();
+
+        self.dag.add_steps(&remapped)?;
+
+        // Register new tasks in the group.
+        for (step_id, task_id) in &new_step_tasks {
+            group.task_ids.insert(task_id.0.clone());
+            self.task_groups
+                .insert(task_id.0.clone(), execution_id.to_string());
+            self.task_steps
+                .insert(task_id.0.clone(), step_id.clone());
+        }
+
         Ok(())
     }
 
     /// Check if a step is a checkpoint node.
     pub fn is_checkpoint(&self, execution_id: &str, step_id: &str) -> bool {
-        self.executions
-            .get(execution_id)
-            .and_then(|exec| exec.dag.get(step_id))
+        self.resolve_task_id(execution_id, step_id)
+            .and_then(|tid| self.dag.get(tid))
             .is_some_and(|node| node.checkpoint)
     }
 
     /// Record that a step is being handled by a specific ACP session.
     pub fn set_step_session(&mut self, execution_id: &str, step_id: &str, session_id: String) {
-        if let Some(exec) = self.executions.get_mut(execution_id) {
-            exec.step_sessions.insert(step_id.to_string(), session_id);
+        if let Some(task_id) = self.resolve_task_id(execution_id, step_id) {
+            self.task_sessions.insert(task_id.to_string(), session_id);
         }
     }
 
     /// Look up which execution and step a task belongs to.
     pub fn find_task(&self, task_id: &Id) -> Option<(&str, &str)> {
-        for exec in self.executions.values() {
-            for (step_id, tid) in &exec.step_tasks {
-                if tid.0 == task_id.0 {
-                    return Some((&exec.execution_id.0, step_id));
-                }
-            }
-        }
-        None
+        let exec_id = self.task_groups.get(&task_id.0)?;
+        let step_id = self.task_steps.get(&task_id.0)?;
+        Some((exec_id, step_id))
     }
 
     /// Get current worker counts: (total, heavy, standard, light).
@@ -425,41 +560,52 @@ impl Scheduler {
         )
     }
 
-    /// Abort all active executions immediately.
-    /// Returns a list of (execution_id, step_id, task_id) for every running step
-    /// so the caller can kill sessions and update the DB.
+    /// Abort all active groups immediately.
+    /// Returns a list of (execution_id, step_id, task_id) for every running task.
     pub fn abort_all(&mut self) -> Vec<(String, String, Id)> {
         let mut aborted = Vec::new();
-        for exec in self.executions.values() {
-            for node in exec.dag.nodes() {
-                if node.status == NodeStatus::Running
-                    && let Some(task_id) = exec.step_tasks.get(&node.id) {
-                        aborted.push((
-                            exec.execution_id.0.clone(),
-                            node.id.clone(),
-                            task_id.clone(),
-                        ));
-                    }
+        for node in self.dag.nodes() {
+            if node.status == NodeStatus::Running {
+                let exec_id = self
+                    .task_groups
+                    .get(&node.id)
+                    .cloned()
+                    .unwrap_or_default();
+                let step_id = self
+                    .task_steps
+                    .get(&node.id)
+                    .cloned()
+                    .unwrap_or_default();
+                aborted.push((exec_id, step_id, Id(node.id.clone())));
             }
         }
-        self.executions.clear();
+        self.dag = Dag::from_steps(&[]);
+        self.groups.clear();
+        self.task_groups.clear();
+        self.task_steps.clear();
+        self.task_sessions.clear();
+        self.task_outputs.clear();
+        self.reported_blocked.clear();
         self.running = TierCounts::default();
         aborted
     }
 
-    /// Get all (execution_id, step_id, task_id) triples where the step is still Running.
+    /// Get all (execution_id, step_id, task_id) triples where the task is Running.
     pub fn running_steps(&self) -> Vec<(String, String, Id)> {
         let mut result = Vec::new();
-        for exec in self.executions.values() {
-            for node in exec.dag.nodes() {
-                if node.status == NodeStatus::Running
-                    && let Some(task_id) = exec.step_tasks.get(&node.id) {
-                        result.push((
-                            exec.execution_id.0.clone(),
-                            node.id.clone(),
-                            task_id.clone(),
-                        ));
-                    }
+        for node in self.dag.nodes() {
+            if node.status == NodeStatus::Running {
+                let exec_id = self
+                    .task_groups
+                    .get(&node.id)
+                    .cloned()
+                    .unwrap_or_default();
+                let step_id = self
+                    .task_steps
+                    .get(&node.id)
+                    .cloned()
+                    .unwrap_or_default();
+                result.push((exec_id, step_id, Id(node.id.clone())));
             }
         }
         result
@@ -467,114 +613,152 @@ impl Scheduler {
 
     /// Get all active execution IDs.
     pub fn active_executions(&self) -> Vec<&str> {
-        self.executions.keys().map(|s| s.as_str()).collect()
+        self.groups.keys().map(|s| s.as_str()).collect()
     }
 
-    /// Pause an entire execution. `tick()` will skip it.
+    /// Pause an entire execution group. `tick()` will skip its tasks.
     pub fn pause_execution(&mut self, execution_id: &str) -> bool {
-        if let Some(exec) = self.executions.get_mut(execution_id) {
-            exec.paused = true;
+        if let Some(group) = self.groups.get_mut(execution_id) {
+            group.paused = true;
             return true;
         }
         false
     }
 
-    /// Resume a paused execution. Next `tick()` will process it.
+    /// Resume a paused execution group.
     pub fn resume_execution(&mut self, execution_id: &str) -> bool {
-        if let Some(exec) = self.executions.get_mut(execution_id) {
-            exec.paused = false;
+        if let Some(group) = self.groups.get_mut(execution_id) {
+            group.paused = false;
             return true;
         }
         false
     }
 
-    /// Cancel an entire execution. Returns `(task_id, session_id)` pairs
-    /// for running steps that need to be killed.
+    /// Cancel an entire execution group. Returns `(task_id, session_id)` pairs
+    /// for running tasks that need to be killed.
     pub fn cancel_execution(&mut self, execution_id: &str) -> Vec<(Id, String)> {
         let mut to_kill = Vec::new();
-        if let Some(exec) = self.executions.remove(execution_id) {
-            for node in exec.dag.nodes() {
-                if node.status == NodeStatus::Running
-                    && let Some(task_id) = exec.step_tasks.get(&node.id)
-                        && let Some(session_id) = exec.step_sessions.get(&node.id) {
-                            to_kill.push((task_id.clone(), session_id.clone()));
+        if let Some(group) = self.groups.remove(execution_id) {
+            for tid in &group.task_ids {
+                if let Some(node) = self.dag.get(tid) {
+                    if node.status == NodeStatus::Running {
+                        let tier = node.tier.unwrap_or(Tier::Standard);
+                        self.running.decrement(tier);
+                        if let Some(session_id) = self.task_sessions.get(tid) {
+                            to_kill.push((Id(tid.clone()), session_id.clone()));
                         }
-            }
-            // Decrement running counts for killed workers.
-            for node in exec.dag.nodes() {
-                if node.status == NodeStatus::Running {
-                    let tier = node.tier.unwrap_or(Tier::Standard);
-                    self.running.decrement(tier);
+                    }
                 }
+                // Cancel the node and cascade to dependents (even outside group).
+                self.dag.cancel_node(tid);
             }
         }
         to_kill
     }
 
-    /// Pause a single node within an execution.
+    /// Pause a single node.
     /// Returns `Some(session_id)` if the node was Running (caller must kill it).
     pub fn pause_node(&mut self, execution_id: &str, step_id: &str) -> Option<String> {
-        let exec = self.executions.get_mut(execution_id)?;
-        let was_running = exec.dag.pause_node(step_id)?;
+        let task_id = self.resolve_task_id(execution_id, step_id)?.to_string();
+        let was_running = self.dag.pause_node(&task_id)?;
         if was_running {
-            let tier = exec.dag.get(step_id).map(|n| n.tier.unwrap_or(Tier::Standard)).unwrap_or(Tier::Standard);
+            let tier = self
+                .dag
+                .get(&task_id)
+                .map(|n| n.tier.unwrap_or(Tier::Standard))
+                .unwrap_or(Tier::Standard);
             self.running.decrement(tier);
-            return exec.step_sessions.remove(step_id);
+            return self.task_sessions.remove(&task_id);
         }
         None
     }
 
-    /// Retry a failed/blocked node within an execution.
-    /// Resets the node and its blocked dependents so they can be re-dispatched.
+    /// Retry a failed/blocked node.
     pub fn retry_node(&mut self, execution_id: &str, step_id: &str) -> bool {
-        if let Some(exec) = self.executions.get_mut(execution_id) {
-            if exec.dag.retry_node(step_id) {
-                // Clear reported_blocked for any nodes that were just unblocked,
-                // so they can be re-reported if they fail again.
-                let unblocked: Vec<String> = exec
-                    .dag
-                    .nodes()
-                    .iter()
-                    .filter(|n| matches!(n.status, NodeStatus::Pending | NodeStatus::Ready))
-                    .map(|n| n.id.clone())
-                    .collect();
-                for id in unblocked {
-                    exec.reported_blocked.remove(&id);
-                }
-                return true;
+        let Some(task_id) = self.resolve_task_id(execution_id, step_id) else {
+            return false;
+        };
+        let task_id = task_id.to_string();
+        if self.dag.retry_node(&task_id) {
+            // Clear reported_blocked for any nodes that were just unblocked.
+            let unblocked: Vec<String> = self
+                .dag
+                .nodes()
+                .iter()
+                .filter(|n| matches!(n.status, NodeStatus::Pending | NodeStatus::Ready))
+                .map(|n| n.id.clone())
+                .collect();
+            for id in unblocked {
+                self.reported_blocked.remove(&id);
             }
+            // Re-register the group if it was cleaned up on ExecutionFailed.
+            if !self.groups.contains_key(execution_id) {
+                let task_ids: HashSet<String> = self
+                    .task_groups
+                    .iter()
+                    .filter(|(_, eid)| *eid == execution_id)
+                    .map(|(tid, _)| tid.clone())
+                    .collect();
+                if !task_ids.is_empty() {
+                    self.groups.insert(
+                        execution_id.to_string(),
+                        GroupState {
+                            execution_id: Id(execution_id.to_string()),
+                            project_id: Id("project".into()),
+                            task_ids,
+                            paused: false,
+                        },
+                    );
+                }
+            }
+            return true;
         }
         false
     }
 
-    /// Resume a paused node within an execution.
+    /// Resume a paused node.
     pub fn resume_node(&mut self, execution_id: &str, step_id: &str) -> bool {
-        if let Some(exec) = self.executions.get_mut(execution_id) {
-            return exec.dag.resume_node(step_id);
-        }
-        false
+        let Some(task_id) = self.resolve_task_id(execution_id, step_id).map(|s| s.to_string()) else {
+            return false;
+        };
+        self.dag.resume_node(&task_id)
     }
 
-    /// Cancel a single node within an execution.
+    /// Cancel a single node.
     /// Returns `Some(session_id)` if the node was Running (caller must kill it).
     pub fn cancel_node(&mut self, execution_id: &str, step_id: &str) -> Option<String> {
-        let exec = self.executions.get_mut(execution_id)?;
-        let was_running = exec.dag.cancel_node(step_id)?;
+        let task_id = self.resolve_task_id(execution_id, step_id)?.to_string();
+        let was_running = self.dag.cancel_node(&task_id)?;
         if was_running {
-            let tier = exec.dag.get(step_id).map(|n| n.tier.unwrap_or(Tier::Standard)).unwrap_or(Tier::Standard);
+            let tier = self
+                .dag
+                .get(&task_id)
+                .map(|n| n.tier.unwrap_or(Tier::Standard))
+                .unwrap_or(Tier::Standard);
             self.running.decrement(tier);
-            return exec.step_sessions.remove(step_id);
+            return self.task_sessions.remove(&task_id);
         }
         None
     }
 
-    /// Check if an execution is paused.
+    /// Get the global DAG (if the execution group exists).
     pub fn get_dag(&self, execution_id: &str) -> Option<&Dag> {
-        self.executions.get(execution_id).map(|e| &e.dag)
+        if self.groups.contains_key(execution_id) {
+            Some(&self.dag)
+        } else {
+            None
+        }
+    }
+
+    /// Get a reference to the global DAG (unconditional).
+    pub fn global_dag(&self) -> &Dag {
+        &self.dag
     }
 
     pub fn is_execution_paused(&self, execution_id: &str) -> bool {
-        self.executions.get(execution_id).is_some_and(|e| e.paused)
+        self.groups
+            .get(execution_id)
+            .is_some_and(|g| g.paused)
     }
 }
 
@@ -610,7 +794,7 @@ mod tests {
         (scheduler, exec_id, step_tasks)
     }
 
-    /// Simulate the full two-phase completion: worker done (tier freed) + merge landed (DAG advances).
+    /// Simulate the full two-phase completion: worker done + merge landed.
     fn complete_step(scheduler: &mut Scheduler, exec_id: &str, step_id: &str, output: Option<String>) {
         scheduler.step_worker_done(exec_id, step_id, output.clone());
         scheduler.step_completed(exec_id, step_id, output);
@@ -683,7 +867,6 @@ mod tests {
             upstream_outputs, ..
         } = review_action
         {
-            // review depends on implement and test
             assert_eq!(upstream_outputs.len(), 2);
             let titles: Vec<&str> = upstream_outputs.iter().map(|(t, _)| t.as_str()).collect();
             assert!(titles.contains(&"Implement"));
@@ -920,11 +1103,131 @@ mod tests {
 
         // tick — test is still running, review/merge are cancelled by DAG cascade
         let actions = scheduler.tick();
-        // No new spawns since review's deps aren't all done (implement cancelled, not done).
+        // No new spawns since review's deps aren't all done.
         let spawns: Vec<_> = actions
             .iter()
             .filter(|a| matches!(a, SchedulerAction::SpawnWorker { .. }))
             .collect();
         assert!(spawns.is_empty());
+    }
+
+    // --- New cross-group dependency tests ---
+
+    #[test]
+    fn cross_group_dependency() {
+        let mut scheduler = Scheduler::new(Limits::default());
+
+        // Group A: a single task "setup"
+        let dag_a = Dag::from_steps(&[
+            ("setup".into(), "Setup".into(), "Initialize".into(), Some(Tier::Light), vec![]),
+        ]);
+        let exec_a = Id::new("exec");
+        let task_setup = Id::new("task");
+        let mut st_a = StdMap::new();
+        st_a.insert("setup".into(), task_setup.clone());
+        scheduler.add_execution(exec_a.clone(), Id::new("proj"), dag_a, st_a);
+
+        // Group B: "build" depends on "setup" from group A.
+        // Build a DAG where "build" depends on "setup" (the step_id).
+        // But "setup" won't be in group B's DAG — we need to add it via add_steps
+        // using task_ids that reference the global DAG.
+        let dag_b = Dag::from_steps(&[
+            ("build".into(), "Build".into(), "Build it".into(), Some(Tier::Standard), vec![]),
+        ]);
+        let exec_b = Id::new("exec");
+        let task_build = Id::new("task");
+        let mut st_b = StdMap::new();
+        st_b.insert("build".into(), task_build.clone());
+        scheduler.add_execution(exec_b.clone(), Id::new("proj"), dag_b, st_b);
+
+        // Tick: both setup and build should be ready (build has no deps yet in DAG).
+        let actions = scheduler.tick();
+        let spawns: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, SchedulerAction::SpawnWorker { .. }))
+            .collect();
+        assert_eq!(spawns.len(), 2);
+    }
+
+    #[test]
+    fn standalone_task() {
+        let mut scheduler = Scheduler::new(Limits::default());
+
+        let dag = Dag::single("task", "Standalone", "Do something", Some(Tier::Standard));
+        let task_id = Id::new("task");
+        let mut st = StdMap::new();
+        st.insert("task".into(), task_id.clone());
+        let exec_id = Id::new("exec");
+        scheduler.add_execution(exec_id.clone(), Id::new("proj"), dag, st);
+
+        let actions = scheduler.tick();
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(&actions[0], SchedulerAction::SpawnWorker { title, .. } if title == "Standalone"));
+
+        complete_step(&mut scheduler, &exec_id.0, "task", None);
+        let actions = scheduler.tick();
+        assert!(actions.iter().any(|a| matches!(a, SchedulerAction::ExecutionComplete { .. })));
+    }
+
+    #[test]
+    fn group_completion_independent_of_external_dependents() {
+        let mut scheduler = Scheduler::new(Limits::default());
+
+        // Group A with one task
+        let dag_a = Dag::from_steps(&[
+            ("a".into(), "A".into(), "task a".into(), Some(Tier::Light), vec![]),
+        ]);
+        let exec_a = Id::new("exec");
+        let task_a = Id::new("task");
+        let mut st_a = StdMap::new();
+        st_a.insert("a".into(), task_a.clone());
+        scheduler.add_execution(exec_a.clone(), Id::new("proj"), dag_a, st_a);
+
+        // Complete A
+        scheduler.tick();
+        complete_step(&mut scheduler, &exec_a.0, "a", None);
+        let actions = scheduler.tick();
+
+        // Group A should complete even if other groups depend on its tasks
+        assert!(actions.iter().any(|a| matches!(a, SchedulerAction::ExecutionComplete { .. })));
+    }
+
+    #[test]
+    fn pause_group_does_not_affect_other_groups() {
+        let mut scheduler = Scheduler::new(Limits::default());
+
+        // Group A
+        let dag_a = Dag::from_steps(&[
+            ("a".into(), "A".into(), "task a".into(), Some(Tier::Light), vec![]),
+        ]);
+        let exec_a = Id::new("exec");
+        let task_a = Id::new("task");
+        let mut st_a = StdMap::new();
+        st_a.insert("a".into(), task_a.clone());
+        scheduler.add_execution(exec_a.clone(), Id::new("proj"), dag_a, st_a);
+
+        // Group B
+        let dag_b = Dag::from_steps(&[
+            ("b".into(), "B".into(), "task b".into(), Some(Tier::Light), vec![]),
+        ]);
+        let exec_b = Id::new("exec");
+        let task_b = Id::new("task");
+        let mut st_b = StdMap::new();
+        st_b.insert("b".into(), task_b.clone());
+        scheduler.add_execution(exec_b.clone(), Id::new("proj"), dag_b, st_b);
+
+        // Pause group A
+        scheduler.pause_execution(&exec_a.0);
+
+        // Tick: only B should spawn
+        let actions = scheduler.tick();
+        let spawns: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, SchedulerAction::SpawnWorker { .. }))
+            .collect();
+        assert_eq!(spawns.len(), 1);
+        if let SchedulerAction::SpawnWorker { title, .. } = &spawns[0] {
+            assert_eq!(title, "B");
+        }
     }
 }

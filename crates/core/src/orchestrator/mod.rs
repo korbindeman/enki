@@ -75,11 +75,11 @@ impl Orchestrator {
     }
 
     fn persist_dags(&self) {
+        let dag = self.scheduler.global_dag();
         for exec_id in self.scheduler.active_executions() {
-            if let Some(dag) = self.scheduler.get_dag(exec_id)
-                && let Err(e) = self.db.save_dag(&Id(exec_id.to_string()), dag) {
-                    tracing::warn!(execution_id = %exec_id, error = %e, "failed to persist dag");
-                }
+            if let Err(e) = self.db.save_dag(&Id(exec_id.to_string()), dag) {
+                tracing::warn!(execution_id = %exec_id, error = %e, "failed to persist dag");
+            }
         }
     }
 
