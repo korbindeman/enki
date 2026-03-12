@@ -171,9 +171,9 @@ pub(super) fn process_worker_done(done: WorkerDone, copy_mgr: &CopyManager, enki
             };
 
             if !has_changes {
-                tracing::warn!(
+                tracing::info!(
                     task_id = %done.task_id, title = %done.title,
-                    "worker completed but copy has no changes"
+                    "worker completed with no changes"
                 );
                 let _ = copy_mgr.remove_copy(&done.copy_path);
                 return WorkerResult {

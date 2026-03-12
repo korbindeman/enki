@@ -118,44 +118,43 @@ fn worker_success_queues_merge() {
 }
 
 #[test]
-fn worker_no_changes_retries_then_fails() {
+fn worker_no_changes_completes_successfully() {
     let mut orch = test_orchestrator();
     let events = orch.handle(Command::CreateTask {
         title: "Fix bug".into(),
         description: None,
         tier: Tier::Standard,
     });
-    let task_id = match &events[0] {
-        Event::SpawnWorker { task_id, .. } => task_id.clone(),
+    let (task_id, exec_id, step_id) = match &events[0] {
+        Event::SpawnWorker {
+            task_id,
+            execution_id,
+            step_id,
+            ..
+        } => (task_id.clone(), execution_id.clone(), step_id.clone()),
         _ => panic!("expected SpawnWorker"),
     };
 
-    let make_result = || WorkerResult {
+    // Worker completes with no changes — should be treated as success.
+    let events = orch.handle(Command::WorkerDone(WorkerResult {
         task_id: task_id.clone(),
-        execution_id: None,
-        step_id: None,
+        execution_id: Some(exec_id),
+        step_id: Some(step_id),
         title: "Fix bug".into(),
         branch: "task/fix-bug".into(),
         outcome: WorkerOutcome::NoChanges,
-    };
+    }));
 
-    // First NoChanges: should retry (status goes to Pending).
-    let events = orch.handle(Command::WorkerDone(make_result()));
-    assert!(events.iter().any(|e| matches!(e, Event::WorkerFailed { error, .. } if error.contains("retrying"))));
-    let task = orch.db().get_task(&task_id).unwrap();
-    assert_eq!(task.status, TaskStatus::Pending);
+    // Should produce WorkerCompleted, not WorkerFailed.
+    assert!(events.iter().any(|e| matches!(e, Event::WorkerCompleted { .. })));
+    assert!(!events.iter().any(|e| matches!(e, Event::WorkerFailed { .. })));
 
-    // Second NoChanges: should retry again.
-    let events = orch.handle(Command::WorkerDone(make_result()));
-    assert!(events.iter().any(|e| matches!(e, Event::WorkerFailed { error, .. } if error.contains("retrying"))));
-    let task = orch.db().get_task(&task_id).unwrap();
-    assert_eq!(task.status, TaskStatus::Pending);
+    // Should NOT queue a merge (nothing to merge).
+    assert!(!events.iter().any(|e| matches!(e, Event::QueueMerge(_))));
 
-    // Third NoChanges: retry budget exhausted, permanently fails.
-    let events = orch.handle(Command::WorkerDone(make_result()));
-    assert!(events.iter().any(|e| matches!(e, Event::WorkerFailed { error, .. } if !error.contains("retrying"))));
+    // Task status should be Done.
     let task = orch.db().get_task(&task_id).unwrap();
-    assert_eq!(task.status, TaskStatus::Failed);
+    assert_eq!(task.status, TaskStatus::Done);
 }
 
 #[test]

@@ -105,38 +105,41 @@ impl Orchestrator {
                 events.extend(self.tick_scheduler());
             }
             WorkerOutcome::NoChanges => {
-                let error = "completed without committing changes".to_string();
-                self.notify_scheduler_failed(&result.execution_id, &result.step_id);
-
-                let retried = self.maybe_retry(
-                    &result.task_id,
-                    &result.title,
-                    &error,
-                    &result.execution_id,
-                    &result.step_id,
-                );
-
-                if retried {
-                    events.push(Event::WorkerFailed {
-                        task_id: result.task_id.0.clone(),
-                        title: result.title.clone(),
-                        error: format!("{error} (retrying)"),
-                    });
-                } else {
-                    if let Err(e) = self
-                        .db
-                        .update_task_status(&result.task_id, TaskStatus::Failed)
-                    {
-                        tracing::warn!(task_id = %result.task_id, error = %e, "failed to update task status to Failed");
-                        events.push(Event::StatusMessage(format!("failed to update task status: {e}")));
-                    }
-
-                    events.push(Event::WorkerFailed {
-                        task_id: result.task_id.0.clone(),
-                        title: result.title.clone(),
-                        error,
-                    });
+                // Worker completed successfully but made no changes — skip merge.
+                self.monitor.clear_retries(&result.task_id.0);
+                if let Err(e) = self.db.update_task_status(&result.task_id, TaskStatus::Done) {
+                    tracing::warn!(task_id = %result.task_id, error = %e, "failed to update task status to Done");
+                    events.push(Event::StatusMessage(format!("failed to update task status: {e}")));
                 }
+
+                let is_checkpoint = if let (Some(eid), Some(sid)) = (&result.execution_id, &result.step_id) {
+                    let cp = self.scheduler.is_checkpoint(&eid.0, sid);
+                    self.scheduler.step_worker_done(&eid.0, sid, None);
+                    self.scheduler.step_completed(&eid.0, sid, None);
+                    cp
+                } else {
+                    false
+                };
+
+                events.push(Event::WorkerCompleted {
+                    task_id: result.task_id.0.clone(),
+                    title: result.title.clone(),
+                });
+
+                if is_checkpoint {
+                    if let (Some(eid), Some(sid)) = (&result.execution_id, &result.step_id) {
+                        self.scheduler.pause_execution(&eid.0);
+                        events.push(Event::CheckpointReached {
+                            execution_id: eid.0.clone(),
+                            step_id: sid.clone(),
+                            title: result.title.clone(),
+                            output: None,
+                        });
+                    }
+                }
+
+                // No merge step — tick scheduler now.
+                events.extend(self.tick_scheduler());
             }
             WorkerOutcome::Failed { ref error } => {
                 // Always mark the DAG node as failed first (consistent state machine).
@@ -230,8 +233,7 @@ impl Orchestrator {
         step_id: &Option<String>,
     ) -> bool {
         let is_retryable = error.contains("timed out")
-            || error.contains("stuck")
-            || error.contains("without committing changes");
+            || error.contains("stuck");
         if !is_retryable {
             return false;
         }
