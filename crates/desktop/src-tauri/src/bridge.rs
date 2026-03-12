@@ -129,6 +129,43 @@ pub fn get_current_branch(state: tauri::State<CoordinatorState>) -> Result<Strin
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct GitStatusSummary {
+    pub modified: u32,
+    pub untracked: u32,
+    pub staged: u32,
+}
+
+#[tauri::command]
+pub fn get_git_status(state: tauri::State<CoordinatorState>) -> Result<GitStatusSummary, String> {
+    let cwd = state.cwd.lock().unwrap().clone();
+    if cwd.is_empty() {
+        return Err("no project open".into());
+    }
+    let output = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(&cwd)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err("git status failed".into());
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut modified = 0u32;
+    let mut untracked = 0u32;
+    let mut staged = 0u32;
+    for line in text.lines() {
+        if line.len() < 2 { continue; }
+        let bytes = line.as_bytes();
+        let index = bytes[0];
+        let worktree = bytes[1];
+        if index == b'?' { untracked += 1; continue; }
+        if worktree == b'M' || worktree == b'D' { modified += 1; }
+        if index == b'M' || index == b'A' || index == b'D' || index == b'R' { staged += 1; }
+    }
+    Ok(GitStatusSummary { modified, untracked, staged })
+}
+
 #[tauri::command]
 pub async fn open_project(
     path: String,

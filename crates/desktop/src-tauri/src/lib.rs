@@ -16,6 +16,7 @@ pub fn run() {
             bridge::set_agent,
             bridge::get_project_dir,
             bridge::get_current_branch,
+            bridge::get_git_status,
             bridge::open_project,
             bridge::load_config,
             bridge::save_config,

@@ -25,6 +25,8 @@ export interface AppState {
   error: string | null;
   /** Current git branch name. */
   currentBranch: string | null;
+  /** Git working tree status counts. */
+  gitStatus: { modified: number; untracked: number; staged: number } | null;
 }
 
 const [state, setState] = createStore<AppState>({
@@ -36,6 +38,7 @@ const [state, setState] = createStore<AppState>({
   tasks: [],
   error: null,
   currentBranch: null,
+  gitStatus: null,
 });
 
 export { state };
@@ -128,6 +131,15 @@ export async function fetchBranch(): Promise<void> {
   }
 }
 
+export async function fetchGitStatus(): Promise<void> {
+  try {
+    const status = await invoke<{ modified: number; untracked: number; staged: number }>("get_git_status");
+    setState("gitStatus", status);
+  } catch {
+    setState("gitStatus", null);
+  }
+}
+
 export async function switchAgent(agent: string): Promise<void> {
   setState({
     ready: false,
@@ -150,10 +162,12 @@ export async function openProject(path: string): Promise<void> {
     tasks: [],
     error: null,
     currentBranch: null,
+    gitStatus: null,
     projectCwd: path,
   });
   await invoke("open_project", { path });
   fetchBranch();
+  fetchGitStatus();
 }
 
 // ---------------------------------------------------------------------------
@@ -460,8 +474,9 @@ function handleEvent(event: CoordinatorEvent): void {
           }
           // Remove merger worker from sidebar.
           s.workers = s.workers.filter(w => w.taskId !== event.task_id);
-          // Branch may have changed after merge.
+          // Branch/status may have changed after merge.
           fetchBranch();
+          fetchGitStatus();
           break;
         }
 
@@ -535,8 +550,10 @@ export async function initStore(): Promise<void> {
   if (cwd) {
     setState("projectCwd", cwd);
     fetchBranch();
+    fetchGitStatus();
     setInterval(() => {
       fetchBranch();
+      fetchGitStatus();
     }, 5000);
   }
 }

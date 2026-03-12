@@ -483,6 +483,15 @@ function App() {
                 <span class="text-text-muted">{state.currentBranch}</span>
               </Show>
             </div>
+            <Show when={state.gitStatus && (state.gitStatus.modified > 0 || state.gitStatus.untracked > 0 || state.gitStatus.staged > 0)}>
+              <div class="text-xs text-text-faint truncate mt-0.5">
+                {[
+                  state.gitStatus!.staged > 0 ? `${state.gitStatus!.staged} staged` : null,
+                  state.gitStatus!.modified > 0 ? `${state.gitStatus!.modified} modified` : null,
+                  state.gitStatus!.untracked > 0 ? `${state.gitStatus!.untracked} untracked` : null,
+                ].filter(Boolean).join(", ")}
+              </div>
+            </Show>
           </Show>
         </div>
         <div class="flex-1 overflow-y-auto p-4 space-y-6">
