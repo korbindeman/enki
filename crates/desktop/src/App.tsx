@@ -26,6 +26,7 @@ import TaskList from "./TaskList";
 import TierBadge from "./TierBadge";
 import Settings from "./Settings";
 import Backlog from "./Backlog";
+import Explorer from "./Explorer";
 import { Check, GitMerge, AlertTriangle, XCircle, Loader2, Wrench } from "lucide-solid";
 
 interface PendingImage {
@@ -301,6 +302,7 @@ function App() {
   const [pendingImages, setPendingImages] = createSignal<PendingImage[]>([]);
   const [settingsOpen, setSettingsOpen] = createSignal(false);
   const [backlogOpen, setBacklogOpen] = createSignal(false);
+  const [explorerOpen, setExplorerOpen] = createSignal(false);
   const [stickToBottom, setStickToBottom] = createSignal(true);
 
   const isStreaming = () => {
@@ -367,6 +369,10 @@ function App() {
     if ((e.metaKey || e.ctrlKey) && e.key === "b") {
       e.preventDefault();
       setBacklogOpen((v) => !v);
+    }
+    if ((e.metaKey || e.ctrlKey) && e.key === "e") {
+      e.preventDefault();
+      setExplorerOpen((v) => !v);
     }
   }
 
@@ -440,6 +446,15 @@ function App() {
       <aside class="w-[260px] shrink-0 border-r border-border bg-paper flex flex-col">
         <div class="px-4 py-3">
           <div class="flex items-center justify-end gap-2">
+            <button
+              onClick={() => setExplorerOpen(true)}
+              class="text-text-muted hover:text-text transition-colors"
+              title={`Files (${navigator.platform.includes("Mac") ? "\u2318" : "Ctrl"}E)`}
+            >
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
+              </svg>
+            </button>
             <button
               onClick={() => setBacklogOpen(true)}
               class="text-text-muted hover:text-text transition-colors"
@@ -602,6 +617,7 @@ function App() {
 
       <Settings open={settingsOpen()} onClose={() => setSettingsOpen(false)} />
       <Backlog open={backlogOpen()} onClose={() => setBacklogOpen(false)} />
+      <Explorer open={explorerOpen()} onClose={() => setExplorerOpen(false)} />
     </div>
   );
 }
