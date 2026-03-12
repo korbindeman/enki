@@ -71,6 +71,14 @@ CREATE TABLE IF NOT EXISTS task_outputs (
     output      TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS backlog_items (
+    id         TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    body       TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS messages (
     id          TEXT PRIMARY KEY,
     from_addr   TEXT NOT NULL,
@@ -95,6 +103,8 @@ CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(session_id);
 CREATE INDEX IF NOT EXISTS idx_executions_session ON executions(session_id);
 CREATE INDEX IF NOT EXISTS idx_merge_requests_status ON merge_requests(status);
 CREATE INDEX IF NOT EXISTS idx_merge_requests_session ON merge_requests(session_id);
+CREATE INDEX IF NOT EXISTS idx_backlog_items_session ON backlog_items(session_id);
+CREATE INDEX IF NOT EXISTS idx_backlog_items_created ON backlog_items(created_at);
 CREATE INDEX IF NOT EXISTS idx_messages_to_addr ON messages(to_addr);
 CREATE INDEX IF NOT EXISTS idx_messages_unread ON messages(to_addr, read);
 CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id);
@@ -279,6 +289,16 @@ pub(super) fn row_to_merge_request(row: &Row) -> rusqlite::Result<MergeRequest> 
         queued_at: parse_dt(row.get(10)?),
         started_at: parse_opt_dt(row.get(11)?),
         merged_at: parse_opt_dt(row.get(12)?),
+    })
+}
+
+pub(super) fn row_to_backlog_item(row: &Row) -> rusqlite::Result<BacklogItem> {
+    Ok(BacklogItem {
+        id: Id(row.get(0)?),
+        session_id: row.get(1)?,
+        body: row.get(2)?,
+        created_at: parse_dt(row.get(3)?),
+        updated_at: parse_dt(row.get(4)?),
     })
 }
 

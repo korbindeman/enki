@@ -348,6 +348,15 @@ pub struct MergeRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BacklogItem {
+    pub id: Id,
+    pub session_id: String,
+    pub body: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub id: Id,
     pub from_addr: String,

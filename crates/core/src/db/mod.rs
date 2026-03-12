@@ -684,6 +684,71 @@ impl Db {
         Ok(deleted as u64)
     }
 
+    // --- Backlog Items ---
+
+    pub fn insert_backlog_item(&self, item: &BacklogItem) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO backlog_items (id, session_id, body, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                item.id.as_str(),
+                item.session_id,
+                item.body,
+                item.created_at.to_rfc3339(),
+                item.updated_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_backlog_items(&self, session_id: &str) -> Result<Vec<BacklogItem>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, body, created_at, updated_at
+             FROM backlog_items WHERE session_id = ?1 ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map(params![session_id], row_to_backlog_item)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(DbError::Sqlite)
+    }
+
+    pub fn get_backlog_item(&self, id: &Id) -> Result<BacklogItem> {
+        self.conn
+            .query_row(
+                "SELECT id, session_id, body, created_at, updated_at
+                 FROM backlog_items WHERE id = ?1",
+                params![id.as_str()],
+                row_to_backlog_item,
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    DbError::NotFound(format!("backlog_item {id}"))
+                }
+                other => DbError::Sqlite(other),
+            })
+    }
+
+    pub fn update_backlog_item(&self, id: &Id, body: &str) -> Result<()> {
+        let updated = self.conn.execute(
+            "UPDATE backlog_items SET body = ?1, updated_at = ?2 WHERE id = ?3",
+            params![body, Utc::now().to_rfc3339(), id.as_str()],
+        )?;
+        if updated == 0 {
+            return Err(DbError::NotFound(format!("backlog_item {id}")));
+        }
+        Ok(())
+    }
+
+    pub fn delete_backlog_item(&self, id: &Id) -> Result<()> {
+        let updated = self.conn.execute(
+            "DELETE FROM backlog_items WHERE id = ?1",
+            params![id.as_str()],
+        )?;
+        if updated == 0 {
+            return Err(DbError::NotFound(format!("backlog_item {id}")));
+        }
+        Ok(())
+    }
+
     pub fn list_running_worker_addrs(&self, session_id: &str) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT 'worker/' || id FROM tasks WHERE status = 'running' AND session_id = ?1",
@@ -792,6 +857,53 @@ mod tests {
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap();
         assert!(cols.contains(&"tier".to_string()), "tier column should be auto-added, got: {:?}", cols);
+    }
+
+    #[test]
+    fn backlog_item_crud() {
+        let db = test_db();
+        let now = Utc::now();
+        let sid = "sess-1";
+
+        let item = BacklogItem {
+            id: Id::new("bl"),
+            session_id: sid.into(),
+            body: "Investigate caching strategy".into(),
+            created_at: now,
+            updated_at: now,
+        };
+        db.insert_backlog_item(&item).unwrap();
+
+        // get
+        let loaded = db.get_backlog_item(&item.id).unwrap();
+        assert_eq!(loaded.body, "Investigate caching strategy");
+        assert_eq!(loaded.session_id, sid);
+
+        // list
+        let items = db.list_backlog_items(sid).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id.0, item.id.0);
+
+        // list filters by session
+        let empty = db.list_backlog_items("other-session").unwrap();
+        assert!(empty.is_empty());
+
+        // update
+        db.update_backlog_item(&item.id, "Updated body").unwrap();
+        let loaded = db.get_backlog_item(&item.id).unwrap();
+        assert_eq!(loaded.body, "Updated body");
+        assert!(loaded.updated_at >= loaded.created_at);
+
+        // delete
+        db.delete_backlog_item(&item.id).unwrap();
+        let items = db.list_backlog_items(sid).unwrap();
+        assert!(items.is_empty());
+
+        // not found cases
+        let fake_id = Id::new("bl");
+        assert!(matches!(db.get_backlog_item(&fake_id), Err(DbError::NotFound(_))));
+        assert!(matches!(db.update_backlog_item(&fake_id, "x"), Err(DbError::NotFound(_))));
+        assert!(matches!(db.delete_backlog_item(&fake_id), Err(DbError::NotFound(_))));
     }
 
     #[test]
