@@ -443,7 +443,8 @@ function App() {
   return (
     <div class="flex h-screen bg-background text-text">
       {/* Sidebar */}
-      <aside class="w-[260px] shrink-0 border-r border-border bg-paper flex flex-col">
+      <aside class="relative w-[260px] shrink-0 border-r border-border bg-paper flex flex-col pt-[52px]">
+        <div data-tauri-drag-region class="absolute top-0 left-0 right-0 h-[52px]" />
         <div class="px-4 py-3">
           <div class="flex items-center justify-end gap-2">
             <button
@@ -501,7 +502,7 @@ function App() {
       </aside>
 
       {/* Main chat area */}
-      <main class="flex-1 flex flex-col min-w-0">
+      <main class="flex-1 flex flex-col min-w-0 pt-[52px]">
         <Show
           when={state.projectCwd}
           fallback={
