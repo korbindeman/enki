@@ -12,7 +12,7 @@ pub(super) fn all_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "enki_task_create",
-            "description": "Create a single standalone task. Starts with status 'ready' and will be automatically picked up by a worker agent. For multi-step work with dependencies, use enki_execution_create instead.",
+            "description": "Create a single standalone task. Starts with status 'ready' and will be automatically picked up by a worker agent. Can depend on other tasks via 'needs' for cross-group dependencies. For multi-step work with dependencies, use enki_execution_create instead.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -28,6 +28,23 @@ pub(super) fn all_tool_definitions() -> Vec<Value> {
                         "type": "string",
                         "enum": ["light", "standard", "heavy"],
                         "description": "Complexity tier. Defaults to 'standard'."
+                    },
+                    "needs": {
+                        "type": "array",
+                        "items": {
+                            "oneOf": [
+                                { "type": "string" },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "task": { "type": "string", "description": "Task ID to depend on." },
+                                        "condition": { "type": "string", "enum": ["merged", "completed", "started"], "description": "When to unblock. Defaults to 'merged'." }
+                                    },
+                                    "required": ["task"]
+                                }
+                            ]
+                        },
+                        "description": "Task IDs this task depends on. Bare string = task_id with 'merged' condition. Object for finer control."
                     }
                 },
                 "required": ["title"]
@@ -43,7 +60,7 @@ pub(super) fn all_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "enki_execution_create",
-            "description": "Create a multi-step execution with dependencies between steps. Steps with no dependencies start immediately; others wait for their dependencies to complete. Use this for any work involving 2+ related steps.",
+            "description": "Create a multi-step execution with dependencies between steps. Steps with no dependencies start immediately; others wait for their dependencies to complete. Supports cross-group dependencies via {\"task\": \"<task_id>\"} in needs. Use this for any work involving 2+ related steps.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -77,14 +94,22 @@ pub(super) fn all_tool_definitions() -> Vec<Value> {
                                             {
                                                 "type": "object",
                                                 "properties": {
-                                                    "step": { "type": "string", "description": "Step ID to depend on." },
+                                                    "step": { "type": "string", "description": "Step ID within this execution to depend on." },
                                                     "condition": { "type": "string", "enum": ["merged", "completed", "started"], "description": "When to unblock: 'merged' (default, merge landed), 'completed' (worker finished), 'started' (worker began running)." }
                                                 },
                                                 "required": ["step"]
+                                            },
+                                            {
+                                                "type": "object",
+                                                "properties": {
+                                                    "task": { "type": "string", "description": "Global task ID to depend on (cross-group dependency)." },
+                                                    "condition": { "type": "string", "enum": ["merged", "completed", "started"], "description": "When to unblock. Defaults to 'merged'." }
+                                                },
+                                                "required": ["task"]
                                             }
                                         ]
                                     },
-                                    "description": "Dependencies. Bare string = wait for merge. Object with 'condition' for finer control."
+                                    "description": "Dependencies. Bare string = step_id (wait for merge). {\"step\": ...} for step deps with condition. {\"task\": ...} for cross-group task deps."
                                 },
                                 "checkpoint": {
                                     "type": "boolean",
@@ -105,7 +130,7 @@ pub(super) fn all_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "enki_execution_add_steps",
-            "description": "Add new steps to a running execution. New steps can depend on existing steps or other new steps. The execution must exist and not be completed/aborted. If the execution is paused (e.g. at a checkpoint), add steps first then call enki_resume.",
+            "description": "Add new steps to a running execution. New steps can depend on existing steps, other new steps, or tasks from other executions via {\"task\": \"<task_id>\"}. The execution must exist and not be completed/aborted. If the execution is paused (e.g. at a checkpoint), add steps first then call enki_resume.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -143,14 +168,22 @@ pub(super) fn all_tool_definitions() -> Vec<Value> {
                                             {
                                                 "type": "object",
                                                 "properties": {
-                                                    "step": { "type": "string" },
+                                                    "step": { "type": "string", "description": "Step ID within this execution." },
                                                     "condition": { "type": "string", "enum": ["merged", "completed", "started"] }
                                                 },
                                                 "required": ["step"]
+                                            },
+                                            {
+                                                "type": "object",
+                                                "properties": {
+                                                    "task": { "type": "string", "description": "Global task ID (cross-group dependency)." },
+                                                    "condition": { "type": "string", "enum": ["merged", "completed", "started"] }
+                                                },
+                                                "required": ["task"]
                                             }
                                         ]
                                     },
-                                    "description": "Dependencies on existing or new steps."
+                                    "description": "Dependencies on existing or new steps, or cross-group task IDs via {\"task\": ...}."
                                 },
                                 "checkpoint": {
                                     "type": "boolean",
@@ -390,13 +423,13 @@ pub(super) fn all_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "enki_dag",
-            "description": "Render the execution DAG as an ASCII graph showing steps, dependencies, and current status.",
+            "description": "Render the task graph as an ASCII graph showing tasks, dependencies, and current status. Without arguments, shows the global graph of all tasks including cross-group dependencies. With execution_id, shows only that execution's DAG.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "execution_id": {
                         "type": "string",
-                        "description": "Execution ID. If omitted, shows the most recent execution."
+                        "description": "Execution ID. If omitted, shows the global task graph."
                     }
                 }
             }

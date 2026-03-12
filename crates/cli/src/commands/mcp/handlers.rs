@@ -51,6 +51,29 @@ pub(super) fn tool_task_create(args: &Value) -> Result<String, String> {
     let db = open_db().map_err(|e| e.to_string())?;
     let session_id = std::env::var("ENKI_SESSION_ID").ok();
 
+    // Parse optional needs (task_ids only for standalone tasks).
+    let task_deps: Vec<(String, EdgeCondition)> = if let Some(arr) = args["needs"].as_array() {
+        let mut deps = Vec::new();
+        for v in arr {
+            if let Some(s) = v.as_str() {
+                // Bare string → task_id with default Merged condition.
+                let tid = Id(s.to_string());
+                db.get_task(&tid).map_err(|_| format!("depends on unknown task '{s}'"))?;
+                deps.push((s.to_string(), EdgeCondition::Merged));
+            } else if let Some(task_id) = v.get("task").and_then(|t| t.as_str()) {
+                let tid = Id(task_id.to_string());
+                db.get_task(&tid).map_err(|_| format!("depends on unknown task '{task_id}'"))?;
+                deps.push((task_id.to_string(), parse_condition(v)));
+            } else {
+                return Err("standalone task needs only accepts task IDs (bare string or {\"task\": \"...\"})"
+                    .to_string());
+            }
+        }
+        deps
+    } else {
+        Vec::new()
+    };
+
     let now = Utc::now();
     let task = Task {
         id: Id::new("task"),
@@ -69,8 +92,21 @@ pub(super) fn tool_task_create(args: &Value) -> Result<String, String> {
     };
 
     db.insert_task(&task).map_err(|e| e.to_string())?;
+
+    // Wire up task-level dependencies.
+    for (dep_tid, _condition) in &task_deps {
+        let dep_id = Id(dep_tid.clone());
+        db.insert_dependency(&task.id, &dep_id).map_err(|e| e.to_string())?;
+    }
+
     write_signal_file(&json!({"type": "task_created", "task_id": task.id.as_str()}))?;
-    Ok(format!("Created task '{}' ({}) — status: ready, tier: {}", title, task.id.short(), tier_str))
+
+    let mut result = format!("Created task '{}' ({}) — status: ready, tier: {}", title, task.id.short(), tier_str);
+    if !task_deps.is_empty() {
+        let dep_strs: Vec<&str> = task_deps.iter().map(|(tid, _)| tid.as_str()).collect();
+        result.push_str(&format!(", needs: {}", dep_strs.join(", ")));
+    }
+    Ok(result)
 }
 
 pub(super) fn tool_task_list() -> Result<String, String> {
@@ -102,20 +138,43 @@ pub(super) fn tool_task_list() -> Result<String, String> {
     Ok(lines.join("\n"))
 }
 
-/// Parse a step dependency from JSON — accepts bare string or {"step": "...", "condition": "..."}.
-fn parse_step_dep(v: &Value) -> Option<StepDep> {
+/// A parsed dependency — either referencing a step within the same execution,
+/// or a global task_id for cross-group dependencies.
+#[allow(dead_code)]
+enum ParsedDep {
+    /// Step ID within the same execution (bare string or {"step": "..."}).
+    Step(StepDep),
+    /// Global task_id reference ({"task": "..."}).
+    /// The condition is stored for the DAG construction layer; the
+    /// `task_dependencies` DB table only records the existence of the edge.
+    Task { task_id: String, condition: EdgeCondition },
+}
+
+fn parse_condition(v: &Value) -> EdgeCondition {
+    match v.get("condition").and_then(|c| c.as_str()) {
+        Some("completed") => EdgeCondition::Completed,
+        Some("started") => EdgeCondition::Started,
+        _ => EdgeCondition::Merged,
+    }
+}
+
+/// Parse a dependency from JSON — accepts:
+/// - bare string → step_id within same execution
+/// - {"step": "..."} → step_id within same execution
+/// - {"task": "..."} → global task_id reference
+fn parse_dep(v: &Value) -> Option<ParsedDep> {
     if let Some(s) = v.as_str() {
-        Some(StepDep::from(s.to_string()))
-    } else if let Some(step_id) = v.get("step").and_then(|s| s.as_str()) {
-        let condition = match v.get("condition").and_then(|c| c.as_str()) {
-            Some("completed") => EdgeCondition::Completed,
-            Some("started") => EdgeCondition::Started,
-            _ => EdgeCondition::Merged,
-        };
-        Some(StepDep {
-            step_id: step_id.to_string(),
-            condition,
+        Some(ParsedDep::Step(StepDep::from(s.to_string())))
+    } else if let Some(task_id) = v.get("task").and_then(|s| s.as_str()) {
+        Some(ParsedDep::Task {
+            task_id: task_id.to_string(),
+            condition: parse_condition(v),
         })
+    } else if let Some(step_id) = v.get("step").and_then(|s| s.as_str()) {
+        Some(ParsedDep::Step(StepDep {
+            step_id: step_id.to_string(),
+            condition: parse_condition(v),
+        }))
     } else {
         None
     }
@@ -131,7 +190,12 @@ pub(super) fn tool_execution_create(args: &Value) -> Result<String, String> {
     }
 
     // Parse and validate all steps up front.
-    let mut defs: Vec<StepDef> = Vec::new();
+    struct StepWithDeps {
+        def: StepDef,
+        parsed_deps: Vec<ParsedDep>,
+    }
+
+    let mut parsed_steps: Vec<StepWithDeps> = Vec::new();
     let mut step_ids: HashSet<String> = HashSet::new();
 
     for step in steps {
@@ -150,48 +214,69 @@ pub(super) fn tool_execution_create(args: &Value) -> Result<String, String> {
         let tier_str = step["tier"].as_str().unwrap_or("heavy");
         let tier =
             Tier::from_str(tier_str).ok_or_else(|| format!("invalid tier: {tier_str}"))?;
-        let needs: Vec<StepDep> = step["needs"]
+        let parsed_deps: Vec<ParsedDep> = step["needs"]
             .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(parse_step_dep)
-                    .collect()
-            })
+            .map(|arr| arr.iter().filter_map(parse_dep).collect())
             .unwrap_or_default();
         let checkpoint = step["checkpoint"].as_bool().unwrap_or(false);
         let role = step["role"].as_str().map(|s| s.to_string());
 
+        // Extract step-local deps for StepDef (used by orchestrator).
+        let needs: Vec<StepDep> = parsed_deps
+            .iter()
+            .filter_map(|d| match d {
+                ParsedDep::Step(sd) => Some(sd.clone()),
+                ParsedDep::Task { .. } => None,
+            })
+            .collect();
+
         if !step_ids.insert(id.clone()) {
             return Err(format!("duplicate step id: {id}"));
         }
-        defs.push(StepDef {
-            id,
-            title,
-            description,
-            tier,
-            needs,
-            checkpoint,
-            role,
+        parsed_steps.push(StepWithDeps {
+            def: StepDef { id, title, description, tier, needs, checkpoint, role },
+            parsed_deps,
         });
     }
 
-    // Validate dependency references.
-    for def in &defs {
-        for dep in &def.needs {
-            if !step_ids.contains(&dep.step_id) {
-                return Err(format!(
-                    "step '{}' depends on unknown step '{}'",
-                    def.id, dep.step_id
-                ));
-            }
-            if dep.step_id == def.id {
-                return Err(format!("step '{}' cannot depend on itself", def.id));
+    // Validate step-local dependency references.
+    for ps in &parsed_steps {
+        for dep in &ps.parsed_deps {
+            match dep {
+                ParsedDep::Step(sd) => {
+                    if !step_ids.contains(&sd.step_id) {
+                        return Err(format!(
+                            "step '{}' depends on unknown step '{}'",
+                            ps.def.id, sd.step_id
+                        ));
+                    }
+                    if sd.step_id == ps.def.id {
+                        return Err(format!("step '{}' cannot depend on itself", ps.def.id));
+                    }
+                }
+                ParsedDep::Task { .. } => {} // validated below against DB
             }
         }
     }
 
     // Create execution + tasks + steps + dependencies atomically.
     let db = open_db().map_err(|e| e.to_string())?;
+
+    // Validate task-based deps exist in DB.
+    for ps in &parsed_steps {
+        for dep in &ps.parsed_deps {
+            if let ParsedDep::Task { task_id, .. } = dep {
+                let tid = Id(task_id.clone());
+                db.get_task(&tid).map_err(|_| {
+                    format!(
+                        "step '{}' depends on unknown task '{}'",
+                        ps.def.id, task_id
+                    )
+                })?;
+            }
+        }
+    }
+
     let execution_id = Id::new("exec");
     let now = Utc::now();
     let session_id = std::env::var("ENKI_SESSION_ID").ok();
@@ -206,36 +291,45 @@ pub(super) fn tool_execution_create(args: &Value) -> Result<String, String> {
 
     let mut step_task_ids: HashMap<String, Id> = HashMap::new();
 
-    for def in &defs {
+    for ps in &parsed_steps {
         let task_id = Id::new("task");
         let task = Task {
             id: task_id.clone(),
             session_id: session_id.clone(),
-            title: def.title.clone(),
-            description: Some(def.description.clone()),
+            title: ps.def.title.clone(),
+            description: Some(ps.def.description.clone()),
             status: TaskStatus::Pending,
             assigned_to: None,
             copy_path: None,
             branch: None,
             base_branch: None,
-            tier: Some(def.tier),
+            tier: Some(ps.def.tier),
             current_activity: None,
             created_at: now,
             updated_at: now,
         };
         db.insert_task(&task).map_err(|e| e.to_string())?;
-        db.insert_execution_step(&execution_id, &def.id, &task_id)
+        db.insert_execution_step(&execution_id, &ps.def.id, &task_id)
             .map_err(|e| e.to_string())?;
-        step_task_ids.insert(def.id.clone(), task_id);
+        step_task_ids.insert(ps.def.id.clone(), task_id);
     }
 
     // Wire up dependencies (task-level).
-    for def in &defs {
-        let task_id = &step_task_ids[&def.id];
-        for dep in &def.needs {
-            let dep_task_id = &step_task_ids[&dep.step_id];
-            db.insert_dependency(task_id, dep_task_id)
-                .map_err(|e| e.to_string())?;
+    for ps in &parsed_steps {
+        let task_id = &step_task_ids[&ps.def.id];
+        for dep in &ps.parsed_deps {
+            match dep {
+                ParsedDep::Step(sd) => {
+                    let dep_task_id = &step_task_ids[&sd.step_id];
+                    db.insert_dependency(task_id, dep_task_id)
+                        .map_err(|e| e.to_string())?;
+                }
+                ParsedDep::Task { task_id: dep_tid, .. } => {
+                    let dep_task_id = Id(dep_tid.clone());
+                    db.insert_dependency(task_id, &dep_task_id)
+                        .map_err(|e| e.to_string())?;
+                }
+            }
         }
     }
 
@@ -243,18 +337,21 @@ pub(super) fn tool_execution_create(args: &Value) -> Result<String, String> {
 
     // Build response.
     let mut lines = vec![format!("execution: {}", execution_id.short())];
-    for def in &defs {
-        let task_id = &step_task_ids[&def.id];
+    for ps in &parsed_steps {
+        let task_id = &step_task_ids[&ps.def.id];
         let status = "pending";
-        let deps = if def.needs.is_empty() {
+        let deps = if ps.parsed_deps.is_empty() {
             String::new()
         } else {
-            let dep_strs: Vec<String> = def.needs.iter().map(|d| d.step_id.clone()).collect();
+            let dep_strs: Vec<String> = ps.parsed_deps.iter().map(|d| match d {
+                ParsedDep::Step(sd) => sd.step_id.clone(),
+                ParsedDep::Task { task_id, .. } => format!("task:{}", &task_id[..task_id.len().min(12)]),
+            }).collect();
             format!(" (needs: {})", dep_strs.join(", "))
         };
         lines.push(format!(
             "  {} → {} | {} | {}{}",
-            def.id, task_id.short(), status, def.title, deps
+            ps.def.id, task_id.short(), status, ps.def.title, deps
         ));
     }
     Ok(lines.join("\n"))
@@ -282,7 +379,12 @@ pub(super) fn tool_execution_add_steps(args: &Value) -> Result<String, String> {
     let existing_step_ids: HashSet<String> = existing_steps.iter().map(|(sid, _)| sid.clone()).collect();
 
     // Parse new steps.
-    let mut defs: Vec<StepDef> = Vec::new();
+    struct StepWithDeps {
+        def: StepDef,
+        parsed_deps: Vec<ParsedDep>,
+    }
+
+    let mut parsed_steps: Vec<StepWithDeps> = Vec::new();
     let mut new_step_ids: HashSet<String> = HashSet::new();
 
     for step in steps {
@@ -301,12 +403,20 @@ pub(super) fn tool_execution_add_steps(args: &Value) -> Result<String, String> {
         let tier_str = step["tier"].as_str().unwrap_or("heavy");
         let tier =
             Tier::from_str(tier_str).ok_or_else(|| format!("invalid tier: {tier_str}"))?;
-        let needs: Vec<StepDep> = step["needs"]
+        let parsed_deps: Vec<ParsedDep> = step["needs"]
             .as_array()
-            .map(|arr| arr.iter().filter_map(parse_step_dep).collect())
+            .map(|arr| arr.iter().filter_map(parse_dep).collect())
             .unwrap_or_default();
         let checkpoint = step["checkpoint"].as_bool().unwrap_or(false);
         let role = step["role"].as_str().map(|s| s.to_string());
+
+        let needs: Vec<StepDep> = parsed_deps
+            .iter()
+            .filter_map(|d| match d {
+                ParsedDep::Step(sd) => Some(sd.clone()),
+                ParsedDep::Task { .. } => None,
+            })
+            .collect();
 
         if existing_step_ids.contains(&id) {
             return Err(format!("step id '{id}' already exists in this execution"));
@@ -314,29 +424,44 @@ pub(super) fn tool_execution_add_steps(args: &Value) -> Result<String, String> {
         if !new_step_ids.insert(id.clone()) {
             return Err(format!("duplicate step id: {id}"));
         }
-        defs.push(StepDef {
-            id,
-            title,
-            description,
-            tier,
-            needs,
-            checkpoint,
-            role,
+        parsed_steps.push(StepWithDeps {
+            def: StepDef { id, title, description, tier, needs, checkpoint, role },
+            parsed_deps,
         });
     }
 
-    // Validate deps reference existing or new steps.
-    let all_ids: HashSet<String> = existing_step_ids.union(&new_step_ids).cloned().collect();
-    for def in &defs {
-        for dep in &def.needs {
-            if !all_ids.contains(&dep.step_id) {
-                return Err(format!(
-                    "step '{}' depends on unknown step '{}'",
-                    def.id, dep.step_id
-                ));
+    // Validate step-local deps reference existing or new steps.
+    let all_step_ids: HashSet<String> = existing_step_ids.union(&new_step_ids).cloned().collect();
+    for ps in &parsed_steps {
+        for dep in &ps.parsed_deps {
+            match dep {
+                ParsedDep::Step(sd) => {
+                    if !all_step_ids.contains(&sd.step_id) {
+                        return Err(format!(
+                            "step '{}' depends on unknown step '{}'",
+                            ps.def.id, sd.step_id
+                        ));
+                    }
+                    if sd.step_id == ps.def.id {
+                        return Err(format!("step '{}' cannot depend on itself", ps.def.id));
+                    }
+                }
+                ParsedDep::Task { .. } => {} // validated below against DB
             }
-            if dep.step_id == def.id {
-                return Err(format!("step '{}' cannot depend on itself", def.id));
+        }
+    }
+
+    // Validate task-based deps exist in DB.
+    for ps in &parsed_steps {
+        for dep in &ps.parsed_deps {
+            if let ParsedDep::Task { task_id, .. } = dep {
+                let tid = Id(task_id.clone());
+                db.get_task(&tid).map_err(|_| {
+                    format!(
+                        "step '{}' depends on unknown task '{}'",
+                        ps.def.id, task_id
+                    )
+                })?;
             }
         }
     }
@@ -349,27 +474,27 @@ pub(super) fn tool_execution_add_steps(args: &Value) -> Result<String, String> {
     // Map existing step_id → task_id for dep wiring.
     let existing_task_map: HashMap<String, Id> = existing_steps.into_iter().collect();
 
-    for def in &defs {
+    for ps in &parsed_steps {
         let task_id = Id::new("task");
         let task = Task {
             id: task_id.clone(),
             session_id: session_id.clone(),
-            title: def.title.clone(),
-            description: Some(def.description.clone()),
+            title: ps.def.title.clone(),
+            description: Some(ps.def.description.clone()),
             status: TaskStatus::Pending,
             assigned_to: None,
             copy_path: None,
             branch: None,
             base_branch: None,
-            tier: Some(def.tier),
+            tier: Some(ps.def.tier),
             current_activity: None,
             created_at: now,
             updated_at: now,
         };
         db.insert_task(&task).map_err(|e| e.to_string())?;
-        db.insert_execution_step(&exec_id, &def.id, &task_id)
+        db.insert_execution_step(&exec_id, &ps.def.id, &task_id)
             .map_err(|e| e.to_string())?;
-        step_task_ids.insert(def.id.clone(), task_id);
+        step_task_ids.insert(ps.def.id.clone(), task_id);
     }
 
     // Wire dependencies.
@@ -378,12 +503,21 @@ pub(super) fn tool_execution_add_steps(args: &Value) -> Result<String, String> {
         .chain(step_task_ids.iter().map(|(k, v)| (k.clone(), v.clone())))
         .collect();
 
-    for def in &defs {
-        let task_id = &step_task_ids[&def.id];
-        for dep in &def.needs {
-            if let Some(dep_task_id) = all_task_map.get(&dep.step_id) {
-                db.insert_dependency(task_id, dep_task_id)
-                    .map_err(|e| e.to_string())?;
+    for ps in &parsed_steps {
+        let task_id = &step_task_ids[&ps.def.id];
+        for dep in &ps.parsed_deps {
+            match dep {
+                ParsedDep::Step(sd) => {
+                    if let Some(dep_task_id) = all_task_map.get(&sd.step_id) {
+                        db.insert_dependency(task_id, dep_task_id)
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
+                ParsedDep::Task { task_id: dep_tid, .. } => {
+                    let dep_task_id = Id(dep_tid.clone());
+                    db.insert_dependency(task_id, &dep_task_id)
+                        .map_err(|e| e.to_string())?;
+                }
             }
         }
     }
@@ -393,18 +527,21 @@ pub(super) fn tool_execution_add_steps(args: &Value) -> Result<String, String> {
         "execution_id": exec_id.as_str()
     }))?;
 
-    let mut lines = vec![format!("added {} steps to execution {}", defs.len(), exec_id.short())];
-    for def in &defs {
-        let task_id = &step_task_ids[&def.id];
-        let deps = if def.needs.is_empty() {
+    let mut lines = vec![format!("added {} steps to execution {}", parsed_steps.len(), exec_id.short())];
+    for ps in &parsed_steps {
+        let task_id = &step_task_ids[&ps.def.id];
+        let deps = if ps.parsed_deps.is_empty() {
             String::new()
         } else {
-            let dep_strs: Vec<String> = def.needs.iter().map(|d| d.step_id.clone()).collect();
+            let dep_strs: Vec<String> = ps.parsed_deps.iter().map(|d| match d {
+                ParsedDep::Step(sd) => sd.step_id.clone(),
+                ParsedDep::Task { task_id, .. } => format!("task:{}", &task_id[..task_id.len().min(12)]),
+            }).collect();
             format!(" (needs: {})", dep_strs.join(", "))
         };
         lines.push(format!(
             "  {} → {} | pending | {}{}",
-            def.id, task_id.short(), def.title, deps
+            ps.def.id, task_id.short(), ps.def.title, deps
         ));
     }
     Ok(lines.join("\n"))
@@ -559,39 +696,84 @@ pub(super) fn tool_edit_file(args: &Value) -> Result<String, String> {
 
 pub(super) fn tool_dag(args: &Value) -> Result<String, String> {
     let db = open_db().map_err(|e| e.to_string())?;
+    let session_id = std::env::var("ENKI_SESSION_ID").ok();
 
-    let exec_id = if let Some(id_str) = args["execution_id"].as_str() {
-        Id(id_str.to_string())
-    } else {
-        let session_id = std::env::var("ENKI_SESSION_ID").ok();
-        let exec = db
-            .get_most_recent_execution(session_id.as_deref())
+    // If execution_id provided, show that execution's DAG (existing behavior).
+    if let Some(id_str) = args["execution_id"].as_str() {
+        let exec_id = Id(id_str.to_string());
+        let dag = db
+            .load_dag(&exec_id)
             .map_err(|e| e.to_string())?
-            .ok_or("No executions found.")?;
-        exec.id
-    };
+            .ok_or_else(|| format!("No DAG found for execution {}.", exec_id))?;
 
-    let dag = db
-        .load_dag(&exec_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("No DAG found for execution {}.", exec_id))?;
+        let nodes = dag.nodes();
+        if nodes.is_empty() {
+            return Ok(format!("Execution {} has an empty DAG.", exec_id));
+        }
 
-    let nodes = dag.nodes();
-    if nodes.is_empty() {
-        return Ok(format!("Execution {} has an empty DAG.", exec_id));
+        let labels: Vec<String> = nodes
+            .iter()
+            .map(|n| format!("{} [{}]", n.id, n.status.as_str()))
+            .collect();
+
+        let node_entries: Vec<(usize, &str)> =
+            labels.iter().enumerate().map(|(i, l)| (i, l.as_str())).collect();
+        let mut edges: Vec<(usize, usize)> = Vec::new();
+        for (i, node) in nodes.iter().enumerate() {
+            for dep in &node.deps {
+                edges.push((dep.target, i));
+            }
+        }
+
+        let ascii = DAG::from_edges(&node_entries, &edges);
+        return Ok(ascii.render());
     }
 
-    // Build labels so they outlive the DAG renderer.
-    let labels: Vec<String> = nodes
+    // No execution_id → show global graph from all session tasks.
+    let tasks = if let Some(ref sid) = session_id {
+        db.list_session_tasks(sid).map_err(|e| e.to_string())?
+    } else {
+        db.list_tasks().map_err(|e| e.to_string())?
+    };
+
+    if tasks.is_empty() {
+        return Ok("No tasks.".into());
+    }
+
+    // Build task index and labels.
+    let task_index: HashMap<String, usize> = tasks
         .iter()
-        .map(|n| format!("{} [{}]", n.id, n.status.as_str()))
+        .enumerate()
+        .map(|(i, t)| (t.id.as_str().to_string(), i))
         .collect();
 
-    let node_entries: Vec<(usize, &str)> = labels.iter().enumerate().map(|(i, l)| (i, l.as_str())).collect();
+    let labels: Vec<String> = tasks
+        .iter()
+        .map(|t| {
+            // Include step_id if task belongs to an execution.
+            let exec_info = db.get_execution_for_task(&t.id).ok().flatten();
+            match exec_info {
+                Some((_, step_id)) => {
+                    format!("{} ({}) [{}]", step_id, t.id.short(), t.status.as_str())
+                }
+                None => {
+                    format!("{} [{}]", t.id.short(), t.status.as_str())
+                }
+            }
+        })
+        .collect();
+
+    let node_entries: Vec<(usize, &str)> =
+        labels.iter().enumerate().map(|(i, l)| (i, l.as_str())).collect();
+
+    // Build edges from task_dependencies.
     let mut edges: Vec<(usize, usize)> = Vec::new();
-    for (i, node) in nodes.iter().enumerate() {
-        for dep in &node.deps {
-            edges.push((dep.target, i));
+    for (i, task) in tasks.iter().enumerate() {
+        let deps = db.get_dependencies(&task.id).map_err(|e| e.to_string())?;
+        for dep_id in deps {
+            if let Some(&dep_idx) = task_index.get(dep_id.as_str()) {
+                edges.push((dep_idx, i));
+            }
         }
     }
 
