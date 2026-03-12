@@ -1,5 +1,6 @@
-import { createSignal, For, Show, onMount } from "solid-js";
+import { createSignal, createEffect, For, Show } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
+import { state } from "./store";
 import { highlightCode, renderMarkdown } from "./markdown";
 
 // ---------------------------------------------------------------------------
@@ -92,16 +93,12 @@ export default function Explorer(props: { open: boolean; onClose: () => void }) 
   const [fileLoading, setFileLoading] = createSignal(false);
   const [markdownRendered, setMarkdownRendered] = createSignal(true);
 
-  // Initialize on first open
-  onMount(async () => {
-    try {
-      const cwd = await invoke<string>("get_project_dir");
-      if (cwd) {
-        setCurrentPath(cwd);
-        await loadDirectory(cwd);
-      }
-    } catch {
-      // Project not open yet.
+  // Reload when project changes (also runs on first mount)
+  createEffect(() => {
+    const cwd = state.projectCwd;
+    if (cwd) {
+      setCurrentPath(cwd);
+      loadDirectory(cwd);
     }
   });
 

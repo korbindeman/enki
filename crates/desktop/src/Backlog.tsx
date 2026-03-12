@@ -1,5 +1,6 @@
-import { createSignal, For, Show, onMount } from "solid-js";
+import { createSignal, createEffect, For, Show } from "solid-js";
 import {
+  state,
   backlogItems,
   loadBacklog,
   addBacklogItem,
@@ -29,7 +30,9 @@ export default function Backlog(props: { open: boolean; onClose: () => void }) {
   let addRef!: HTMLTextAreaElement;
   let editRef!: HTMLTextAreaElement;
 
-  onMount(() => {
+  // Reload when project changes (also runs on first mount)
+  createEffect(() => {
+    const _cwd = state.projectCwd; // track the dependency
     loadBacklog();
   });
 
