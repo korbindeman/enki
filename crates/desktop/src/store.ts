@@ -1,3 +1,4 @@
+import { createSignal } from "solid-js";
 import { createStore, produce } from "solid-js/store";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
@@ -38,6 +39,44 @@ const [state, setState] = createStore<AppState>({
 });
 
 export { state };
+
+// ---------------------------------------------------------------------------
+// Backlog
+// ---------------------------------------------------------------------------
+
+export interface BacklogItem {
+  id: string;
+  body: string;
+  created_at: string;
+  updated_at: string;
+}
+
+const [backlogItems, setBacklogItems] = createSignal<BacklogItem[]>([]);
+export { backlogItems };
+
+export async function loadBacklog(): Promise<void> {
+  try {
+    const items = await invoke<BacklogItem[]>("backlog_list");
+    setBacklogItems(items);
+  } catch {
+    // DB not available yet (no project open).
+  }
+}
+
+export async function addBacklogItem(body: string): Promise<void> {
+  await invoke("backlog_add", { body });
+  await loadBacklog();
+}
+
+export async function updateBacklogItem(id: string, body: string): Promise<void> {
+  await invoke("backlog_update", { id, body });
+  await loadBacklog();
+}
+
+export async function removeBacklogItem(id: string): Promise<void> {
+  await invoke("backlog_remove", { id });
+  await loadBacklog();
+}
 
 // ---------------------------------------------------------------------------
 // Actions (frontend → Rust)

@@ -25,6 +25,7 @@ import WorkerPanel from "./WorkerPanel";
 import TaskList from "./TaskList";
 import TierBadge from "./TierBadge";
 import Settings from "./Settings";
+import Backlog from "./Backlog";
 import { Check, GitMerge, AlertTriangle, XCircle, Loader2, Wrench } from "lucide-solid";
 
 interface PendingImage {
@@ -299,6 +300,7 @@ function App() {
   const [input, setInput] = createSignal("");
   const [pendingImages, setPendingImages] = createSignal<PendingImage[]>([]);
   const [settingsOpen, setSettingsOpen] = createSignal(false);
+  const [backlogOpen, setBacklogOpen] = createSignal(false);
   const [stickToBottom, setStickToBottom] = createSignal(true);
 
   const isStreaming = () => {
@@ -361,6 +363,10 @@ function App() {
     if ((e.metaKey || e.ctrlKey) && e.key === ",") {
       e.preventDefault();
       setSettingsOpen((v) => !v);
+    }
+    if ((e.metaKey || e.ctrlKey) && e.key === "b") {
+      e.preventDefault();
+      setBacklogOpen((v) => !v);
     }
   }
 
@@ -433,7 +439,16 @@ function App() {
       {/* Sidebar */}
       <aside class="w-[260px] shrink-0 border-r border-border bg-paper flex flex-col">
         <div class="px-4 py-3">
-          <div class="flex items-center justify-end">
+          <div class="flex items-center justify-end gap-2">
+            <button
+              onClick={() => setBacklogOpen(true)}
+              class="text-text-muted hover:text-text transition-colors"
+              title={`Backlog (${navigator.platform.includes("Mac") ? "\u2318" : "Ctrl"}B)`}
+            >
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
+              </svg>
+            </button>
             <button
               onClick={() => setSettingsOpen(true)}
               class="text-text-muted hover:text-text transition-colors"
@@ -586,6 +601,7 @@ function App() {
       </main>
 
       <Settings open={settingsOpen()} onClose={() => setSettingsOpen(false)} />
+      <Backlog open={backlogOpen()} onClose={() => setBacklogOpen(false)} />
     </div>
   );
 }
