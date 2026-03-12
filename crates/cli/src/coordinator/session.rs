@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use enki_acp::acp_schema as acp;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
@@ -8,6 +10,16 @@ use super::FromCoordinator;
 
 pub(super) type PromptResult = (u64, Result<String, String>);
 
+/// What triggered the last prompt sent to the coordinator agent.
+enum PromptSource {
+    /// A user-typed message.
+    User,
+    /// An automatic flush of pending worker events.
+    EventFlush,
+    /// No prompt has been sent yet (session startup).
+    None,
+}
+
 pub(super) struct CoordinatorSession {
     pub session_id: String,
     pub pending_events: Vec<String>,
@@ -15,6 +27,8 @@ pub(super) struct CoordinatorSession {
     active_prompt: Option<tokio::task::JoinHandle<()>>,
     prompt_done_tx: mpsc::UnboundedSender<PromptResult>,
     pub forward_updates: std::rc::Rc<std::cell::Cell<bool>>,
+    last_prompt_source: PromptSource,
+    idle_since: Option<Instant>,
 }
 
 impl CoordinatorSession {
@@ -27,6 +41,8 @@ impl CoordinatorSession {
             active_prompt: None,
             prompt_done_tx,
             forward_updates: std::rc::Rc::new(std::cell::Cell::new(false)),
+            last_prompt_source: PromptSource::None,
+            idle_since: None,
         };
         (session, prompt_done_rx)
     }
@@ -56,6 +72,8 @@ impl CoordinatorSession {
         };
 
         let content = build_content_blocks(full_text, images);
+        self.last_prompt_source = PromptSource::User;
+        self.idle_since = None;
         self.spawn_prompt(mgr, content);
     }
 
@@ -68,6 +86,7 @@ impl CoordinatorSession {
             return None;
         }
         self.active_prompt = None;
+        self.idle_since = Some(Instant::now());
         Some(match result {
             Ok(stop_reason) => FromCoordinator::Done(stop_reason),
             Err(e) => FromCoordinator::Error(format!("prompt error: {e}")),
@@ -97,9 +116,32 @@ impl CoordinatorSession {
         if self.active_prompt.is_some() || self.pending_events.is_empty() {
             return;
         }
+
+        match self.last_prompt_source {
+            PromptSource::EventFlush => {
+                // Last response was to system events — flush immediately.
+                self.do_flush(mgr);
+            }
+            PromptSource::User => {
+                // Last response was to user — wait 10s idle before flushing.
+                if let Some(idle_since) = self.idle_since {
+                    if idle_since.elapsed() >= Duration::from_secs(10) {
+                        self.do_flush(mgr);
+                    }
+                }
+            }
+            PromptSource::None => {
+                // No prompt sent yet — wait for first interaction.
+            }
+        }
+    }
+
+    fn do_flush(&mut self, mgr: &AgentManager) {
         let events_text = std::mem::take(&mut self.pending_events).join("\n");
         let msg = format!("[worker status updates]\n{events_text}");
         let content = vec![acp::ContentBlock::Text(acp::TextContent::new(msg))];
+        self.last_prompt_source = PromptSource::EventFlush;
+        self.idle_since = None;
         self.spawn_prompt(mgr, content);
     }
 
