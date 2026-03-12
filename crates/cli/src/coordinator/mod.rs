@@ -29,6 +29,12 @@ use workers::{
     process_worker_done,
 };
 
+/// Conflict info stored between MergeNeedsResolution and MergeLanded/MergeFailed.
+struct MergeConflictInfo {
+    task_title: String,
+    conflict_files: Vec<String>,
+}
+
 /// Counters for session-end summary.
 #[derive(Default)]
 struct SessionStats {
@@ -196,6 +202,9 @@ struct Runtime {
     stats: SessionStats,
     /// Tracks when each merge started for duration logging.
     merge_start_times: HashMap<String, Instant>,
+    /// Conflict info stored between MergeNeedsResolution and MergeLanded/MergeFailed
+    /// for coalescing coordinator announcements.
+    merge_conflict_info: HashMap<String, MergeConflictInfo>,
 }
 
 impl Runtime {

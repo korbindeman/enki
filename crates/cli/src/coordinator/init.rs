@@ -311,6 +311,7 @@ pub(super) async fn initialize(
         session_start: Instant::now(),
         stats: super::SessionStats::default(),
         merge_start_times: std::collections::HashMap::new(),
+        merge_conflict_info: std::collections::HashMap::new(),
     };
 
     // Clean up orphaned merge temp dirs from prior crashed sessions.

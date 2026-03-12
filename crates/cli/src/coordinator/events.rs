@@ -47,9 +47,6 @@ impl Runtime {
                             task_id: mr.task_id.0.clone(),
                             branch: mr.branch.clone(),
                         });
-                        coord.queue_event(format!(
-                            "- Task \"{}\" completed, merge {} queued", mr.task_id, mr.id
-                        ));
                     }
                     Event::WorkerCompleted { task_id, title } => {
                         let _ = self.tx.send(FromCoordinator::WorkerCompleted {
@@ -72,26 +69,35 @@ impl Runtime {
                         let _ = self.tx.send(FromCoordinator::MergeLanded {
                             mr_id: mr_id.clone(), task_id: task_id.clone(), branch: branch.clone(),
                         });
-                        coord.queue_event(format!(
-                            "- Merge {} landed: task {} merged to main", short_id(&mr_id), short_id(&task_id)
-                        ));
+                        let msg = if let Some(info) = self.merge_conflict_info.remove(&mr_id) {
+                            let files = info.conflict_files.join(", ");
+                            format!(
+                                "- Task \"{}\" had merge conflicts in {} file(s) ({}), merger agent resolved them, merged to main",
+                                info.task_title, info.conflict_files.len(), files
+                            )
+                        } else {
+                            let title = self.orch.db().get_task(&Id(task_id.clone()))
+                                .map(|t| t.title)
+                                .unwrap_or_else(|_| short_id(&task_id).to_string());
+                            format!("- Task \"{}\" merged to main", title)
+                        };
+                        coord.queue_event(msg);
                     }
                     Event::MergeConflicted { mr_id, task_id, branch } => {
                         let _ = self.tx.send(FromCoordinator::MergeConflicted {
                             mr_id: mr_id.clone(), task_id: task_id.clone(), branch: branch.clone(),
                         });
-                        coord.queue_event(format!(
-                            "- Merge {} conflicted — task {} needs resolution", short_id(&mr_id), short_id(&task_id)
-                        ));
                     }
                     Event::MergeNeedsResolution {
                         mr_id, task_id, temp_dir, default_branch,
                         conflict_files, conflict_diff,
                     } => {
-                        coord.queue_event(format!(
-                            "- Merge conflict on task {} — spawning merger agent to resolve ({} file(s))",
-                            short_id(&task_id.0), conflict_files.len()
-                        ));
+                        self.merge_conflict_info.insert(mr_id.clone(), super::MergeConflictInfo {
+                            task_title: self.orch.db().get_task(&task_id)
+                                .map(|t| t.title)
+                                .unwrap_or_else(|_| task_id.0.clone()),
+                            conflict_files: conflict_files.clone(),
+                        });
 
                         // Get the task description for context.
                         let task_desc = self.orch.db().get_task(&task_id)
@@ -130,7 +136,15 @@ impl Runtime {
                             mr_id: mr_id.clone(), task_id: task_id.clone(),
                             branch: branch.clone(), reason: reason.clone(),
                         });
-                        coord.queue_event(format!("- Merge {mr_id} failed: {reason}"));
+                        let msg = if let Some(info) = self.merge_conflict_info.remove(&mr_id) {
+                            format!(
+                                "- Task \"{}\" had merge conflicts in {} file(s), resolution failed: {}",
+                                info.task_title, info.conflict_files.len(), reason
+                            )
+                        } else {
+                            format!("- Merge failed for task {}: {}", short_id(&task_id), reason)
+                        };
+                        coord.queue_event(msg);
                     }
                     Event::ExecutionComplete { execution_id } => {
                         tracing::info!(execution_id = %execution_id, "execution completed");
