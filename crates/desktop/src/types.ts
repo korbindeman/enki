@@ -36,6 +36,12 @@ export type CoordinatorEvent =
     }
   | { type: "merge_conflicted"; task_id: string; branch: string }
   | {
+      type: "merger_spawned";
+      task_id: string;
+      title: string;
+      conflict_files: string[];
+    }
+  | {
       type: "merge_progress";
       task_id: string;
       branch: string;

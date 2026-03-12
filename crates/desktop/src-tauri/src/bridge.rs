@@ -615,6 +615,7 @@ pub enum CoordinatorEvent {
     MergeFailed { task_id: String, branch: String, reason: String },
     MergeConflicted { task_id: String, branch: String },
     MergeProgress { task_id: String, branch: String, status: String },
+    MergerSpawned { task_id: String, title: String, conflict_files: Vec<String> },
     WorkerCount { count: usize },
     AllStopped { count: usize },
     Mail { from: String, to: String, subject: String, priority: String },
@@ -672,6 +673,8 @@ fn to_event(msg: FromCoordinator) -> CoordinatorEvent {
             CoordinatorEvent::MergeFailed { task_id, branch, reason },
         FromCoordinator::MergeProgress { mr_id: _, task_id, branch, status } =>
             CoordinatorEvent::MergeProgress { task_id, branch, status },
+        FromCoordinator::MergerSpawned { task_id, title, conflict_files } =>
+            CoordinatorEvent::MergerSpawned { task_id, title, conflict_files },
         FromCoordinator::WorkerCount(count) =>
             CoordinatorEvent::WorkerCount { count },
         FromCoordinator::AllStopped { count } =>

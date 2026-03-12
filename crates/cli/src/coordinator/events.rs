@@ -116,6 +116,13 @@ impl Runtime {
                                     mr_id, task_id = %task_id,
                                     "merger agent spawned for conflict resolution"
                                 );
+                                let _ = self.tx.send(FromCoordinator::MergerSpawned {
+                                    task_id: task_id.0.clone(),
+                                    title: self.orch.db().get_task(&task_id)
+                                        .map(|t| t.title)
+                                        .unwrap_or_else(|_| task_id.0.clone()),
+                                    conflict_files: conflict_files.clone(),
+                                });
                             }
                             Err(e) => {
                                 tracing::error!(mr_id, error = %e, "failed to spawn merger agent");

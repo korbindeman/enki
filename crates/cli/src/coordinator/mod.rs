@@ -112,6 +112,11 @@ pub enum FromCoordinator {
         branch: String,
         status: String,
     },
+    MergerSpawned {
+        task_id: String,
+        title: String,
+        conflict_files: Vec<String>,
+    },
     WorkerReport { task_id: String, status: String },
     Mail {
         from: String,

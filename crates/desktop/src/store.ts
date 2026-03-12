@@ -417,6 +417,19 @@ function handleEvent(event: CoordinatorEvent): void {
           });
           break;
 
+        case "merger_spawned": {
+          const existing = s.workers.find(w => w.taskId === event.task_id);
+          if (!existing) {
+            s.workers.push({
+              taskId: event.task_id,
+              title: event.title,
+              tier: "light",
+              activity: `Resolving conflicts in ${event.conflict_files.length} file(s)`,
+            });
+          }
+          break;
+        }
+
         case "merge_queued": {
           const cardMsg = s.messages.find(
             (m) => m.workerCard?.taskId === event.task_id,
@@ -445,6 +458,8 @@ function handleEvent(event: CoordinatorEvent): void {
             task.mergeStatus = "landed";
             task.mergeFlashUntil = Date.now() + 2000;
           }
+          // Remove merger worker from sidebar.
+          s.workers = s.workers.filter(w => w.taskId !== event.task_id);
           // Branch may have changed after merge.
           fetchBranch();
           break;
@@ -465,6 +480,8 @@ function handleEvent(event: CoordinatorEvent): void {
             task.mergeStatus = "failed";
             task.error = event.reason;
           }
+          // Remove merger worker from sidebar.
+          s.workers = s.workers.filter(w => w.taskId !== event.task_id);
           break;
         }
 

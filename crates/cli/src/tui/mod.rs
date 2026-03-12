@@ -124,6 +124,17 @@ impl Handler<FromCoordinator> for CoordinatorHandler<'_> {
                 cx.remove_worker();
                 cx.panel_remove(&task_id);
             }
+            FromCoordinator::MergerSpawned { task_id, title, conflict_files } => {
+                cx.print(&lines::event(
+                    "⚙",
+                    &format!("Merger spawned: {title} ({}) — {} file(s)",
+                        enki_core::types::short_id(&task_id), conflict_files.len()),
+                    Color::Yellow,
+                ));
+                cx.panel_add(&task_id, &title, "light");
+                cx.panel_set_activity(&task_id,
+                    &format!("Resolving {} conflict(s)", conflict_files.len()));
+            }
             FromCoordinator::MergeQueued { mr_id: _, task_id: _, branch } => {
                 let tag = format!("merge:{branch}");
                 cx.print_or_update(&tag, &lines::event(
@@ -132,13 +143,14 @@ impl Handler<FromCoordinator> for CoordinatorHandler<'_> {
                     Color::DarkCyan,
                 ));
             }
-            FromCoordinator::MergeLanded { mr_id: _, task_id: _, branch } => {
+            FromCoordinator::MergeLanded { mr_id: _, task_id, branch } => {
                 let tag = format!("merge:{branch}");
                 cx.print_or_update(&tag, &lines::event(
                     "✓",
                     &format!("Merge landed: {branch}"),
                     Color::Green,
                 ));
+                cx.panel_remove(&task_id);
             }
             FromCoordinator::MergeConflicted { mr_id: _, task_id: _, branch } => {
                 let tag = format!("merge:{branch}");
@@ -149,13 +161,14 @@ impl Handler<FromCoordinator> for CoordinatorHandler<'_> {
                 ));
                 cx.notify(&format!("Merge conflict: {branch}"));
             }
-            FromCoordinator::MergeFailed { mr_id: _, task_id: _, branch, reason } => {
+            FromCoordinator::MergeFailed { mr_id: _, task_id, branch, reason } => {
                 let tag = format!("merge:{branch}");
                 cx.print_or_update(&tag, &lines::event(
                     "✗",
                     &format!("Merge failed: {branch}: {reason}"),
                     Color::Red,
                 ));
+                cx.panel_remove(&task_id);
             }
             FromCoordinator::MergeProgress { mr_id: _, task_id: _, branch, status } => {
                 let tag = format!("merge:{branch}");
