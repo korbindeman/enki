@@ -140,6 +140,18 @@ export async function fetchGitStatus(): Promise<void> {
   }
 }
 
+export async function switchBranch(branch: string): Promise<void> {
+  await invoke("switch_branch", { branch });
+  await fetchBranch();
+  await fetchGitStatus();
+}
+
+export async function createBranch(name: string): Promise<void> {
+  await invoke("create_branch", { name });
+  await fetchBranch();
+  await fetchGitStatus();
+}
+
 export async function switchAgent(agent: string): Promise<void> {
   setState({
     ready: false,

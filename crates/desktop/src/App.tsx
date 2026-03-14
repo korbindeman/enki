@@ -15,6 +15,8 @@ import {
   interruptCoordinator,
   openProject,
   switchAgent,
+  switchBranch,
+  createBranch,
 } from "./store";
 import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
@@ -114,6 +116,186 @@ function AgentSelector() {
               </button>
             )}
           </For>
+        </div>
+      </Show>
+    </div>
+  );
+}
+
+interface BranchInfo {
+  name: string;
+  is_current: boolean;
+}
+
+function BranchSwitcher() {
+  const [open, setOpen] = createSignal(false);
+  const [branches, setBranches] = createSignal<BranchInfo[]>([]);
+  const [filter, setFilter] = createSignal("");
+  const [creating, setCreating] = createSignal(false);
+  const [newName, setNewName] = createSignal("");
+  const [error, setError] = createSignal<string | null>(null);
+
+  let containerRef!: HTMLDivElement;
+  let searchRef!: HTMLInputElement;
+  let createRef!: HTMLInputElement;
+
+  async function fetchBranches() {
+    try {
+      const list = await invoke<BranchInfo[]>("list_branches");
+      setBranches(list);
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  function toggle() {
+    if (open()) {
+      close();
+    } else {
+      setOpen(true);
+      setFilter("");
+      setCreating(false);
+      setNewName("");
+      setError(null);
+      fetchBranches();
+      requestAnimationFrame(() => searchRef?.focus());
+    }
+  }
+
+  function close() {
+    setOpen(false);
+    setCreating(false);
+    setError(null);
+  }
+
+  async function selectBranch(name: string) {
+    try {
+      await switchBranch(name);
+      close();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function handleCreate() {
+    const name = newName().trim();
+    if (!name) return;
+    try {
+      await createBranch(name);
+      close();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  function onClickOutside(e: MouseEvent) {
+    if (open() && !containerRef.contains(e.target as Node)) close();
+  }
+  function onKeyDown(e: KeyboardEvent) {
+    if (open() && e.key === "Escape") close();
+  }
+
+  onMount(() => {
+    document.addEventListener("mousedown", onClickOutside);
+    document.addEventListener("keydown", onKeyDown);
+  });
+  onCleanup(() => {
+    document.removeEventListener("mousedown", onClickOutside);
+    document.removeEventListener("keydown", onKeyDown);
+  });
+
+  const filtered = () => {
+    const q = filter().toLowerCase();
+    if (!q) return branches();
+    return branches().filter((b) => b.name.toLowerCase().includes(q));
+  };
+
+  return (
+    <div ref={containerRef} class="relative inline-flex items-center">
+      <button
+        onClick={toggle}
+        class="text-text-muted hover:text-text transition-colors cursor-pointer truncate max-w-[120px]"
+        title={state.currentBranch ?? undefined}
+      >
+        {state.currentBranch}
+      </button>
+      <Show when={open()}>
+        <div class="absolute bottom-full left-0 mb-1 rounded-lg bg-surface border border-border shadow-xl min-w-[200px] z-50">
+          {/* Search */}
+          <div class="p-1.5">
+            <input
+              ref={searchRef}
+              type="text"
+              placeholder="Filter branches..."
+              value={filter()}
+              onInput={(e) => setFilter(e.currentTarget.value)}
+              class="w-full rounded px-2 py-1 text-xs bg-background/50 text-text placeholder-text-faint focus:outline-none"
+            />
+          </div>
+          {/* Error */}
+          <Show when={error()}>
+            <div class="px-3 py-1.5 text-xs text-red-400 border-t border-border-subtle">
+              {error()}
+            </div>
+          </Show>
+          {/* Branch list */}
+          <div class="max-h-[200px] overflow-y-auto">
+            <For each={filtered()}>
+              {(branch) => (
+                <button
+                  onClick={() => selectBranch(branch.name)}
+                  class={`w-full text-left px-3 py-1.5 text-xs flex items-center gap-2 transition-colors ${
+                    branch.is_current
+                      ? "text-text bg-surface/50"
+                      : "text-text-muted hover:text-text hover:bg-surface/30"
+                  }`}
+                >
+                  <span class="w-3 shrink-0 text-center">
+                    {branch.is_current ? "\u2713" : ""}
+                  </span>
+                  <span class="truncate">{branch.name}</span>
+                </button>
+              )}
+            </For>
+            <Show when={filtered().length === 0 && branches().length > 0}>
+              <div class="px-3 py-2 text-xs text-text-faint">No matches</div>
+            </Show>
+          </div>
+          {/* Divider + New branch */}
+          <div class="border-t border-border-subtle">
+            <Show
+              when={creating()}
+              fallback={
+                <button
+                  onClick={() => {
+                    setCreating(true);
+                    setNewName("");
+                    setError(null);
+                    requestAnimationFrame(() => createRef?.focus());
+                  }}
+                  class="w-full text-left px-3 py-1.5 text-xs text-text-muted hover:text-text hover:bg-surface/30 transition-colors"
+                >
+                  + New branch...
+                </button>
+              }
+            >
+              <div class="p-1.5">
+                <input
+                  ref={createRef}
+                  type="text"
+                  placeholder="Branch name..."
+                  value={newName()}
+                  onInput={(e) => setNewName(e.currentTarget.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") handleCreate();
+                    if (e.key === "Escape") setCreating(false);
+                  }}
+                  class="w-full rounded px-2 py-1 text-xs bg-background/50 text-text placeholder-text-faint focus:outline-none"
+                />
+              </div>
+            </Show>
+          </div>
         </div>
       </Show>
     </div>
@@ -481,7 +663,7 @@ function App() {
               <span title={state.projectCwd!}>{state.projectCwd!.split("/").pop()}</span>
               <Show when={state.currentBranch}>
                 <span class="text-text-faint">/</span>
-                <span class="text-text-muted">{state.currentBranch}</span>
+                <BranchSwitcher />
               </Show>
             </div>
             <Show when={state.gitStatus && (state.gitStatus.modified > 0 || state.gitStatus.untracked > 0 || state.gitStatus.staged > 0)}>
