@@ -130,6 +130,78 @@ pub fn get_current_branch(state: tauri::State<CoordinatorState>) -> Result<Strin
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct BranchInfo {
+    pub name: String,
+    pub is_current: bool,
+}
+
+#[tauri::command]
+pub fn list_branches(state: tauri::State<CoordinatorState>) -> Result<Vec<BranchInfo>, String> {
+    let cwd = state.cwd.lock().unwrap().clone();
+    if cwd.is_empty() {
+        return Err("no project open".into());
+    }
+    let output = std::process::Command::new("git")
+        .args(["branch", "--list"])
+        .current_dir(&cwd)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err("git branch failed".into());
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut branches: Vec<BranchInfo> = text
+        .lines()
+        .filter_map(|line| {
+            let is_current = line.starts_with("* ");
+            let name = line.trim_start_matches("* ").trim().to_string();
+            if name.is_empty() || name.starts_with("task/") {
+                return None;
+            }
+            Some(BranchInfo { name, is_current })
+        })
+        .collect();
+    branches.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(branches)
+}
+
+#[tauri::command]
+pub fn switch_branch(branch: String, state: tauri::State<CoordinatorState>) -> Result<(), String> {
+    let cwd = state.cwd.lock().unwrap().clone();
+    if cwd.is_empty() {
+        return Err("no project open".into());
+    }
+    let output = std::process::Command::new("git")
+        .args(["checkout", &branch])
+        .current_dir(&cwd)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(stderr);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn create_branch(name: String, state: tauri::State<CoordinatorState>) -> Result<(), String> {
+    let cwd = state.cwd.lock().unwrap().clone();
+    if cwd.is_empty() {
+        return Err("no project open".into());
+    }
+    let output = std::process::Command::new("git")
+        .args(["checkout", "-b", &name])
+        .current_dir(&cwd)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(stderr);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct GitStatusSummary {
     pub modified: u32,
     pub untracked: u32,
