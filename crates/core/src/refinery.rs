@@ -111,7 +111,7 @@ pub fn process_merge(
     // Step 3: Verify the feature branch actually changed files.
     let default_tree = git(
         &tmp_dir,
-        &["rev-parse", &format!("{default_branch}^{{tree}}")],
+        &["rev-parse", &format!("origin/{default_branch}^{{tree}}")],
     );
     let branch_tree = git(&tmp_dir, &["rev-parse", &format!("{branch}^{{tree}}")]);
 
