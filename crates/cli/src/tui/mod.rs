@@ -93,7 +93,7 @@ impl Handler<FromCoordinator> for CoordinatorHandler<'_> {
                 cx.clear_activity();
                 cx.notify("Enki is waiting for input");
             }
-            FromCoordinator::WorkerSpawned { task_id, title, tier } => {
+            FromCoordinator::WorkerSpawned { task_id, title, tier, .. } => {
                 cx.print(&lines::event(
                     "▶",
                     &format!("Worker spawned: {title} ({})", enki_core::types::short_id(&task_id)),

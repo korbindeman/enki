@@ -707,7 +707,14 @@ pub enum CoordinatorEvent {
     Done { content: String },
     ToolCall { name: String },
     ToolCallDone { name: String },
-    WorkerSpawned { task_id: String, title: String, tier: String },
+    WorkerSpawned {
+        task_id: String,
+        title: String,
+        tier: String,
+        role: Option<String>,
+        branch: Option<String>,
+        description: Option<String>,
+    },
     WorkerCompleted { task_id: String, title: String },
     WorkerFailed { task_id: String, title: String, error: String },
     WorkerUpdate { task_id: String, activity: WorkerActivityEvent },
@@ -749,8 +756,8 @@ fn to_event(msg: FromCoordinator) -> CoordinatorEvent {
         FromCoordinator::Done(content) => CoordinatorEvent::Done { content },
         FromCoordinator::ToolCall(name) => CoordinatorEvent::ToolCall { name },
         FromCoordinator::ToolCallDone(name) => CoordinatorEvent::ToolCallDone { name },
-        FromCoordinator::WorkerSpawned { task_id, title, tier } =>
-            CoordinatorEvent::WorkerSpawned { task_id, title, tier },
+        FromCoordinator::WorkerSpawned { task_id, title, tier, role, branch, description } =>
+            CoordinatorEvent::WorkerSpawned { task_id, title, tier, role, branch, description },
         FromCoordinator::WorkerCompleted { task_id, title } =>
             CoordinatorEvent::WorkerCompleted { task_id, title },
         FromCoordinator::WorkerFailed { task_id, title, error } =>

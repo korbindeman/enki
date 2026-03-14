@@ -74,7 +74,14 @@ pub enum FromCoordinator {
     ToolCall(String),
     ToolCallDone(String),
     Done(String),
-    WorkerSpawned { task_id: String, title: String, tier: String },
+    WorkerSpawned {
+        task_id: String,
+        title: String,
+        tier: String,
+        role: Option<String>,
+        branch: Option<String>,
+        description: Option<String>,
+    },
     WorkerCompleted { task_id: String, title: String },
     WorkerFailed {
         task_id: String,

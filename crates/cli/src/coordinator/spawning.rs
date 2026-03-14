@@ -127,6 +127,9 @@ impl Runtime {
             task_id: prep.task_id.0.clone(),
             title: prep.title.clone(),
             tier: prep.tier.as_str().to_string(),
+            role: prep.role.clone(),
+            branch: Some(prep.branch.clone()),
+            description: Some(prep.description.clone()),
         });
         coord.queue_event(format!(
             "- Worker spawned for \"{}\" ({})", prep.title, prep.task_id
