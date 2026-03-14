@@ -7,10 +7,8 @@ interface ConfigPayload {
   max_heavy: number;
   max_standard: number;
   max_light: number;
-  sonnet_only: boolean;
-  local_workers: boolean;
-  ollama_host: string;
-  agent_command: string;
+  coordinator_agent: string;
+  worker_agent: string;
 }
 
 const DEFAULTS: ConfigPayload = {
@@ -19,10 +17,8 @@ const DEFAULTS: ConfigPayload = {
   max_heavy: 5,
   max_standard: 5,
   max_light: 10,
-  sonnet_only: false,
-  local_workers: false,
-  ollama_host: "",
-  agent_command: "claude-agent-acp",
+  coordinator_agent: "claude",
+  worker_agent: "claude",
 };
 
 type SettingConfig =
@@ -30,6 +26,7 @@ type SettingConfig =
   | { type: "text"; key: keyof ConfigPayload; label: string }
   | { type: "boolean"; key: keyof ConfigPayload; label: string }
   | { type: "conditional-text"; key: keyof ConfigPayload; label: string; condition: keyof ConfigPayload; placeholder?: string }
+  | { type: "select"; key: keyof ConfigPayload; label: string; options: { value: string; label: string }[] }
   | { type: "separator" }
   | { type: "heading"; label: string };
 
@@ -39,15 +36,21 @@ const settingsConfig: SettingConfig[] = [
   { type: "number", key: "max_heavy", label: "Max Heavy", min: 0, max: 50 },
   { type: "number", key: "max_standard", label: "Max Standard", min: 0, max: 50 },
   { type: "number", key: "max_light", label: "Max Light", min: 0, max: 50 },
-  { type: "boolean", key: "sonnet_only", label: "Sonnet Only" },
-  { type: "boolean", key: "local_workers", label: "Local Workers" },
-  { type: "conditional-text", key: "ollama_host", label: "Ollama Host", condition: "local_workers", placeholder: "http://localhost:11434" },
+  { type: "separator" },
+  { type: "heading", label: "Agent" },
+  { type: "select", key: "coordinator_agent", label: "Coordinator", options: [
+    { value: "claude", label: "Claude Code" },
+    { value: "codex", label: "OpenAI Codex" },
+    { value: "opencode", label: "OpenCode" },
+  ]},
+  { type: "select", key: "worker_agent", label: "Workers", options: [
+    { value: "claude", label: "Claude Code" },
+    { value: "codex", label: "OpenAI Codex" },
+    { value: "opencode", label: "OpenCode" },
+  ]},
   { type: "separator" },
   { type: "heading", label: "Git" },
   { type: "text", key: "commit_suffix", label: "Commit Suffix" },
-  { type: "separator" },
-  { type: "heading", label: "Agent" },
-  { type: "text", key: "agent_command", label: "Command" },
 ];
 
 export default function Settings(props: { open: boolean; onClose: () => void }) {
@@ -248,6 +251,36 @@ export default function Settings(props: { open: boolean; onClose: () => void }) 
                             placeholder={setting.placeholder}
                             onInput={(e) => updateField(setting.key, e.currentTarget.value)}
                           />
+                        </div>
+                      </div>
+                    );
+                  }
+
+                  if (setting.type === "select") {
+                    const value = current[setting.key] as string;
+                    const defaultValue = DEFAULTS[setting.key] as string;
+                    const hasChanged = value !== defaultValue;
+                    return (
+                      <div class="flex items-center justify-between">
+                        <label class="text-sm text-text">{setting.label}</label>
+                        <div class="flex items-center gap-2">
+                          <Show when={hasChanged}>
+                            <button
+                              class="text-xs text-text-muted hover:text-text hover:underline"
+                              onClick={() => resetField(setting.key)}
+                            >
+                              Reset
+                            </button>
+                          </Show>
+                          <select
+                            class="w-48 h-7 px-2 text-sm bg-input-bg border border-border rounded text-text focus:outline-none focus:border-text-muted appearance-none cursor-pointer"
+                            value={value}
+                            onChange={(e) => updateField(setting.key, e.currentTarget.value)}
+                          >
+                            <For each={setting.options}>
+                              {(opt) => <option value={opt.value}>{opt.label}</option>}
+                            </For>
+                          </select>
                         </div>
                       </div>
                     );

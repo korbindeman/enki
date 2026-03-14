@@ -52,9 +52,9 @@ function AgentSelector() {
 
   onMount(async () => {
     try {
-      const config = await invoke<{ agent_command?: string }>("load_config");
-      if (config.agent_command && config.agent_command in AGENT_DISPLAY_NAMES) {
-        setAgent(config.agent_command);
+      const config = await invoke<{ coordinator_agent?: string }>("load_config");
+      if (config.coordinator_agent && config.coordinator_agent in AGENT_DISPLAY_NAMES) {
+        setAgent(config.coordinator_agent);
       }
     } catch {
       // Config not available yet — keep default.
@@ -66,6 +66,8 @@ function AgentSelector() {
     setOpen(false);
     try {
       await switchAgent(key);
+      const config = await invoke<Record<string, unknown>>("load_config");
+      await invoke("save_config", { config: { ...config, coordinator_agent: key } });
     } catch {
       // Ignore if coordinator not ready.
     }
