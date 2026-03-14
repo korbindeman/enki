@@ -12,7 +12,7 @@ export type CoordinatorEvent =
   | { type: "done"; content: string }
   | { type: "tool_call"; name: string }
   | { type: "tool_call_done"; name: string }
-  | { type: "worker_spawned"; task_id: string; title: string; tier: string }
+  | { type: "worker_spawned"; task_id: string; title: string; tier: string; role?: string; branch?: string; description?: string }
   | { type: "worker_completed"; task_id: string; title: string }
   | {
       type: "worker_failed";
@@ -102,6 +102,10 @@ export interface Worker {
   title: string;
   tier: string;
   activity: string;
+  role?: string;
+  branch?: string;
+  description?: string;
+  spawnedAt: number;
   /** Set briefly on failure before removal. */
   failed?: boolean;
   failError?: string;

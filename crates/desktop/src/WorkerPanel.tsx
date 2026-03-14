@@ -1,20 +1,53 @@
-import { For, Show } from "solid-js";
+import { createSignal, For, Show, onCleanup } from "solid-js";
 import { state, stopWorker, stopAll } from "./store";
 import TierBadge from "./TierBadge";
+
+function formatElapsed(ms: number): string {
+  const totalSeconds = Math.floor(ms / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  return `${minutes}m ${seconds}s`;
+}
+
+function humanizeRole(role: string): string {
+  return role
+    .split("_")
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(" ");
+}
 
 function WorkerCard(props: {
   taskId: string;
   title: string;
   tier: string;
   activity: string;
+  role?: string;
+  branch?: string;
+  description?: string;
+  spawnedAt: number;
   failed?: boolean;
 }) {
+  const [expanded, setExpanded] = createSignal(false);
+  const [elapsed, setElapsed] = createSignal(Date.now() - props.spawnedAt);
+
+  const timer = setInterval(() => {
+    setElapsed(Date.now() - props.spawnedAt);
+  }, 1000);
+  onCleanup(() => clearInterval(timer));
+
   return (
     <div
-      class="group rounded-lg p-2.5 text-sm transition-colors"
+      class="group rounded-lg p-2.5 text-sm transition-colors cursor-pointer"
       classList={{
         "bg-red-950/50 border border-red-800/50": props.failed,
         "bg-surface/50": !props.failed,
+      }}
+      onClick={(e) => {
+        // Don't toggle if clicking the stop button.
+        if ((e.target as HTMLElement).closest("button")) return;
+        setExpanded(!expanded());
       }}
     >
       <div class="flex items-center gap-2 mb-1">
@@ -49,6 +82,32 @@ function WorkerCard(props: {
       >
         {props.activity}
       </div>
+
+      <Show when={expanded()}>
+        <div class="mt-2 pt-2 border-t border-border/50 space-y-1">
+          <Show when={props.role}>
+            <div class="flex justify-between text-xs">
+              <span class="text-text-faint">Role</span>
+              <span class="text-text-muted">{humanizeRole(props.role!)}</span>
+            </div>
+          </Show>
+          <Show when={props.branch}>
+            <div class="flex justify-between text-xs">
+              <span class="text-text-faint">Branch</span>
+              <span class="text-text-muted font-mono">{props.branch}</span>
+            </div>
+          </Show>
+          <div class="flex justify-between text-xs">
+            <span class="text-text-faint">Elapsed</span>
+            <span class="text-text-muted">{formatElapsed(elapsed())}</span>
+          </div>
+          <Show when={props.description}>
+            <p class="text-xs text-text-faint mt-1.5 line-clamp-3">
+              {props.description}
+            </p>
+          </Show>
+        </div>
+      </Show>
     </div>
   );
 }
@@ -87,6 +146,10 @@ export default function WorkerPanel() {
                 title={worker.title}
                 tier={worker.tier}
                 activity={worker.activity}
+                role={worker.role}
+                branch={worker.branch}
+                description={worker.description}
+                spawnedAt={worker.spawnedAt}
                 failed={worker.failed}
               />
             )}

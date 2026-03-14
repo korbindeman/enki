@@ -280,6 +280,10 @@ function handleEvent(event: CoordinatorEvent): void {
             title: event.title,
             tier: event.tier,
             activity: "Starting",
+            role: event.role,
+            branch: event.branch,
+            description: event.description,
+            spawnedAt: Date.now(),
           });
           // Add or update task entry.
           {
@@ -451,6 +455,7 @@ function handleEvent(event: CoordinatorEvent): void {
               title: event.title,
               tier: "light",
               activity: `Resolving conflicts in ${event.conflict_files.length} file(s)`,
+              spawnedAt: Date.now(),
             });
           }
           break;
