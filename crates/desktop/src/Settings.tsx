@@ -101,7 +101,7 @@ export default function Settings(props: { open: boolean; onClose: () => void }) 
               </p>
               <For each={settingsConfig}>
                 {(setting) => {
-                  const current = config()!;
+                  const current = () => config()!;
 
                   if (setting.type === "separator") {
                     return <hr class="border-border" />;
@@ -116,14 +116,14 @@ export default function Settings(props: { open: boolean; onClose: () => void }) 
                   }
 
                   if (setting.type === "number") {
-                    const value = current[setting.key] as number;
+                    const value = () => current()[setting.key] as number;
                     const defaultValue = DEFAULTS[setting.key] as number;
-                    const hasChanged = value !== defaultValue;
+                    const hasChanged = () => value() !== defaultValue;
                     return (
                       <div class="flex items-center justify-between">
                         <label class="text-sm text-text">{setting.label}</label>
                         <div class="flex items-center gap-2">
-                          <Show when={hasChanged}>
+                          <Show when={hasChanged()}>
                             <button
                               class="text-xs text-text-muted hover:text-text hover:underline"
                               onClick={() => resetField(setting.key)}
@@ -135,7 +135,7 @@ export default function Settings(props: { open: boolean; onClose: () => void }) 
                             <button
                               class="w-7 h-7 flex items-center justify-center rounded-l border border-border bg-button-bg text-text hover:bg-button-hover text-sm"
                               onClick={() => {
-                                const next = Math.max(setting.min, value - 1);
+                                const next = Math.max(setting.min, value() - 1);
                                 updateField(setting.key, next);
                               }}
                             >
@@ -144,7 +144,7 @@ export default function Settings(props: { open: boolean; onClose: () => void }) 
                             <input
                               type="number"
                               class="w-12 h-7 text-center text-sm bg-input-bg border-y border-border text-text appearance-none [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
-                              value={value}
+                              value={value()}
                               min={setting.min}
                               max={setting.max}
                               onInput={(e) => {
@@ -157,7 +157,7 @@ export default function Settings(props: { open: boolean; onClose: () => void }) 
                             <button
                               class="w-7 h-7 flex items-center justify-center rounded-r border border-border bg-button-bg text-text hover:bg-button-hover text-sm"
                               onClick={() => {
-                                const next = Math.min(setting.max, value + 1);
+                                const next = Math.min(setting.max, value() + 1);
                                 updateField(setting.key, next);
                               }}
                             >
@@ -170,14 +170,14 @@ export default function Settings(props: { open: boolean; onClose: () => void }) 
                   }
 
                   if (setting.type === "text") {
-                    const value = current[setting.key] as string;
+                    const value = () => current()[setting.key] as string;
                     const defaultValue = DEFAULTS[setting.key] as string;
-                    const hasChanged = value !== defaultValue;
+                    const hasChanged = () => value() !== defaultValue;
                     return (
                       <div class="flex items-center justify-between">
                         <label class="text-sm text-text">{setting.label}</label>
                         <div class="flex items-center gap-2">
-                          <Show when={hasChanged}>
+                          <Show when={hasChanged()}>
                             <button
                               class="text-xs text-text-muted hover:text-text hover:underline"
                               onClick={() => resetField(setting.key)}
@@ -188,7 +188,7 @@ export default function Settings(props: { open: boolean; onClose: () => void }) 
                           <input
                             type="text"
                             class="w-48 h-7 px-2 text-sm bg-input-bg border border-border rounded text-text focus:outline-none focus:border-text-muted"
-                            value={value}
+                            value={value()}
                             onInput={(e) => updateField(setting.key, e.currentTarget.value)}
                           />
                         </div>
@@ -197,14 +197,14 @@ export default function Settings(props: { open: boolean; onClose: () => void }) 
                   }
 
                   if (setting.type === "boolean") {
-                    const value = current[setting.key] as boolean;
+                    const value = () => current()[setting.key] as boolean;
                     const defaultValue = DEFAULTS[setting.key] as boolean;
-                    const hasChanged = value !== defaultValue;
+                    const hasChanged = () => value() !== defaultValue;
                     return (
                       <div class="flex items-center justify-between">
                         <label class="text-sm text-text">{setting.label}</label>
                         <div class="flex items-center gap-2">
-                          <Show when={hasChanged}>
+                          <Show when={hasChanged()}>
                             <button
                               class="text-xs text-text-muted hover:text-text hover:underline"
                               onClick={() => resetField(setting.key)}
@@ -214,11 +214,11 @@ export default function Settings(props: { open: boolean; onClose: () => void }) 
                           </Show>
                           <button
                             class={`w-5 h-5 rounded border flex items-center justify-center text-xs ${
-                              value
+                              value()
                                 ? "bg-button-hover border-border text-text"
                                 : "bg-input-bg border-border text-transparent"
                             }`}
-                            onClick={() => updateField(setting.key, !value)}
+                            onClick={() => updateField(setting.key, !value())}
                           >
                             ✓
                           </button>
@@ -228,15 +228,15 @@ export default function Settings(props: { open: boolean; onClose: () => void }) 
                   }
 
                   if (setting.type === "conditional-text") {
-                    if (!current[setting.condition]) return null;
-                    const value = current[setting.key] as string;
+                    if (!current()[setting.condition]) return null;
+                    const value = () => current()[setting.key] as string;
                     const defaultValue = DEFAULTS[setting.key] as string;
-                    const hasChanged = value !== defaultValue;
+                    const hasChanged = () => value() !== defaultValue;
                     return (
                       <div class="flex items-center justify-between pl-4">
                         <label class="text-sm text-text">{setting.label}</label>
                         <div class="flex items-center gap-2">
-                          <Show when={hasChanged}>
+                          <Show when={hasChanged()}>
                             <button
                               class="text-xs text-text-muted hover:text-text hover:underline"
                               onClick={() => resetField(setting.key)}
@@ -247,7 +247,7 @@ export default function Settings(props: { open: boolean; onClose: () => void }) 
                           <input
                             type="text"
                             class="w-48 h-7 px-2 text-sm bg-input-bg border border-border rounded text-text focus:outline-none focus:border-text-muted"
-                            value={value}
+                            value={value()}
                             placeholder={setting.placeholder}
                             onInput={(e) => updateField(setting.key, e.currentTarget.value)}
                           />
@@ -257,14 +257,14 @@ export default function Settings(props: { open: boolean; onClose: () => void }) 
                   }
 
                   if (setting.type === "select") {
-                    const value = current[setting.key] as string;
+                    const value = () => current()[setting.key] as string;
                     const defaultValue = DEFAULTS[setting.key] as string;
-                    const hasChanged = value !== defaultValue;
+                    const hasChanged = () => value() !== defaultValue;
                     return (
                       <div class="flex items-center justify-between">
                         <label class="text-sm text-text">{setting.label}</label>
                         <div class="flex items-center gap-2">
-                          <Show when={hasChanged}>
+                          <Show when={hasChanged()}>
                             <button
                               class="text-xs text-text-muted hover:text-text hover:underline"
                               onClick={() => resetField(setting.key)}
@@ -274,7 +274,7 @@ export default function Settings(props: { open: boolean; onClose: () => void }) 
                           </Show>
                           <select
                             class="w-48 h-7 px-2 text-sm bg-input-bg border border-border rounded text-text focus:outline-none focus:border-text-muted appearance-none cursor-pointer"
-                            value={value}
+                            value={value()}
                             onChange={(e) => updateField(setting.key, e.currentTarget.value)}
                           >
                             <For each={setting.options}>
