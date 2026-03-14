@@ -630,44 +630,48 @@ function App() {
       <aside class="relative w-[260px] shrink-0 border-r border-border bg-paper flex flex-col pt-[52px]">
         <div data-tauri-drag-region class="absolute top-0 left-0 right-0 h-[52px]" />
         <div class="px-4 py-3">
-          <div class="flex items-center justify-end gap-2">
-            <button
-              onClick={() => setExplorerOpen(true)}
-              class="text-text-muted hover:text-text transition-colors"
-              title={`Files (${navigator.platform.includes("Mac") ? "\u2318" : "Ctrl"}E)`}
-            >
-              <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
-              </svg>
-            </button>
-            <button
-              onClick={() => setBacklogOpen(true)}
-              class="text-text-muted hover:text-text transition-colors"
-              title={`Backlog (${navigator.platform.includes("Mac") ? "\u2318" : "Ctrl"}B)`}
-            >
-              <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
-              </svg>
-            </button>
-            <button
-              onClick={() => setSettingsOpen(true)}
-              class="text-text-muted hover:text-text transition-colors"
-              title="Settings (⌘,)"
-            >
-              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-              </svg>
-            </button>
+          <div class="flex items-center justify-between">
+            <Show when={state.projectCwd} fallback={<div />}>
+              <div class="text-xs text-text-muted truncate flex items-center gap-1.5">
+                <span title={state.projectCwd!}>{state.projectCwd!.split("/").pop()}</span>
+                <Show when={state.currentBranch}>
+                  <span class="text-text-faint">/</span>
+                  <BranchSwitcher />
+                </Show>
+              </div>
+            </Show>
+            <div class="flex items-center gap-2 shrink-0">
+              <button
+                onClick={() => setExplorerOpen(true)}
+                class="text-text-muted hover:text-text transition-colors"
+                title={`Files (${navigator.platform.includes("Mac") ? "\u2318" : "Ctrl"}E)`}
+              >
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
+                </svg>
+              </button>
+              <button
+                onClick={() => setBacklogOpen(true)}
+                class="text-text-muted hover:text-text transition-colors"
+                title={`Backlog (${navigator.platform.includes("Mac") ? "\u2318" : "Ctrl"}B)`}
+              >
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
+                </svg>
+              </button>
+              <button
+                onClick={() => setSettingsOpen(true)}
+                class="text-text-muted hover:text-text transition-colors"
+                title="Settings (⌘,)"
+              >
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                </svg>
+              </button>
+            </div>
           </div>
           <Show when={state.projectCwd}>
-            <div class="text-xs text-text-muted truncate mt-0.5 flex items-center gap-1.5">
-              <span title={state.projectCwd!}>{state.projectCwd!.split("/").pop()}</span>
-              <Show when={state.currentBranch}>
-                <span class="text-text-faint">/</span>
-                <BranchSwitcher />
-              </Show>
-            </div>
             <Show when={state.gitStatus && (state.gitStatus.modified > 0 || state.gitStatus.untracked > 0 || state.gitStatus.staged > 0)}>
               <div class="text-xs text-text-faint truncate mt-0.5">
                 {[
