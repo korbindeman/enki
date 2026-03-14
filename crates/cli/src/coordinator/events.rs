@@ -399,6 +399,8 @@ impl Runtime {
         if !self.infra_broken {
             self.handle_command(Command::CheckSignals, coord).await;
             self.handle_command(Command::DiscoverFromDb, coord).await;
+        } else {
+            tracing::debug!("skipping CheckSignals + DiscoverFromDb: infra_broken");
         }
 
         // Snapshot worker activity to DB.

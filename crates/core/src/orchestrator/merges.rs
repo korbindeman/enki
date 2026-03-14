@@ -148,8 +148,9 @@ impl Orchestrator {
     /// Reconcile scheduler DAG with DB: check for merges that landed
     /// while we weren't looking (missed refinery signals).
     pub fn reconcile_merges(&mut self) -> Vec<Event> {
-        let running = self.scheduler.running_steps();
-        for (exec_id, step_id, task_id) in running {
+        // Check WorkerDone nodes for merges that already landed.
+        let worker_done = self.scheduler.worker_done_steps();
+        for (exec_id, step_id, task_id) in worker_done {
             if let Ok(Some(mr)) = self.db.get_merge_request_for_task(&task_id)
                 && mr.status == MergeStatus::Merged
             {
@@ -161,6 +162,29 @@ impl Orchestrator {
                 self.scheduler.step_completed(&exec_id, &step_id, output);
             }
         }
+
         self.tick_scheduler()
+    }
+
+    /// Re-queue MRs stuck in transient states from prior crashed sessions.
+    /// Call once at startup, NOT on every tick (would interfere with active merges).
+    pub fn reconcile_stuck_merges(&mut self) {
+        if let Ok(active_mrs) = self.db.get_active_merge_requests() {
+            for mr in active_mrs {
+                match mr.status {
+                    MergeStatus::Rebasing | MergeStatus::Verifying | MergeStatus::Processing => {
+                        tracing::warn!(
+                            mr_id = %mr.id, task_id = %mr.task_id,
+                            status = mr.status.as_str(),
+                            "reconciliation: MR stuck in transient state, re-queuing"
+                        );
+                        if let Err(e) = self.db.update_merge_status(&mr.id, MergeStatus::Queued) {
+                            tracing::warn!(mr_id = %mr.id, error = %e, "failed to re-queue stuck MR");
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 }

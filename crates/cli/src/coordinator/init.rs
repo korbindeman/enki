@@ -295,7 +295,7 @@ pub(super) async fn initialize(
 
     let (merger_agent_done_tx, merger_agent_done_rx) = mpsc::unbounded_channel::<MergerAgentDone>();
 
-    let rt = Runtime {
+    let mut rt = Runtime {
         mgr,
         tracker,
         worker_done_tx,
@@ -319,6 +319,9 @@ pub(super) async fn initialize(
     if !removed.is_empty() {
         tracing::info!(count = removed.len(), "cleaned up orphaned merge temp dirs");
     }
+
+    // Re-queue MRs stuck in transient states from prior sessions.
+    rt.orch.reconcile_stuck_merges();
 
     tracing::info!(
         elapsed_ms = init_start.elapsed().as_millis() as u64,

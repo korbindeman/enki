@@ -250,16 +250,20 @@ impl Scheduler {
             .map(|s| s.to_string())
             .collect();
 
-        for task_id in ready {
+        let mut skipped_paused = 0usize;
+        let mut skipped_tier_full = 0usize;
+
+        for task_id in &ready {
             // Skip if the task's group is paused.
-            if let Some(exec_id) = self.task_groups.get(&task_id) {
+            if let Some(exec_id) = self.task_groups.get(task_id) {
                 if self.groups.get(exec_id).is_some_and(|g| g.paused) {
+                    skipped_paused += 1;
                     continue;
                 }
             }
 
             let (title, description, tier, role, upstream_outputs) = {
-                let node = self.dag.get(&task_id).unwrap();
+                let node = self.dag.get(task_id).unwrap();
                 let tier = node.tier.unwrap_or(Tier::Standard);
 
                 // Collect outputs from all completed upstream deps.
@@ -284,20 +288,30 @@ impl Scheduler {
             };
 
             if !self.running.can_run(tier, &self.limits) {
+                tracing::debug!(
+                    task_id,
+                    ?tier,
+                    running_heavy = self.running.heavy,
+                    running_standard = self.running.standard,
+                    running_light = self.running.light,
+                    running_total = self.running.total(),
+                    "ready task skipped: tier limit reached"
+                );
+                skipped_tier_full += 1;
                 continue;
             }
 
-            self.dag.mark_running(&task_id);
+            self.dag.mark_running(task_id);
             self.running.increment(tier);
 
             let exec_id = self
                 .task_groups
-                .get(&task_id)
+                .get(task_id)
                 .cloned()
                 .unwrap_or_default();
             let step_id = self
                 .task_steps
-                .get(&task_id)
+                .get(task_id)
                 .cloned()
                 .unwrap_or_default();
             let project_id = self
@@ -307,7 +321,7 @@ impl Scheduler {
                 .unwrap_or_else(|| Id("project".into()));
 
             actions.push(SchedulerAction::SpawnWorker {
-                task_id: Id(task_id),
+                task_id: Id(task_id.clone()),
                 project_id,
                 title,
                 description,
@@ -317,6 +331,36 @@ impl Scheduler {
                 upstream_outputs,
                 role,
             });
+        }
+
+        // Log scheduler state summary when there's interesting state.
+        {
+            let nodes = self.dag.nodes();
+            let ready_count = ready.len() - skipped_paused - skipped_tier_full;
+            let running_count = nodes.iter().filter(|n| n.status == NodeStatus::Running).count();
+            let worker_done_count = nodes.iter().filter(|n| n.status == NodeStatus::WorkerDone).count();
+            let pending_count = nodes.iter().filter(|n| n.status == NodeStatus::Pending).count();
+            let blocked_count = nodes.iter().filter(|n| n.status == NodeStatus::Blocked).count();
+            let failed_count = nodes.iter().filter(|n| n.status == NodeStatus::Failed).count();
+
+            let interesting = running_count > 0 || worker_done_count > 0 || pending_count > 0
+                || blocked_count > 0 || skipped_paused > 0 || skipped_tier_full > 0
+                || failed_count > 0;
+
+            if interesting {
+                tracing::info!(
+                    dispatched = ready_count,
+                    running = running_count,
+                    worker_done = worker_done_count,
+                    pending = pending_count,
+                    blocked = blocked_count,
+                    failed = failed_count,
+                    skipped_paused,
+                    skipped_tier_full,
+                    groups = self.groups.len(),
+                    "scheduler tick"
+                );
+            }
         }
 
         // Check group completion/failure.
@@ -592,9 +636,18 @@ impl Scheduler {
 
     /// Get all (execution_id, step_id, task_id) triples where the task is Running.
     pub fn running_steps(&self) -> Vec<(String, String, Id)> {
+        self.steps_with_status(NodeStatus::Running)
+    }
+
+    /// Get all (execution_id, step_id, task_id) triples where the task is WorkerDone.
+    pub fn worker_done_steps(&self) -> Vec<(String, String, Id)> {
+        self.steps_with_status(NodeStatus::WorkerDone)
+    }
+
+    fn steps_with_status(&self, status: NodeStatus) -> Vec<(String, String, Id)> {
         let mut result = Vec::new();
         for node in self.dag.nodes() {
-            if node.status == NodeStatus::Running {
+            if node.status == status {
                 let exec_id = self
                     .task_groups
                     .get(&node.id)
